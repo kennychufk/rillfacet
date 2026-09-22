@@ -1,0 +1,118 @@
+#pragma once
+// The viewer: window + input + built-in panels around a Renderer.
+//
+// Usage mirrors polyscope: fill `scene()`, register a per-frame callback
+// (which may draw its own ImGui windows), then `run()`; or drive the loop
+// yourself with `frame()`. Headless mode renders offscreen for screenshots.
+//
+// Navigation (Blender style):
+//   MMB drag orbit | Shift+MMB pan | Ctrl+MMB / wheel zoom | Alt+LMB orbit
+//   Numpad 1/3/7 front/right/top (Ctrl = opposite), 5 persp/ortho,
+//   2/4/6/8 orbit steps, . or F frame selection, Home frame all.
+// Selection:
+//   LMB click select, Shift+click add/remove, LMB drag box select (Shift extends),
+//   1/2/3/4 vertex/edge/face/body mode, Alt+Z x-ray select, Alt+A / Esc clear,
+//   H hide selected bodies, Alt+H unhide the bodies the user hid.
+// Shading: Shift+Z Solid <-> Wireframe (see-through), Z wire overlay on Solid.
+// Tools: M measure (distance -> angle -> off), F12 screenshot.
+// Ctrl+LMB is left to the application (e.g. dragging simulated bodies).
+
+#include "avbd_viz/camera.h"
+#include "avbd_viz/overlay.h"
+#include "avbd_viz/renderer.h"
+#include "avbd_viz/scene.h"
+#include "avbd_viz/selection.h"
+
+#include <functional>
+#include <memory>
+#include <string>
+
+struct GLFWwindow;
+struct ImFont;
+
+namespace avbd_viz {
+
+struct ViewerOptions {
+  std::string title = "avbd-viz";
+  int width = 1600;
+  int height = 960;
+  bool headless = false;
+};
+
+class Viewer {
+ public:
+  explicit Viewer(const ViewerOptions& options = {});
+  ~Viewer();
+  bool ok() const { return ok_; }
+
+  Scene& scene() { return scene_; }
+  Camera& camera() { return camera_; }
+  RenderSettings& settings() { return settings_; }
+  Selection& selection() { return selection_; }
+  Overlay& overlay() { return overlay_; }  // cleared every frame before the callback
+  std::vector<Measurement>& measurements() { return measurements_; }
+
+  // Called every frame inside the ImGui frame (create windows, step a sim, ...).
+  void set_callback(std::function<void()> fn) { callback_ = std::move(fn); }
+
+  bool frame();  // renders one frame; false once the window is closed
+  void run();    // frame() until closed
+  bool screenshot(const std::string& png_path);
+  void set_ui_visible(bool v) { ui_visible_ = v; }
+
+  void frame_all(bool animate = true);
+  void frame_selection();
+  // Ray under the mouse cursor (pixels, origin top-left).
+  Ray mouse_ray() const;
+  glm::vec2 mouse() const;
+  glm::vec2 viewport() const { return {float(renderer_->width()), float(renderer_->height())}; }
+  // Exact 3D hit under a pixel (reads the last frame's id buffer).
+  Hit pick(float x, float y);
+  float frame_seconds() const { return dt_; }
+  ImFont* mono_font() const { return mono_font_; }
+
+ private:
+  void handle_input();
+  void handle_click(const glm::vec2& p, bool extend);
+  void handle_box(const glm::vec2& a, const glm::vec2& b, bool extend);
+  void handle_measure_click(const glm::vec2& p);
+  void build_overlays();
+  void draw_ui();
+  void apply_theme();
+
+  ViewerOptions options_;
+  bool ok_ = false;
+  bool ui_visible_ = true;
+  GLFWwindow* window_ = nullptr;
+  std::unique_ptr<Gpu> gpu_;
+  std::unique_ptr<ShaderLibrary> shaders_;
+  std::unique_ptr<Renderer> renderer_;
+  wgpu::Surface surface_;
+  wgpu::TextureFormat surface_format_ = wgpu::TextureFormat::Undefined;
+  uint32_t surface_w_ = 0, surface_h_ = 0;
+
+  Scene scene_;
+  Camera camera_;
+  RenderSettings settings_;
+  Selection selection_;
+  Overlay overlay_;
+  std::vector<Measurement> measurements_;
+  Measurement pending_measure_;
+  MeasureTool measure_tool_ = MeasureTool::Off;
+  bool xray_select_ = false;
+  std::function<void()> callback_;
+
+  // Mouse gesture state.
+  bool lmb_down_ = false, box_active_ = false, nav_drag_ = false;
+  glm::vec2 press_pos_{0}, last_mouse_{0};
+  double last_time_ = 0;
+  float dt_ = 1.0f / 60.0f;
+  int applied_theme_ = -1;
+  ImFont* ui_font_ = nullptr;
+  ImFont* mono_font_ = nullptr;
+  int screenshot_counter_ = 0;
+  std::string status_;
+  double status_until_ = 0;
+};
+
+}  // namespace avbd_viz

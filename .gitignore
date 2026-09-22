@@ -1,0 +1,7 @@
+third_party/
+build*/
+*.png
+!docs/**/*.png
+imgui.ini
+.cache/
+compile_commands.json

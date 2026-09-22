@@ -1,0 +1,214 @@
+// Surface meshes. The vertex shader "pulls" positions straight from storage
+// buffers (no vertex buffers): vertex k of the draw is corner k%3 of triangle
+// k/3. Every corner can then see its whole triangle, which gives us flat
+// normals and barycentric coordinates (for the wireframe) for free.
+//
+// Entry points: vs_main + fs_main    -> lit color (solid shading)
+//               vs_main + fs_wire    -> edges only, see-through (wireframe shading)
+//               vs_main + fs_prepass -> normals + pick ids (prepass)
+//               vs_shadow            -> sun shadow map depth
+
+#include "common/frame.wgsl"
+#include "common/scene.wgsl"
+#include STYLE
+
+// Must match `MeshUniforms` in renderer.cpp.
+struct MeshObject {
+  model: mat4x4f,
+  base_color: vec4f,     // linear rgb
+  color_mode: u32,       // 0 uniform, 1 segment palette, 2 vertex scalar, 3 face scalar, 4 segment scalar
+  cmap_row: u32,
+  flags: u32,            // bit 0: isolines
+  object_id: u32,
+  scalar_range: vec2f,
+  iso_spacing: f32,
+  _pad: f32,
+  material: vec4f,       // x = metallic, y = roughness
+};
+
+struct SegmentInfo {
+  color: u32,            // packed sRGB
+  flags: u32,            // bit 0 hidden, bit 1 selected, bit 2 active
+  scalar: f32,
+  _pad: u32,
+};
+
+@group(1) @binding(0) var<uniform> obj: MeshObject;
+@group(1) @binding(1) var<storage, read> positions: array<f32>;     // xyz per vertex
+@group(1) @binding(2) var<storage, read> triangles: array<u32>;     // 3 per face
+@group(1) @binding(3) var<storage, read> face_segment: array<u32>;  // segment per face
+@group(1) @binding(4) var<storage, read> segments: array<SegmentInfo>;
+@group(1) @binding(5) var<storage, read> vertex_scalar: array<f32>;
+// face_info.x = face scalar bits; face_info.y flags: bit 0 selected, bit 1
+// active, bits 2..4 = edge k (corners k, k+1) is flat and hidden in wireframes.
+@group(1) @binding(6) var<storage, read> face_info: array<vec2u>;
+
+struct VsOut {
+  @builtin(position) clip: vec4f,
+  @location(0) world_pos: vec3f,
+  @location(1) @interpolate(flat) normal: vec3f,
+  @location(2) bary: vec3f,
+  @location(3) scalar: f32,
+  @location(4) @interpolate(flat) face: u32,
+};
+
+fn load_position(i: u32) -> vec3f {
+  let p = vec3f(positions[3u * i], positions[3u * i + 1u], positions[3u * i + 2u]);
+  return (obj.model * vec4f(p, 1.0)).xyz;
+}
+
+fn is_hidden(face: u32) -> bool {
+  return (segments[face_segment[face]].flags & 1u) != 0u;
+}
+
+// Pushes a vertex outside the clip volume so its triangle is dropped.
+const CULLED = vec4f(0.0, 0.0, -2.0, 1.0);
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
+  let face = vid / 3u;
+  let corner = vid % 3u;
+  let p0 = load_position(triangles[3u * face]);
+  let p1 = load_position(triangles[3u * face + 1u]);
+  let p2 = load_position(triangles[3u * face + 2u]);
+  let p = select(select(p2, p1, corner == 1u), p0, corner == 0u);
+
+  var out: VsOut;
+  out.world_pos = p;
+  out.clip = select(frame.view_proj * vec4f(p, 1.0), CULLED, is_hidden(face));
+  let c = cross(p1 - p0, p2 - p0);
+  out.normal = select(vec3f(0.0, 0.0, 1.0), normalize(c), dot(c, c) > 1e-30);
+  out.bary = vec3f(f32(corner == 0u), f32(corner == 1u), f32(corner == 2u));
+  let vi = triangles[3u * face + corner];
+  out.scalar = vertex_scalar[min(vi, arrayLength(&vertex_scalar) - 1u)];
+  out.face = face;
+  return out;
+}
+
+@vertex
+fn vs_shadow(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4f {
+  let face = vid / 3u;
+  let p = load_position(triangles[vid]);
+  return select(frame.light_view_proj * vec4f(p, 1.0), CULLED, is_hidden(face));
+}
+
+// Maps the active quantity (or palette) to a base color.
+fn base_color(face: u32, vertex_value: f32, value_width: f32) -> vec3f {
+  let seg = segments[face_segment[face]];
+  if (obj.color_mode == 0u) {
+    return obj.base_color.rgb;
+  }
+  if (obj.color_mode == 1u) {
+    return unpack_srgb(seg.color);
+  }
+  var value = vertex_value;
+  if (obj.color_mode == 3u) {
+    value = bitcast<f32>(face_info[face].x);
+  } else if (obj.color_mode == 4u) {
+    value = seg.scalar;
+  }
+  let t = (value - obj.scalar_range.x) / max(obj.scalar_range.y - obj.scalar_range.x, 1e-20);
+  var c = colormap(obj.cmap_row, t);
+  if ((obj.flags & 1u) != 0u && obj.iso_spacing > 0.0 && obj.color_mode == 2u) {
+    // Contour lines: distance to the nearest multiple of iso_spacing, in pixels.
+    let d = abs(fract(value / obj.iso_spacing + 0.5) - 0.5) * obj.iso_spacing / max(value_width, 1e-20);
+    c *= mix(0.35, 1.0, smoothstep(0.5, 1.5, d));
+  }
+  return c;
+}
+
+// Coverage (0..1) of this triangle's edges at the pixel, `width_px` wide.
+// Each triangle draws the inner half of its edges, so a shared edge comes out
+// full width. Edges flagged flat in `flags` are skipped.
+fn edge_coverage(bary: vec3f, bary_width: vec3f, flags: u32, width_px: f32) -> f32 {
+  var d = bary / max(bary_width, vec3f(1e-6));  // pixels to the edge opposite each corner
+  // Edge k joins corners k and k+1, so it lies opposite corner (k + 2) % 3.
+  if ((flags & 4u) != 0u) { d.z = 1e6; }
+  if ((flags & 8u) != 0u) { d.x = 1e6; }
+  if ((flags & 16u) != 0u) { d.y = 1e6; }
+  let edge = min(d.x, min(d.y, d.z));
+  let w = width_px * 0.5;
+  return 1.0 - smoothstep(w - 0.5, w + 0.5, edge);
+}
+
+// Wire color: theme or object color, orange when its body is selected.
+fn wire_color(seg_flags: u32, albedo: vec3f) -> vec3f {
+  if ((seg_flags & 2u) != 0u) {
+    return select(frame.select_color.rgb, frame.active_color.rgb, (seg_flags & 4u) != 0u);
+  }
+  return select(frame.wire.rgb, albedo, frame.wire_mode.z > 0.5);
+}
+
+@fragment
+fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
+  // Screen-space derivatives first: they must run in uniform control flow.
+  let bary_width = fwidth(in.bary);
+  let value_width = fwidth(in.scalar);
+
+  var s: Surface;
+  s.n = select(-in.normal, in.normal, front);  // two-sided lighting
+  s.p = in.world_pos;
+  s.v = view_dir(in.world_pos);
+  s.albedo = base_color(in.face, in.scalar, value_width);
+  s.ao = sample_ao(in.clip.xy);
+  s.shadow = sample_shadow(in.world_pos, s.n);
+  s.metallic = obj.material.x;
+  s.roughness = obj.material.y;
+  var color = shade(s) * frame.style.y;
+
+  // Selection tint (faces and whole segments).
+  if ((face_info[in.face].y & 1u) != 0u) {
+    color = mix(color, frame.select_color.rgb, 0.45);
+  }
+  if ((segments[face_segment[in.face]].flags & 2u) != 0u) {
+    color = mix(color, frame.select_color.rgb, 0.15);
+  }
+
+  // Wireframe overlay on the shaded surface.
+  if (frame.wire.a > 0.0) {
+    let seg_flags = segments[face_segment[in.face]].flags;
+    let cov = edge_coverage(in.bary, bary_width, face_info[in.face].y, frame.wire.a);
+    color = mix(color, wire_color(seg_flags & 6u, frame.wire.rgb), cov);
+  }
+  return vec4f(color, 1.0);
+}
+
+// Wireframe shading (Blender's "Wireframe" mode with X-ray): only edges, no
+// depth test, so hidden edges show through. An optional faint face fill
+// (frame.wire_mode.y) keeps shapes readable; selected faces get a tint.
+@fragment
+fn fs_wire(in: VsOut) -> @location(0) vec4f {
+  let bary_width = fwidth(in.bary);
+  let value_width = fwidth(in.scalar);
+  let flags = face_info[in.face].y;
+  let albedo = base_color(in.face, in.scalar, value_width);
+  let cov = edge_coverage(in.bary, bary_width, flags, frame.wire.a);
+  let wire = wire_color(segments[face_segment[in.face]].flags, albedo);
+
+  var fill = albedo;
+  var fill_a = frame.wire_mode.y;
+  if ((flags & 1u) != 0u) {
+    fill = select(frame.select_color.rgb, frame.active_color.rgb, (flags & 2u) != 0u);
+    fill_a = max(fill_a, 0.3);
+  }
+  // Premultiplied "wire over fill".
+  let a = cov + fill_a * (1.0 - cov);
+  if (a <= 0.001) {
+    discard;
+  }
+  return vec4f(wire * cov + fill * fill_a * (1.0 - cov), a);
+}
+
+struct PrepassOut {
+  @location(0) normal: vec4f,  // view-space normal
+  @location(1) ids: vec4u,     // object id, face, segment, flags (bit 0 segment selected)
+};
+
+@fragment
+fn fs_prepass(in: VsOut, @builtin(front_facing) front: bool) -> PrepassOut {
+  var out: PrepassOut;
+  out.normal = vec4f(to_view(select(-in.normal, in.normal, front)), 1.0);
+  let seg = face_segment[in.face];
+  out.ids = vec4u(obj.object_id, in.face, seg, (segments[seg].flags >> 1u) & 1u);
+  return out;
+}
