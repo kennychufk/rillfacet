@@ -14,7 +14,7 @@
 //   1/2/3/4 vertex/edge/face/body mode, Alt+Z x-ray select, Alt+A / Esc clear,
 //   H hide selected bodies, Alt+H unhide the bodies the user hid.
 // Shading: Shift+Z Solid <-> Wireframe (see-through), Z wire overlay on Solid.
-// Tools: M measure (distance -> angle -> off), F12 screenshot.
+// Tools: M measure (distance -> angle -> off), F12 screenshot, F10 start/stop video.
 // Ctrl+LMB is left to the application (e.g. dragging simulated bodies).
 
 #include "avbd_viz/camera.h"
@@ -23,6 +23,7 @@
 #include "avbd_viz/scene.h"
 #include "avbd_viz/selection.h"
 
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <string>
@@ -57,7 +58,15 @@ class Viewer {
 
   bool frame();  // renders one frame; false once the window is closed
   void run();    // frame() until closed
+  // PNG of the last frame, including the UI.
   bool screenshot(const std::string& png_path);
+  // PNG taken at the end of the next frame, with or without the UI.
+  void request_screenshot(const std::string& png_path, bool with_ui);
+  // Video of every following frame: an .mp4 through ffmpeg when available,
+  // otherwise numbered PNGs next to `path`. Stops on window resize.
+  bool start_recording(const std::string& path, int fps = 30, bool with_ui = false);
+  void stop_recording();
+  bool recording() const { return video_ != nullptr || video_png_; }
   void set_ui_visible(bool v) { ui_visible_ = v; }
 
   void frame_all(bool animate = true);
@@ -78,6 +87,8 @@ class Viewer {
   void handle_measure_click(const glm::vec2& p);
   void build_overlays();
   void draw_ui();
+  void capture_panel();
+  void capture_frame();
   void apply_theme();
 
   ViewerOptions options_;
@@ -111,6 +122,13 @@ class Viewer {
   ImFont* ui_font_ = nullptr;
   ImFont* mono_font_ = nullptr;
   int screenshot_counter_ = 0;
+  std::string shot_path_;
+  bool shot_with_ui_ = true;
+  FILE* video_ = nullptr;
+  bool video_png_ = false, video_with_ui_ = false;
+  std::string video_path_;
+  int video_fps_ = 30, video_frames_ = 0;
+  uint32_t video_w_ = 0, video_h_ = 0;
   std::string status_;
   double status_until_ = 0;
 };

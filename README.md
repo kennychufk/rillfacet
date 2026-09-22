@@ -4,9 +4,16 @@ Real-time scientific viewer for the AVBD simulators, replacing polyscope.
 WebGPU (Dawn, Vulkan backend on Linux) + WGSL shaders + Dear ImGui. No
 dependency on avbd: simulators feed it plain arrays.
 
-Status: **v1 in progress.** Default look: **Studio**. MatCap, Environment PBR
-and Technical remain available under Display → Style. Shading is Solid (in the
+Status: **v1.** Default look: **Studio**. MatCap, Environment PBR and
+Technical remain available under Display → Style. Shading is Solid (in the
 chosen style) or Wireframe (see-through, Blender's X-ray wireframe).
+
+Structures: surface meshes (with segments = bodies), point clouds, curve
+networks (tubes), tet volume meshes and vector sets. Quantities: scalars,
+vectors (drawn as arrows) and colors on vertices, edges, faces, bodies or
+cells, colored through a colormap with optional isolines. Per structure
+opacity (order-independent transparency), a global slice plane that also cuts
+volumes open to show interior quantities, screenshots and video (ffmpeg).
 
 ## Build
 
@@ -20,7 +27,43 @@ cmake -S . -B build -G Ninja && cmake --build build
 `build_dawn.sh` pins a Dawn commit. It needs the X11 development headers,
 including `libx11-xcb-dev`.
 
-Simulator demo (lives in avbd-cuda, links this repo):
+Python module (`avbd_viz`, pybind11):
+
+```bash
+cmake -S . -B build -G Ninja -DAVBD_VIZ_BUILD_PYTHON=ON \
+      -DPython3_EXECUTABLE=$(which python) && cmake --build build
+pip install -e . --no-build-isolation        # or: PYTHONPATH=python
+PYTHONPATH=python python -m pytest tests -q   # headless checks
+```
+
+```python
+import avbd_viz as viz
+from avbd_viz import imgui              # polyscope.imgui-style subset
+
+v = viz.Viewer()                        # Viewer(headless=True) renders offscreen
+cloth = v.scene.add_mesh("cloth")
+cloth.set_geometry(verts, tris)         # numpy, lists or torch tensors (CUDA ok)
+cloth.add_scalar("speed", viz.ElementKind.Vertex, speed)
+cloth.color_quantity = "speed"
+cloth.colormap = "viridis"
+
+def callback():                         # every frame, inside the ImGui frame
+    sim.step(dt, iters)
+    cloth.set_positions(sim.positions)
+    if imgui.Button("Reset"):
+        ...
+v.set_callback(callback)
+v.run()
+```
+
+Simulator demos (live in avbd-cuda). Python, on the avbd `Simulator`
+(tet bodies as volume meshes, cloth, ropes):
+
+```bash
+cd ../avbd-cuda && python examples/viz_demo.py      # --headless --scene 1 --out knot.png
+```
+
+C++, on `RigidCompoundSimulator`:
 
 ```bash
 cd ../avbd-cuda && conda activate avbd
@@ -43,7 +86,7 @@ cmake --build build-viewer --target mixed_convex_viewer
 | Shading | Shift+Z Solid ↔ Wireframe (see-through; box select goes through), Z wire overlay on Solid |
 | Hide | H hides selected bodies, Alt+H unhides all; or tick them in Display → Structures → Bodies |
 | Measure | M cycles distance → angle → off; clicks snap to vertices within 12 px |
-| Misc | Alt+A / Esc clear selection, F12 screenshot |
+| Misc | Alt+A / Esc clear selection, F12 screenshot, F10 start/stop video |
 | Sim demo | Space shoot box, Ctrl+LMB drag body, P pause, → step |
 
 Axis views (numpad or gizmo) switch to orthographic; in the side views the grid
@@ -55,6 +98,15 @@ In wireframe shading, "Hide flat edges" skips edges between (nearly) coplanar
 faces, so triangulated convex hulls show only their real edges. Leave it off
 for cloth: on a flat sheet every edge is flat.
 
+Display → Slice plane cuts away everything on one side of an axis-aligned
+plane (per structure, "Cut by the slice plane"). Volume meshes are filled in at the
+cut, so cell and vertex quantities show inside the body; the cut faces can be
+picked and inspected like any other.
+
+Capture (Display panel): Screenshot writes a PNG; Record streams every frame
+to ffmpeg (H.264 .mp4), or numbered PNGs without ffmpeg. "Include UI" chooses
+between the full window and the 3D view alone.
+
 ## Layout
 
 ```
@@ -62,16 +114,21 @@ src/avbd_viz/
   gpu.*             WebGPU device, buffers, bind-group shorthands
   shader_library.*  WGSL loader: `#include`, hot reload on save
   camera.*          z-up turntable, reversed-Z infinite projection, smooth views
-  scene.*           SurfaceMesh (segments + quantities), PointCloud, VectorSet
+  scene.*           SurfaceMesh (segments), PointCloud, CurveNetwork, VolumeMesh,
+                    VectorSet; quantities on their elements
   renderer.*        frame graph: shadow -> prepass (depth/normal/ids) -> SSAO ->
-                    main (4x MSAA) -> composite (tonemap, outlines) -> overlays -> UI
+                    main (4x MSAA) -> transparency (weighted blended OIT) ->
+                    composite (tonemap, outlines) -> overlays -> UI
   selection.*       id-buffer picking, element choice, box select, measurements
   text.*            SDF font atlas (stb_truetype) for 3D labels
   environment.*     procedural / .hdr environments (GGX prefilter, SH9), matcaps
   ui.*, viewer.*    ImGui panels, gizmo, HUD, input, window loop, headless mode
 shaders/
   styles/{studio,matcap,pbr,technical}.wgsl   one `shade()` each: edit these to restyle
-  mesh, points, arrows, grid, ssao, composite, overlay_*, env_prefilter .wgsl
+  mesh, points, curves, arrows, grid, ssao, composite, overlay_*, env_prefilter .wgsl
+src/python/module.cpp   pybind11 module `_avbd_viz` (+ `avbd_viz.imgui`)
+python/avbd_viz/        Python package
+tests/                  headless Python tests
 ```
 
 ## Changing the look

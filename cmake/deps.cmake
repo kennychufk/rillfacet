@@ -25,6 +25,7 @@ FetchContent_Declare(stb
   GIT_TAG 2c980bb59875b0d32144a71867fbdebb2f77cd20)
 
 FetchContent_MakeAvailable(glfw glm)
+set_target_properties(glfw PROPERTIES POSITION_INDEPENDENT_CODE ON)  # linked into the Python module
 FetchContent_Populate(imgui)   # no CMakeLists upstream: built below
 FetchContent_Populate(implot)
 FetchContent_Populate(stb)

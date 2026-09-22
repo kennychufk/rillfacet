@@ -5,3 +5,7 @@ build*/
 imgui.ini
 .cache/
 compile_commands.json
+*.so
+__pycache__/
+*.egg-info/
+*.mp4

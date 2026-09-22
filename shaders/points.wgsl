@@ -6,18 +6,22 @@
 #include "common/scene.wgsl"
 #include STYLE
 
-// Must match `ItemUniforms` in renderer.cpp.
+// Must match `PointUniforms` in renderer.cpp.
 struct PointObject {
-  color: vec4f,      // linear rgb
-  material: vec4f,   // x = metallic, y = roughness
-  radius: f32,       // used when a point's own radius is negative
-  _unused: f32,
+  color: vec4f,         // linear rgb
+  material: vec4f,      // x = metallic, y = roughness
+  radius: f32,          // used when a point's own radius is negative
+  color_mode: u32,      // 0 uniform, 2 per-point scalar, 5 per-point color
   object_id: u32,
+  flags: u32,           // bit 1 cut by the slice plane, bit 3 whole cloud selected
+  scalar_range: vec2f,
+  cmap_row: u32,
   _pad: u32,
 };
 
 @group(1) @binding(0) var<uniform> pobj: PointObject;
 @group(1) @binding(1) var<storage, read> points: array<vec4f>;  // xyz + radius
+@group(1) @binding(2) var<storage, read> point_attr: array<f32>;  // scalar or packed color
 
 struct VsOut {
   @builtin(position) clip: vec4f,
@@ -38,6 +42,10 @@ fn vs_main(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -
   let q = vec3f(c.xy + corners[vid] * r * 1.3, c.z + r);
   var out: VsOut;
   out.clip = frame.proj * vec4f(q, 1.0);
+  // Points beyond the slice plane are dropped whole.
+  if ((pobj.flags & 2u) != 0u && dot(frame.slice.xyz, pt.xyz) > frame.slice.w) {
+    out.clip = vec4f(0.0, 0.0, -2.0, 1.0);
+  }
   out.quad_pos = q;
   out.center = c;
   out.radius = r;
@@ -72,6 +80,17 @@ fn trace(in: VsOut) -> Hit {
   return hit;
 }
 
+fn point_albedo(i: u32) -> vec3f {
+  let a = point_attr[min(i, arrayLength(&point_attr) - 1u)];
+  if (pobj.color_mode == 2u) {
+    return colormap(pobj.cmap_row, (a - pobj.scalar_range.x) / max(pobj.scalar_range.y - pobj.scalar_range.x, 1e-20));
+  }
+  if (pobj.color_mode == 5u) {
+    return unpack_srgb(bitcast<u32>(a));
+  }
+  return pobj.color.rgb;
+}
+
 struct ColorOut {
   @location(0) color: vec4f,
   @builtin(frag_depth) depth: f32,
@@ -84,7 +103,7 @@ fn fs_main(in: VsOut) -> ColorOut {
   s.p = (frame.inv_view * vec4f(hit.pos, 1.0)).xyz;
   s.n = normalize((frame.inv_view * vec4f(hit.normal, 0.0)).xyz);
   s.v = view_dir(s.p);
-  s.albedo = pobj.color.rgb;
+  s.albedo = point_albedo(in.index);
   s.ao = sample_ao(in.clip.xy);
   s.shadow = sample_shadow(s.p, s.n);
   s.metallic = pobj.material.x;
@@ -106,7 +125,7 @@ fn fs_prepass(in: VsOut) -> PrepassOut {
   let hit = trace(in);
   var out: PrepassOut;
   out.normal = vec4f(hit.normal, 1.0);
-  out.ids = vec4u(pobj.object_id, in.index, 0u, 0u);
+  out.ids = vec4u(pobj.object_id, in.index, 0u, (pobj.flags >> 3u) & 1u);
   out.depth = hit.depth;
   return out;
 }

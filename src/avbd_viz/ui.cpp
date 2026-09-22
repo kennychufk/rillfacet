@@ -3,16 +3,11 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <limits>
 #include <set>
-
-namespace avbd_viz {
-int colormap_count();
-const char* colormap_name(int i);
-glm::vec3 colormap_color(int map, float t);  // sRGB
-}  // namespace avbd_viz
 
 namespace avbd_viz::ui {
 
@@ -109,8 +104,15 @@ std::string format_length(double v, double step) {
   char buf[64];
   double a = std::abs(step);
   if (std::abs(v) < 1e-12) return "0";
-  if (a >= 1.0) {
-    std::snprintf(buf, sizeof buf, "%.0f m", v);
+  if (a >= 0.1) {
+    int dec = a >= 1.0 ? 0 : 1;  // "1.5 m", "20 m"
+    std::snprintf(buf, sizeof buf, "%.*f", dec, v);
+    std::string t = buf;
+    if (t.find('.') != std::string::npos) {
+      t.erase(t.find_last_not_of('0') + 1);
+      if (t.back() == '.') t.pop_back();
+    }
+    return t + " m";
   } else if (a >= 0.01) {
     std::snprintf(buf, sizeof buf, "%.0f cm", v * 100.0);
   } else if (a >= 0.001) {
@@ -193,6 +195,100 @@ static void body_list(SurfaceMesh& m, Selection& sel) {
     }
   ImGui::EndChild();
   ImGui::TreePop();
+}
+
+// Slice plane controls: axis, position within the scene bounds, side.
+static void slice_section(const Scene& scene, RenderSettings& s) {
+  ImGui::SeparatorText("Slice plane");
+  ImGui::Checkbox("Cut the scene", &s.slice.enabled);
+  if (!s.slice.enabled) return;
+  ImGui::SameLine();
+  ImGui::RadioButton("X", &s.slice.axis, 0);
+  ImGui::SameLine();
+  ImGui::RadioButton("Y", &s.slice.axis, 1);
+  ImGui::SameLine();
+  ImGui::RadioButton("Z", &s.slice.axis, 2);
+  glm::vec3 lo(-1.0f), hi(1.0f);
+  scene.bounds(lo, hi);
+  float a = lo[s.slice.axis], b = hi[s.slice.axis];
+  if (b - a < 1e-6f) a -= 0.5f, b += 0.5f;
+  ImGui::SliderFloat("Position", &s.slice.offset, a, b, "%.4g m");
+  ImGui::Checkbox("Flip side", &s.slice.flip);
+  ImGui::SameLine();
+  ImGui::Checkbox("Outline", &s.slice.show);
+}
+
+// Coloring, quantities and per-kind options of one structure.
+static void appearance(QuantityStructure& q, RenderSettings& s, Selection& selection) {
+  bool changed = false;
+  auto* mesh = dynamic_cast<SurfaceMesh*>(&q);
+  int src = mesh ? int(q.color_source) : (q.color_source == ColorSource::Quantity ? 1 : 0);
+  if (ImGui::Combo("Color by", &src, mesh ? "Uniform\0Per body\0Quantity\0" : "Uniform\0Quantity\0")) {
+    q.color_source = mesh ? ColorSource(src) : (src ? ColorSource::Quantity : ColorSource::Uniform);
+    if (q.color_source == ColorSource::Quantity && q.color_quantity.empty() && !q.quantities().empty())
+      q.color_quantity = q.quantities()[0].name;
+    changed = true;
+  }
+  if (q.color_source == ColorSource::Uniform) changed |= ImGui::ColorEdit3("Color", &q.color.x);
+  if (q.color_source == ColorSource::Quantity) {
+    if (ImGui::BeginCombo("Quantity", q.color_quantity.empty() ? "(none)" : q.color_quantity.c_str())) {
+      for (const Quantity& qu : q.quantities()) {
+        const char* type = qu.type == QuantityType::Color ? ", color" : qu.type == QuantityType::Vector ? ", |v|" : "";
+        std::string label = qu.name + "  (" + element_name(qu.on) + type + ")";
+        if (ImGui::Selectable(label.c_str(), qu.name == q.color_quantity)) {
+          q.color_quantity = qu.name;
+          changed = true;
+        }
+      }
+      ImGui::EndCombo();
+    }
+    const Quantity* cq = q.coloring_quantity();
+    if (cq && cq->type != QuantityType::Color) {
+      if (ImGui::BeginCombo("Colormap", colormap_name(q.colormap))) {
+        for (int i = 0; i < colormap_count(); ++i)
+          if (ImGui::Selectable(colormap_name(i), i == q.colormap)) q.colormap = i;
+        ImGui::EndCombo();
+      }
+      changed |= ImGui::Checkbox("Auto range", &q.auto_range);
+      if (!q.auto_range) changed |= ImGui::DragFloat2("Range", &q.range.x, 0.01f);
+      bool iso_ok = cq->on == ElementKind::Vertex &&
+                    (q.kind() == StructureKind::SurfaceMesh || q.kind() == StructureKind::VolumeMesh);
+      if (iso_ok) {
+        changed |= ImGui::Checkbox("Isolines", &q.isolines);
+        if (q.isolines) changed |= ImGui::DragFloat("Spacing", &q.isoline_spacing, 0.001f, 1e-6f, 1e6f, "%.4g");
+      }
+    }
+  }
+  if (auto* p = dynamic_cast<PointCloud*>(&q))
+    ImGui::SliderFloat("Radius", &p->radius, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
+  if (auto* c = dynamic_cast<CurveNetwork*>(&q))
+    ImGui::SliderFloat("Radius", &c->radius, 0.0005f, 0.5f, "%.4f", ImGuiSliderFlags_Logarithmic);
+  if (mesh) ImGui::Checkbox("Smooth shading", &mesh->smooth_shading);
+  if (mesh || q.kind() == StructureKind::VolumeMesh) ImGui::SliderFloat("Opacity", &q.opacity, 0.05f, 1.0f);
+  if (s.slice.enabled) ImGui::Checkbox("Cut by the slice plane", &q.sliced);
+  if (s.style == Style::EnvironmentPBR) {
+    changed |= ImGui::SliderFloat("Metallic", &q.metallic, 0.0f, 1.0f);
+    changed |= ImGui::SliderFloat("Roughness", &q.roughness, 0.02f, 1.0f);
+  }
+  // Vector quantities as arrows.
+  for (Quantity& qu : q.quantities()) {
+    if (qu.type != QuantityType::Vector) continue;
+    ImGui::PushID(qu.name.c_str());
+    ImGui::Checkbox(("Arrows: " + qu.name).c_str(), &qu.show_arrows);
+    if (qu.show_arrows) {
+      ImGui::SliderFloat("Scale", &qu.arrow_scale, 1e-4f, 1e4f, "%.4g", ImGuiSliderFlags_Logarithmic);
+      ImGui::ColorEdit3("Arrow color", &qu.arrow_color.x);
+    }
+    ImGui::PopID();
+  }
+  std::string counts;
+  for (ElementKind e : {ElementKind::Vertex, ElementKind::Edge, ElementKind::Face, ElementKind::Cell})
+    if (size_t n = (e == ElementKind::Edge && mesh) ? 0 : q.count(e))
+      counts += (counts.empty() ? "" : ", ") + std::to_string(n) + " " + element_name(e) + (n == 1 ? "" : "s");
+  if (mesh) counts += ", " + std::to_string(mesh->num_segments()) + " bodies";
+  ImGui::TextDisabled("%s", counts.c_str());
+  if (changed) q.touch_attributes();
+  if (mesh && mesh->num_segments() > 1) body_list(*mesh, selection);
 }
 
 void display_panel(Scene& scene, RenderSettings& s, Selection& selection) {
@@ -298,56 +394,18 @@ void display_panel(Scene& scene, RenderSettings& s, Selection& selection) {
   ImGui::Checkbox("Shadow catcher", &s.ground_shadow);
   ImGui::DragFloat("Height", &s.ground_height, 0.01f);
 
+  slice_section(scene, s);
+
   ImGui::SeparatorText("Structures");
   for (const auto& sp : scene.structures()) {
     ImGui::PushID(int(sp->id()));
     ImGui::Checkbox("##vis", &sp->visible);
     ImGui::SameLine();
     bool open = ImGui::TreeNode(sp->name().c_str());
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", structure_kind_name(sp->kind()));
     if (open) {
-      if (auto* m = dynamic_cast<SurfaceMesh*>(sp.get())) {
-        bool changed = false;
-        int src = int(m->color_source);
-        changed |= ImGui::Combo("Color by", &src, "Uniform\0Per body\0Quantity\0");
-        m->color_source = ColorSource(src);
-        if (m->color_source == ColorSource::Uniform) changed |= ImGui::ColorEdit3("Color", &m->color.x);
-        if (m->color_source == ColorSource::Quantity) {
-          if (ImGui::BeginCombo("Quantity", m->color_quantity.empty() ? "(none)" : m->color_quantity.c_str())) {
-            for (const Quantity& q : m->quantities()) {
-              if (q.on == ElementKind::Edge) continue;
-              std::string label = q.name + "  (" + element_name(q.on) + (q.dims == 3 ? ", |v|)" : ")");
-              if (ImGui::Selectable(label.c_str(), q.name == m->color_quantity)) {
-                m->color_quantity = q.name;
-                changed = true;
-              }
-            }
-            ImGui::EndCombo();
-          }
-          if (ImGui::BeginCombo("Colormap", colormap_name(m->colormap))) {
-            for (int i = 0; i < colormap_count(); ++i)
-              if (ImGui::Selectable(colormap_name(i), i == m->colormap)) m->colormap = i;
-            ImGui::EndCombo();
-          }
-          changed |= ImGui::Checkbox("Auto range", &m->auto_range);
-          if (!m->auto_range) ImGui::DragFloat2("Range", &m->range.x, 0.01f);
-          const Quantity* q = m->quantity(m->color_quantity);
-          ImGui::BeginDisabled(!q || q->on != ElementKind::Vertex);
-          ImGui::Checkbox("Isolines", &m->isolines);
-          if (m->isolines) ImGui::DragFloat("Spacing", &m->isoline_spacing, 0.001f, 1e-6f, 1e6f, "%.4g");
-          ImGui::EndDisabled();
-        }
-        if (s.style == Style::EnvironmentPBR) {
-          ImGui::SliderFloat("Metallic", &m->metallic, 0.0f, 1.0f);
-          ImGui::SliderFloat("Roughness", &m->roughness, 0.02f, 1.0f);
-        }
-        ImGui::TextDisabled("%zu vertices, %zu faces, %zu bodies", m->num_vertices(), m->num_faces(),
-                            m->num_segments());
-        if (changed) m->touch_attributes();
-        if (m->num_segments() > 1) body_list(*m, selection);
-      } else if (auto* p = dynamic_cast<PointCloud*>(sp.get())) {
-        ImGui::ColorEdit3("Color", &p->color.x);
-        ImGui::SliderFloat("Radius", &p->radius, 0.001f, 1.0f, "%.3f", ImGuiSliderFlags_Logarithmic);
-        ImGui::TextDisabled("%zu points", p->size());
+      if (auto* q = dynamic_cast<QuantityStructure*>(sp.get())) {
+        appearance(*q, s, selection);
       } else if (auto* v = dynamic_cast<VectorSet*>(sp.get())) {
         ImGui::ColorEdit3("Color", &v->color.x);
         ImGui::SliderFloat("Radius", &v->radius, 0.001f, 0.2f, "%.3f", ImGuiSliderFlags_Logarithmic);
@@ -387,14 +445,14 @@ struct Table {
   }
 };
 
-void quantity_rows(Table& t, const SurfaceMesh& m, ElementKind on, uint32_t index) {
-  for (const Quantity& q : m.quantities()) {
+void quantity_rows(Table& t, const QuantityStructure& s, ElementKind on, uint32_t index) {
+  for (const Quantity& q : s.quantities()) {
     if (q.on != on || size_t(index + 1) * q.dims > q.data.size()) continue;
     if (q.dims == 1) {
       t.row(q.name, fmt("%.6g", q.data[index]));
     } else {
       glm::vec3 v(q.data[3 * index], q.data[3 * index + 1], q.data[3 * index + 2]);
-      t.row(q.name, fmt3(v) + "  |" + fmt("%.4g", glm::length(v)) + "|");
+      t.row(q.name, q.type == QuantityType::Color ? "rgb " + fmt3(v) : fmt3(v) + "  |" + fmt("%.4g", glm::length(v)) + "|");
     }
   }
 }
@@ -410,6 +468,98 @@ double measurement_value(const Scene& scene, const Measurement& m, glm::vec3* de
   glm::vec3 c = resolve_anchor(scene, m.anchors[2]);
   glm::vec3 u = glm::normalize(a - b), w = glm::normalize(c - b);
   return glm::degrees(std::acos(std::clamp(glm::dot(u, w), -1.0f, 1.0f)));
+}
+
+// Rows for one selected element of a mesh (with its owning body).
+void mesh_rows(Table& table, const SurfaceMesh& m, PickMode mode, uint32_t index) {
+  uint32_t seg = 0;
+  switch (mode) {
+    case PickMode::Vertex:
+      table.row("Vertex", std::to_string(index));
+      table.row("Position", fmt3(m.vertex(index)));
+      quantity_rows(table, m, ElementKind::Vertex, index);
+      seg = m.segment_of_vertex(index);
+      break;
+    case PickMode::Edge: {
+      uint32_t a = m.edges()[2 * index], b = m.edges()[2 * index + 1];
+      glm::vec3 d = m.vertex(b) - m.vertex(a);
+      table.row("Edge", std::to_string(index));
+      table.row("Vertices", std::to_string(a) + ", " + std::to_string(b));
+      table.row("Length", fmt("%.6g", glm::length(d)));
+      table.row("Direction", fmt3(glm::normalize(d)));
+      table.row("Midpoint", fmt3(0.5f * (m.vertex(a) + m.vertex(b))));
+      quantity_rows(table, m, ElementKind::Edge, index);
+      seg = m.segment_of_vertex(a);
+      break;
+    }
+    case PickMode::Face: {
+      glm::uvec3 f = m.face(index);
+      glm::vec3 p0 = m.vertex(f.x), p1 = m.vertex(f.y), p2 = m.vertex(f.z);
+      glm::vec3 n = glm::cross(p1 - p0, p2 - p0);
+      table.row("Face", std::to_string(index));
+      table.row("Vertices", std::to_string(f.x) + ", " + std::to_string(f.y) + ", " + std::to_string(f.z));
+      table.row("Area", fmt("%.6g", 0.5 * glm::length(n)));
+      table.row("Normal", fmt3(glm::normalize(n)));
+      table.row("Centroid", fmt3((p0 + p1 + p2) / 3.0f));
+      quantity_rows(table, m, ElementKind::Face, index);
+      seg = m.segment_of_face(index);
+      break;
+    }
+    case PickMode::Segment: seg = index; break;
+  }
+  // The owning segment ("body").
+  table.section(m.segment_name(seg));
+  const auto& off = m.segment_offsets();
+  glm::vec3 lo(std::numeric_limits<float>::max()), hi = -lo;
+  std::set<uint32_t> verts;
+  for (uint32_t f = off[seg]; f < off[seg + 1]; ++f)
+    for (int k = 0; k < 3; ++k) {
+      uint32_t v = m.triangles()[3 * f + k];
+      verts.insert(v);
+      lo = glm::min(lo, m.vertex(v));
+      hi = glm::max(hi, m.vertex(v));
+    }
+  if (mode == PickMode::Segment) {
+    table.row("Faces", std::to_string(off[seg + 1] - off[seg]));
+    table.row("Vertices", std::to_string(verts.size()));
+    table.row("Size", fmt3(hi - lo));
+  }
+  table.row("Bounds center", fmt3(0.5f * (lo + hi)));
+  quantity_rows(table, m, ElementKind::Segment, seg);
+}
+
+// Rows for one selected element (or the whole) of a point cloud, curve
+// network or volume mesh.
+void element_rows(Table& table, const QuantityStructure& q, ElementKind k, uint32_t index) {
+  if (k == ElementKind::Segment) {
+    for (ElementKind e : {ElementKind::Vertex, ElementKind::Edge, ElementKind::Face, ElementKind::Cell})
+      if (q.count(e)) table.row(std::string(element_name(e)) + "s", std::to_string(q.count(e)));
+    glm::vec3 lo, hi;
+    if (q.bounds(lo, hi)) {
+      table.row("Size", fmt3(hi - lo));
+      table.row("Bounds center", fmt3(0.5f * (lo + hi)));
+    }
+    return;
+  }
+  if (index >= q.count(k)) return;
+  std::string label = q.kind() == StructureKind::CurveNetwork && k == ElementKind::Vertex ? "Node"
+                      : q.kind() == StructureKind::PointCloud ? "Point" : element_name(k);
+  label[0] = char(std::toupper(label[0]));
+  table.row(label, std::to_string(index));
+  table.row("Position", fmt3(q.element_position(k, index)));
+  if (auto* c = dynamic_cast<const CurveNetwork*>(&q); c && k == ElementKind::Edge) {
+    glm::uvec2 e = c->edge(index);
+    table.row("Nodes", std::to_string(e.x) + ", " + std::to_string(e.y));
+    table.row("Length", fmt("%.6g", glm::length(c->node(e.y) - c->node(e.x))));
+  }
+  if (auto* v = dynamic_cast<const VolumeMesh*>(&q); v && k == ElementKind::Cell) {
+    glm::uvec4 t = v->cell(index);
+    table.row("Vertices", std::to_string(t.x) + ", " + std::to_string(t.y) + ", " + std::to_string(t.z) + ", " +
+                              std::to_string(t.w));
+    table.row("Volume", fmt("%.6g", v->cell_volume(index)));
+  }
+  if (auto* p = dynamic_cast<const PointCloud*>(&q)) table.row("Radius", fmt("%.4g", p->point_radius(index)));
+  quantity_rows(table, q, k, index);
 }
 
 }  // namespace
@@ -467,70 +617,13 @@ void inspector_panel(Scene& scene, Selection& sel, std::vector<Measurement>& mea
       const Structure* s = scene.find(e.object);
       table.row("Object", s ? s->name() : "?");
       if (auto* m = dynamic_cast<const SurfaceMesh*>(s)) {
-        uint32_t seg = 0;
-        switch (sel.mode()) {
-          case PickMode::Vertex:
-            table.row("Vertex", std::to_string(e.index));
-            table.row("Position", fmt3(m->vertex(e.index)));
-            quantity_rows(table, *m, ElementKind::Vertex, e.index);
-            seg = m->segment_of_vertex(e.index);
-            break;
-          case PickMode::Edge: {
-            uint32_t a = m->edges()[2 * e.index], b = m->edges()[2 * e.index + 1];
-            glm::vec3 d = m->vertex(b) - m->vertex(a);
-            table.row("Edge", std::to_string(e.index));
-            table.row("Vertices", std::to_string(a) + ", " + std::to_string(b));
-            table.row("Length", fmt("%.6g", glm::length(d)));
-            table.row("Direction", fmt3(glm::normalize(d)));
-            table.row("Midpoint", fmt3(0.5f * (m->vertex(a) + m->vertex(b))));
-            quantity_rows(table, *m, ElementKind::Edge, e.index);
-            seg = m->segment_of_vertex(a);
-            break;
-          }
-          case PickMode::Face: {
-            glm::uvec3 f = m->face(e.index);
-            glm::vec3 p0 = m->vertex(f.x), p1 = m->vertex(f.y), p2 = m->vertex(f.z);
-            glm::vec3 n = glm::cross(p1 - p0, p2 - p0);
-            table.row("Face", std::to_string(e.index));
-            table.row("Vertices", std::to_string(f.x) + ", " + std::to_string(f.y) + ", " + std::to_string(f.z));
-            table.row("Area", fmt("%.6g", 0.5 * glm::length(n)));
-            table.row("Normal", fmt3(glm::normalize(n)));
-            table.row("Centroid", fmt3((p0 + p1 + p2) / 3.0f));
-            quantity_rows(table, *m, ElementKind::Face, e.index);
-            seg = m->segment_of_face(e.index);
-            break;
-          }
-          case PickMode::Segment: seg = e.index; break;
-        }
-        // The owning segment ("body").
-        table.section(m->segment_name(seg));
-        const auto& off = m->segment_offsets();
-        glm::vec3 lo(std::numeric_limits<float>::max()), hi = -lo;
-        std::set<uint32_t> verts;
-        for (uint32_t f = off[seg]; f < off[seg + 1]; ++f)
-          for (int k = 0; k < 3; ++k) {
-            uint32_t v = m->triangles()[3 * f + k];
-            verts.insert(v);
-            lo = glm::min(lo, m->vertex(v));
-            hi = glm::max(hi, m->vertex(v));
-          }
-        if (sel.mode() == PickMode::Segment) {
-          table.row("Faces", std::to_string(off[seg + 1] - off[seg]));
-          table.row("Vertices", std::to_string(verts.size()));
-          table.row("Size", fmt3(hi - lo));
-        }
-        table.row("Bounds center", fmt3(0.5f * (lo + hi)));
-        quantity_rows(table, *m, ElementKind::Segment, seg);
-      } else if (auto* p = dynamic_cast<const PointCloud*>(s)) {
-        table.row("Point", std::to_string(e.index));
-        table.row("Position", fmt3(p->point(e.index)));
-        float r = p->packed()[4 * e.index + 3];
-        table.row("Radius", fmt("%.4g", r > 0 ? r : p->radius));
-      } else if (auto* v = dynamic_cast<const VectorSet*>(s)) {
-        glm::vec3 o(v->origins()[3 * e.index], v->origins()[3 * e.index + 1], v->origins()[3 * e.index + 2]);
+        mesh_rows(table, *m, sel.mode(), e.index);
+      } else if (auto* q = dynamic_cast<const QuantityStructure*>(s)) {
+        element_rows(table, *q, picked_kind(*s, sel.mode()), e.index);
+      } else if (auto* v = dynamic_cast<const VectorSet*>(s); v && e.index < v->size()) {
         glm::vec3 d(v->vectors()[3 * e.index], v->vectors()[3 * e.index + 1], v->vectors()[3 * e.index + 2]);
         table.row("Vector", std::to_string(e.index));
-        table.row("Origin", fmt3(o));
+        table.row("Origin", fmt3(v->origin(e.index)));
         table.row("Value", fmt3(d));
         table.row("Length", fmt("%.6g", glm::length(d)));
       }
@@ -546,23 +639,21 @@ void inspector_panel(Scene& scene, Selection& sel, std::vector<Measurement>& mea
       table.row("Centroid", fmt3(sum / float(items.size())));
       table.row("Extent", fmt3(hi - lo));
       // Statistics of every quantity on the selected element kind.
-      ElementKind kind = ElementKind(int(sel.mode()));
-      if (auto* m = scene.get<SurfaceMesh>(items[0].object)) {
-        for (const Quantity& q : m->quantities()) {
-          if (q.on != kind) continue;
+      if (auto* q = scene.get<QuantityStructure>(items[0].object)) {
+        ElementKind kind = picked_kind(*q, sel.mode());
+        for (const Quantity& qu : q->quantities()) {
+          if (qu.on != kind || qu.type == QuantityType::Color) continue;
           double mn = 1e300, mx = -1e300, acc = 0;
           size_t n = 0;
           for (const ElementRef& e : items) {
-            if (e.object != m->id() || size_t(e.index + 1) * q.dims > q.data.size()) continue;
-            double v = q.dims == 1 ? q.data[e.index]
-                                   : glm::length(glm::vec3(q.data[3 * e.index], q.data[3 * e.index + 1],
-                                                           q.data[3 * e.index + 2]));
+            if (e.object != q->id() || size_t(e.index + 1) * qu.dims > qu.data.size()) continue;
+            double v = qu.value(e.index);
             mn = std::min(mn, v);
             mx = std::max(mx, v);
             acc += v;
             ++n;
           }
-          if (n) table.row(q.name, fmt("min %.4g", mn) + fmt("  max %.4g", mx) + fmt("  mean %.4g", acc / n));
+          if (n) table.row(qu.name, fmt("min %.4g", mn) + fmt("  max %.4g", mx) + fmt("  mean %.4g", acc / n));
         }
       }
     }
@@ -747,11 +838,10 @@ void hud(const Camera& cam, const RenderSettings& s, const glm::vec2& vp, float 
 
 void colorbar(const Scene& scene, const glm::vec2& vp) {
   for (const auto& sp : scene.structures()) {
-    auto* m = dynamic_cast<const SurfaceMesh*>(sp.get());
-    if (!m || !m->visible || m->color_source != ColorSource::Quantity) continue;
-    const Quantity* q = m->quantity(m->color_quantity);
-    if (!q) continue;
-    glm::vec2 r = m->auto_range ? m->quantity_range(*q) : m->range;
+    auto* m = dynamic_cast<const QuantityStructure*>(sp.get());
+    const Quantity* q = m && m->visible ? m->coloring_quantity() : nullptr;
+    if (!q || q->type == QuantityType::Color) continue;
+    glm::vec2 r = m->color_range();
     const float w = 240, h = 12;
     ImGui::SetNextWindowPos(ImVec2(vp.x * 0.5f, vp.y - 12), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
     ImGui::SetNextWindowBgAlpha(0.75f);
@@ -759,7 +849,7 @@ void colorbar(const Scene& scene, const glm::vec2& vp) {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                      ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs |
                      ImGuiWindowFlags_NoDocking);
-    std::string title = m->color_quantity + (q->dims == 3 ? " (magnitude)" : "");
+    std::string title = m->name() + ": " + m->color_quantity + (q->dims == 3 ? " (magnitude)" : "");
     ImGui::TextUnformatted(title.c_str());
     ImVec2 p = ImGui::GetCursorScreenPos();
     ImDrawList* dl = ImGui::GetWindowDrawList();

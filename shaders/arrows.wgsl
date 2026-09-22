@@ -13,7 +13,7 @@ struct ArrowObject {
   radius: f32,        // shaft radius (world units)
   length_scale: f32,
   object_id: u32,
-  _pad: u32,
+  flags: u32,         // bit 1: cut by the slice plane (arrows whose origin is beyond it vanish)
 };
 
 struct Arrow {
@@ -68,7 +68,8 @@ fn vs_main(@location(0) tmpl: vec2f, @builtin(instance_index) iid: u32) -> VsOut
   out.world_pos = a.origin.xyz + p;
   out.normal = n;
   out.clip = frame.view_proj * vec4f(out.world_pos, 1.0);
-  if (len <= 1e-12) {
+  let cut = (aobj.flags & 2u) != 0u && dot(frame.slice.xyz, a.origin.xyz) > frame.slice.w;
+  if (len <= 1e-12 || cut) {
     out.clip = vec4f(0.0, 0.0, -2.0, 1.0);
   }
   out.index = iid;

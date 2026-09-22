@@ -3,10 +3,9 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstring>
-#include <map>
+#include <set>
 #include <unordered_set>
 
 namespace avbd_viz {
@@ -36,9 +35,31 @@ static glm::vec4 lin(float r, float g, float b, float a = 1.0f) {
   return glm::vec4(srgb_to_linear({r, g, b}), a);
 }
 
-static uint32_t pack_srgb(const glm::vec3& c) {
-  auto b = [](float x) { return uint32_t(std::lround(std::clamp(x, 0.0f, 1.0f) * 255.0f)); };
-  return b(c.r) | (b(c.g) << 8) | (b(c.b) << 16) | (255u << 24);
+static uint32_t pack_srgb(float r, float g, float b) {
+  auto q = [](float x) { return uint32_t(std::lround(std::clamp(x, 0.0f, 1.0f) * 255.0f)); };
+  return q(r) | (q(g) << 8) | (q(b) << 16) | (255u << 24);
+}
+
+static uint32_t pack_srgb(const glm::vec3& c) { return pack_srgb(c.r, c.g, c.b); }
+
+static float bits_to_float(uint32_t u) {
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+static uint32_t float_to_bits(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  return u;
+}
+
+// Per-element value a shader reads: the scalar (vector magnitude), or a
+// packed sRGB color reinterpreted as a float.
+static float attr_value(const Quantity& q, size_t i) {
+  if (q.type == QuantityType::Color)
+    return bits_to_float(pack_srgb(q.data[3 * i], q.data[3 * i + 1], q.data[3 * i + 2]));
+  return q.value(i);
 }
 
 const char* style_name(Style s) {
@@ -70,6 +91,12 @@ void RenderSettings::apply_style_defaults(Style s) {
   }
 }
 
+glm::vec4 SlicePlane::equation() const {
+  glm::vec3 n(0.0f);
+  n[axis] = flip ? -1.0f : 1.0f;
+  return {n, flip ? -offset : offset};
+}
+
 GridPlane grid_plane(const Camera& camera, const RenderSettings& settings) {
   GridPlane g;
   int axis = camera.aligned_axis();
@@ -92,7 +119,7 @@ struct MeshUniforms {
   glm::vec4 base_color{1.0f};
   uint32_t color_mode = 0, cmap_row = 0, flags = 0, object_id = 0;
   glm::vec2 scalar_range{0, 1};
-  float iso_spacing = 0, pad = 0;
+  float iso_spacing = 0, edge_band = 2;
   glm::vec4 material{0};
 };
 static_assert(sizeof(MeshUniforms) == 128);
@@ -103,14 +130,32 @@ struct SegmentInfo {
   uint32_t pad;
 };
 
-// Mirrors `PointObject` / `ArrowObject`.
+// Mirrors `ArrowObject` in shaders/arrows.wgsl.
 struct ItemUniforms {
   glm::vec4 color;
   glm::vec4 material;
   float radius;
-  float length_scale;  // vectors only
+  float length_scale;
   uint32_t object_id;
-  uint32_t pad;
+  uint32_t flags;  // bit 1: cut by the slice plane
+};
+
+// Mirrors `PointObject` (points.wgsl) and `CurveObject` (curves.wgsl).
+struct PointUniforms {
+  glm::vec4 color{1.0f};
+  glm::vec4 material{0.0f};
+  float radius = 0;
+  uint32_t color_mode = 0, object_id = 0, flags = 0;
+  glm::vec2 scalar_range{0, 1};
+  uint32_t cmap_row = 0, pad = 0;
+};
+static_assert(sizeof(PointUniforms) == 64);
+using CurveUniforms = PointUniforms;
+
+struct Renderer::MeshSelection {
+  std::vector<uint32_t> faces, segments;
+  int64_t active_face = -1, active_segment = -1;
+  uint64_t version = 0;
 };
 
 struct Renderer::MeshGpu {
@@ -118,33 +163,56 @@ struct Renderer::MeshGpu {
   float edge_angle = 0.0f;
   std::string color_key;
   wgpu::Buffer ubo;
-  DynamicBuffer positions, triangles, face_segment, segments, vertex_scalar, face_info;
+  DynamicBuffer positions, triangles, face_segment, segments, vertex_attr, face_info, vertex_faces;
   wgpu::BindGroup group;
   MeshUniforms u;
   uint32_t faces = 0;
+  bool transparent = false;
 };
 
 struct Renderer::PointsGpu {
-  uint64_t ver = 0;
+  uint64_t pos_ver = 0, attr_ver = 0;
+  std::string color_key;
   wgpu::Buffer ubo;
-  DynamicBuffer points;
+  DynamicBuffer points, attr;
   wgpu::BindGroup group;
+  PointUniforms u;
+  uint32_t count = 0;
+};
+
+struct Renderer::CurvesGpu {
+  uint64_t pos_ver = 0, topo_ver = 0, attr_ver = 0;
+  std::string color_key;
+  wgpu::Buffer ubo;
+  DynamicBuffer nodes, edges, node_attr, edge_attr;
+  wgpu::BindGroup group;
+  CurveUniforms u;
   uint32_t count = 0;
 };
 
 struct Renderer::VectorsGpu {
-  uint64_t ver = 0;
+  uint64_t ver = 0, attr_ver = 0;
   wgpu::Buffer ubo;
   DynamicBuffer arrows;
   wgpu::BindGroup group;
   uint32_t count = 0;
 };
 
+// A volume mesh draws as two internal surface meshes: its boundary, clipped
+// by the slice plane, and the cross-section at the plane.
+struct Renderer::VolumeGpu {
+  SurfaceMesh boundary, cut;
+  MeshGpu boundary_gpu, cut_gpu;
+  uint64_t topo = 0, pos = 0, attr = 0;
+  glm::vec4 plane{0.0f};
+  bool cut_active = false;
+};
+
 // ---- Pipeline construction ----------------------------------------------------
 
 namespace {
 
-enum class Blend { Opaque, Premultiplied };
+enum class Blend { Opaque, Premultiplied, WeightedOit };
 
 struct PipelineSpec {
   wgpu::ShaderModule module;
@@ -165,13 +233,20 @@ wgpu::RenderPipeline make_pipeline(const Gpu& gpu, const PipelineSpec& p, const 
   pl.bindGroupLayoutCount = p.layouts.size();
   pl.bindGroupLayouts = p.layouts.data();
 
-  wgpu::BlendState premult{};
-  premult.color = {wgpu::BlendOperation::Add, wgpu::BlendFactor::One, wgpu::BlendFactor::OneMinusSrcAlpha};
+  using BF = wgpu::BlendFactor;
+  using BO = wgpu::BlendOperation;
+  wgpu::BlendState premult{}, accum{}, reveal{};
+  premult.color = {BO::Add, BF::One, BF::OneMinusSrcAlpha};
   premult.alpha = premult.color;
+  accum.color = {BO::Add, BF::One, BF::One};  // weighted sums
+  accum.alpha = accum.color;
+  reveal.color = {BO::Add, BF::Zero, BF::OneMinusSrc};  // product of (1 - alpha)
+  reveal.alpha = reveal.color;
   std::vector<wgpu::ColorTargetState> targets(p.colors.size());
   for (size_t i = 0; i < p.colors.size(); ++i) {
     targets[i].format = p.colors[i];
     if (p.blend == Blend::Premultiplied && i == 0) targets[i].blend = &premult;
+    if (p.blend == Blend::WeightedOit) targets[i].blend = i == 0 ? &accum : &reveal;
   }
   wgpu::FragmentState fs{};
   fs.module = p.module;
@@ -227,13 +302,17 @@ bool Renderer::init(std::string* error) {
                                {7, BK::Texture}, {8, BK::Sampler}});
   mesh_layout_ = make_layout(gpu_, "mesh",
                              {{0, BK::Uniform}, {1, BK::Storage}, {2, BK::Storage}, {3, BK::Storage},
-                              {4, BK::Storage}, {5, BK::Storage}, {6, BK::Storage}});
+                              {4, BK::Storage}, {5, BK::Storage}, {6, BK::Storage}, {7, BK::Storage}});
   item_layout_ = make_layout(gpu_, "item", {{0, BK::Uniform}, {1, BK::Storage}});
+  points_layout_ = make_layout(gpu_, "points", {{0, BK::Uniform}, {1, BK::Storage}, {2, BK::Storage}});
+  curves_layout_ = make_layout(gpu_, "curves",
+                               {{0, BK::Uniform}, {1, BK::Storage}, {2, BK::Storage}, {3, BK::Storage},
+                                {4, BK::Storage}});
   ssao_layout_ = make_layout(gpu_, "ssao", {{0, BK::Uniform}, {1, BK::DepthTexture}, {2, BK::Texture}});
   blur_layout_ = make_layout(gpu_, "blur", {{0, BK::Uniform}, {1, BK::DepthTexture}, {3, BK::Texture}});
   composite_layout_ = make_layout(gpu_, "composite",
                                   {{0, BK::Uniform}, {1, BK::Texture}, {2, BK::UintTexture},
-                                   {3, BK::DepthTexture}, {4, BK::Texture}});
+                                   {3, BK::DepthTexture}, {4, BK::Texture}, {5, BK::Texture}, {6, BK::Texture}});
   lines_layout_ = make_layout(gpu_, "lines", {{0, BK::Uniform}, {1, BK::DepthTexture, VF}});
   text_layout_ = make_layout(gpu_, "text",
                              {{0, BK::Uniform}, {1, BK::DepthTexture}, {2, BK::Texture}, {3, BK::Sampler}});
@@ -333,15 +412,15 @@ bool Renderer::init(std::string* error) {
 bool Renderer::build_pipelines(std::string* error) {
   std::string err;
   std::map<std::string, std::string> style = {{"STYLE", style_file(built_style_)}};
-  wgpu::ShaderModule mesh = shaders_.compile(gpu_, "mesh.wgsl", style, &err);
-  wgpu::ShaderModule points = mesh ? shaders_.compile(gpu_, "points.wgsl", style, &err) : nullptr;
-  wgpu::ShaderModule arrows = points ? shaders_.compile(gpu_, "arrows.wgsl", style, &err) : nullptr;
-  wgpu::ShaderModule grid = arrows ? shaders_.compile(gpu_, "grid.wgsl", {}, &err) : nullptr;
-  wgpu::ShaderModule ssao = grid ? shaders_.compile(gpu_, "ssao.wgsl", {}, &err) : nullptr;
-  wgpu::ShaderModule comp = ssao ? shaders_.compile(gpu_, "composite.wgsl", {}, &err) : nullptr;
-  wgpu::ShaderModule lines = comp ? shaders_.compile(gpu_, "overlay_lines.wgsl", {}, &err) : nullptr;
-  wgpu::ShaderModule text = lines ? shaders_.compile(gpu_, "overlay_text.wgsl", {}, &err) : nullptr;
-  if (!text) {
+  const char* styled[] = {"mesh.wgsl", "points.wgsl", "curves.wgsl", "arrows.wgsl"};
+  const char* plain[] = {"grid.wgsl", "ssao.wgsl", "composite.wgsl", "overlay_lines.wgsl", "overlay_text.wgsl"};
+  std::map<std::string, wgpu::ShaderModule> mod;
+  for (const char* f : styled)
+    if (!(mod[f] = shaders_.compile(gpu_, f, style, &err))) break;
+  if (err.empty())
+    for (const char* f : plain)
+      if (!(mod[f] = shaders_.compile(gpu_, f, {}, &err))) break;
+  if (!err.empty()) {
     shader_error_ = err;
     if (error) *error = err;
     return false;
@@ -349,42 +428,55 @@ bool Renderer::build_pipelines(std::string* error) {
 
   const TF hdr = TF::RGBA16Float, depth = TF::Depth32Float;
   const std::vector<TF> prepass_targets = {TF::RGBA16Float, TF::RGBA32Uint};
+  const std::vector<TF> oit_targets = {TF::RGBA16Float, TF::R16Float};
+  using CF = wgpu::CompareFunction;
   wgpu::VertexAttribute attr{};
   attr.format = wgpu::VertexFormat::Float32x2;
   wgpu::VertexBufferLayout arrow_vbl{};
   arrow_vbl.arrayStride = sizeof(glm::vec2);
   arrow_vbl.attributeCount = 1;
   arrow_vbl.attributes = &attr;
+  const auto& mesh = mod["mesh.wgsl"];
+  const auto& points = mod["points.wgsl"];
+  const auto& curves = mod["curves.wgsl"];
+  const auto& arrows = mod["arrows.wgsl"];
+  const auto& grid = mod["grid.wgsl"];
+  const auto& ssao = mod["ssao.wgsl"];
+  const std::vector<wgpu::BindGroupLayout> mesh_l = {scene_layout_, mesh_layout_};
 
   gpu_.push_error_scope();
   auto mk = [&](PipelineSpec p, const char* label) { return make_pipeline(gpu_, p, label); };
-  auto mesh_main = mk({mesh, "vs_main", "fs_main", {scene_layout_, mesh_layout_}, {hdr}, Blend::Opaque, depth, true,
-                       wgpu::CompareFunction::Greater, 4}, "mesh main");
-  auto mesh_wire = mk({mesh, "vs_main", "fs_wire", {scene_layout_, mesh_layout_}, {hdr}, Blend::Premultiplied,
-                       depth, false, wgpu::CompareFunction::Always, 4}, "mesh wire");
-  auto mesh_pre = mk({mesh, "vs_main", "fs_prepass", {scene_layout_, mesh_layout_}, prepass_targets,
-                      Blend::Opaque, depth}, "mesh prepass");
-  auto mesh_shadow = mk({mesh, "vs_shadow", nullptr, {frame_layout_, mesh_layout_}, {}, Blend::Opaque, depth,
-                         true, wgpu::CompareFunction::Less}, "mesh shadow");
-  auto points_main = mk({points, "vs_main", "fs_main", {scene_layout_, item_layout_}, {hdr}, Blend::Opaque, depth,
-                         true, wgpu::CompareFunction::Greater, 4}, "points main");
-  auto points_pre = mk({points, "vs_main", "fs_prepass", {scene_layout_, item_layout_}, prepass_targets,
+  auto mesh_main = mk({mesh, "vs_main", "fs_main", mesh_l, {hdr}, Blend::Opaque, depth, true, CF::Greater, 4}, "mesh main");
+  auto mesh_transparent = mk({mesh, "vs_main", "fs_transparent", mesh_l, oit_targets, Blend::WeightedOit, depth,
+                              false, CF::Greater, 4}, "mesh transparent");
+  auto mesh_wire = mk({mesh, "vs_main", "fs_wire", mesh_l, {hdr}, Blend::Premultiplied, depth, false, CF::Always, 4},
+                      "mesh wire");
+  auto mesh_pre = mk({mesh, "vs_main", "fs_prepass", mesh_l, prepass_targets, Blend::Opaque, depth}, "mesh prepass");
+  auto mesh_shadow = mk({mesh, "vs_shadow", "fs_shadow", {frame_layout_, mesh_layout_}, {}, Blend::Opaque, depth,
+                         true, CF::Less}, "mesh shadow");
+  auto points_main = mk({points, "vs_main", "fs_main", {scene_layout_, points_layout_}, {hdr}, Blend::Opaque, depth,
+                         true, CF::Greater, 4}, "points main");
+  auto points_pre = mk({points, "vs_main", "fs_prepass", {scene_layout_, points_layout_}, prepass_targets,
                         Blend::Opaque, depth}, "points prepass");
+  auto curves_main = mk({curves, "vs_main", "fs_main", {scene_layout_, curves_layout_}, {hdr}, Blend::Opaque, depth,
+                         true, CF::Greater, 4}, "curves main");
+  auto curves_pre = mk({curves, "vs_main", "fs_prepass", {scene_layout_, curves_layout_}, prepass_targets,
+                        Blend::Opaque, depth}, "curves prepass");
   auto arrows_main = mk({arrows, "vs_main", "fs_main", {scene_layout_, item_layout_}, {hdr}, Blend::Opaque, depth,
-                         true, wgpu::CompareFunction::Greater, 4, &arrow_vbl}, "arrows main");
+                         true, CF::Greater, 4, &arrow_vbl}, "arrows main");
   auto arrows_pre = mk({arrows, "vs_main", "fs_prepass", {scene_layout_, item_layout_}, prepass_targets,
-                        Blend::Opaque, depth, true, wgpu::CompareFunction::Greater, 1, &arrow_vbl},
-                       "arrows prepass");
-  auto grid_main = mk({grid, "vs_fullscreen", "fs_main", {scene_layout_}, {hdr}, Blend::Premultiplied, depth,
-                       false, wgpu::CompareFunction::Greater, 4}, "grid main");
-  auto grid_pre = mk({grid, "vs_fullscreen", "fs_prepass", {scene_layout_}, prepass_targets, Blend::Opaque,
-                      depth}, "grid prepass");
+                        Blend::Opaque, depth, true, CF::Greater, 1, &arrow_vbl}, "arrows prepass");
+  auto grid_main = mk({grid, "vs_fullscreen", "fs_main", {scene_layout_}, {hdr}, Blend::Premultiplied, depth, false,
+                       CF::Greater, 4}, "grid main");
+  auto grid_pre = mk({grid, "vs_fullscreen", "fs_prepass", {scene_layout_}, prepass_targets, Blend::Opaque, depth},
+                     "grid prepass");
   auto ssao_p = mk({ssao, "vs_fullscreen", "fs_ssao", {ssao_layout_}, {TF::R8Unorm}}, "ssao");
   auto blur_p = mk({ssao, "vs_fullscreen", "fs_blur", {blur_layout_}, {TF::R8Unorm}}, "ssao blur");
-  auto comp_p = mk({comp, "vs_fullscreen", "fs_composite", {composite_layout_}, {kFinalFormat}}, "composite");
-  auto lines_p = mk({lines, "vs_main", "fs_main", {lines_layout_, storage_layout_}, {kFinalFormat},
-                     Blend::Premultiplied}, "overlay lines");
-  auto text_p = mk({text, "vs_main", "fs_main", {text_layout_, storage_layout_}, {kFinalFormat},
+  auto comp_p = mk({mod["composite.wgsl"], "vs_fullscreen", "fs_composite", {composite_layout_}, {kFinalFormat}},
+                   "composite");
+  auto lines_p = mk({mod["overlay_lines.wgsl"], "vs_main", "fs_main", {lines_layout_, storage_layout_},
+                     {kFinalFormat}, Blend::Premultiplied}, "overlay lines");
+  auto text_p = mk({mod["overlay_text.wgsl"], "vs_main", "fs_main", {text_layout_, storage_layout_}, {kFinalFormat},
                     Blend::Premultiplied}, "overlay text");
   err = gpu_.pop_error_scope();
   if (!err.empty()) {
@@ -392,8 +484,10 @@ bool Renderer::build_pipelines(std::string* error) {
     if (error) *error = err;
     return false;
   }
-  mesh_main_ = mesh_main, mesh_wire_ = mesh_wire, mesh_prepass_ = mesh_pre, mesh_shadow_ = mesh_shadow;
+  mesh_main_ = mesh_main, mesh_transparent_ = mesh_transparent, mesh_wire_ = mesh_wire;
+  mesh_prepass_ = mesh_pre, mesh_shadow_ = mesh_shadow;
   points_main_ = points_main, points_prepass_ = points_pre;
+  curves_main_ = curves_main, curves_prepass_ = curves_pre;
   arrows_main_ = arrows_main, arrows_prepass_ = arrows_pre;
   grid_main_ = grid_main, grid_prepass_ = grid_pre;
   ssao_ = ssao_p, blur_ = blur_p, composite_ = comp_p, lines_ = lines_p, text_ = text_p;
@@ -418,21 +512,27 @@ void Renderer::create_targets() {
     tex = gpu_.create_texture(w, h, fmt, usage, label, samples);
     view = tex.CreateView();
   };
+  const auto sampled = TU::RenderAttachment | TU::TextureBinding;
   make(msaa_color_, msaa_color_view_, TF::RGBA16Float, TU::RenderAttachment, "msaa color", 4);
   make(msaa_depth_, msaa_depth_view_, TF::Depth32Float, TU::RenderAttachment, "msaa depth", 4);
-  make(resolved_, resolved_view_, TF::RGBA16Float, TU::RenderAttachment | TU::TextureBinding, "resolved");
-  make(pre_depth_, pre_depth_view_, TF::Depth32Float, TU::RenderAttachment | TU::TextureBinding, "prepass depth");
-  make(pre_normal_, pre_normal_view_, TF::RGBA16Float, TU::RenderAttachment | TU::TextureBinding, "normals");
-  make(pre_ids_, pre_ids_view_, TF::RGBA32Uint, TU::RenderAttachment | TU::TextureBinding | TU::CopySrc, "ids");
-  make(ao_raw_, ao_raw_view_, TF::R8Unorm, TU::RenderAttachment | TU::TextureBinding, "ao raw");
-  make(ao_, ao_view_, TF::R8Unorm, TU::RenderAttachment | TU::TextureBinding, "ao");
-  make(final_, final_view_, kFinalFormat, TU::RenderAttachment | TU::TextureBinding | TU::CopySrc, "final");
+  make(resolved_, resolved_view_, TF::RGBA16Float, sampled, "resolved");
+  make(oit_accum_msaa_, oit_accum_msaa_view_, TF::RGBA16Float, TU::RenderAttachment, "oit accum msaa", 4);
+  make(oit_reveal_msaa_, oit_reveal_msaa_view_, TF::R16Float, TU::RenderAttachment, "oit reveal msaa", 4);
+  make(oit_accum_, oit_accum_view_, TF::RGBA16Float, sampled, "oit accum");
+  make(oit_reveal_, oit_reveal_view_, TF::R16Float, sampled, "oit reveal");
+  make(pre_depth_, pre_depth_view_, TF::Depth32Float, sampled, "prepass depth");
+  make(pre_normal_, pre_normal_view_, TF::RGBA16Float, sampled, "normals");
+  make(pre_ids_, pre_ids_view_, TF::RGBA32Uint, sampled | TU::CopySrc, "ids");
+  make(ao_raw_, ao_raw_view_, TF::R8Unorm, sampled, "ao raw");
+  make(ao_, ao_view_, TF::R8Unorm, sampled, "ao");
+  make(final_, final_view_, kFinalFormat, sampled | TU::CopySrc, "final");
+  scene_image_ = gpu_.create_texture(w, h, kFinalFormat, TU::CopyDst | TU::CopySrc, "scene image");
 
   ssao_group_ = make_group(gpu_, ssao_layout_, {{0, frame_ubo_}, {1, pre_depth_view_}, {2, pre_normal_view_}});
   blur_group_ = make_group(gpu_, blur_layout_, {{0, frame_ubo_}, {1, pre_depth_view_}, {3, ao_raw_view_}});
   composite_group_ = make_group(gpu_, composite_layout_,
-                                {{0, frame_ubo_}, {1, resolved_view_}, {2, pre_ids_view_},
-                                 {3, pre_depth_view_}, {4, pre_normal_view_}});
+                                {{0, frame_ubo_}, {1, resolved_view_}, {2, pre_ids_view_}, {3, pre_depth_view_},
+                                 {4, pre_normal_view_}, {5, oit_accum_view_}, {6, oit_reveal_view_}});
   lines_group_ = make_group(gpu_, lines_layout_, {{0, frame_ubo_}, {1, pre_depth_view_}});
   text_group_ = make_group(gpu_, text_layout_,
                            {{0, frame_ubo_}, {1, pre_depth_view_}, {2, font_tex_.CreateView()}, {3, clamp_sampler_}});
@@ -476,137 +576,373 @@ void Renderer::update_environment(const RenderSettings& s) {
 
 // ---- Per-frame sync -------------------------------------------------------------
 
-void Renderer::sync(const Scene& scene, const RenderSettings& settings, const Selection& sel) {
-  // Drop GPU copies of removed structures (keyed by pointer, validated by id).
-  std::unordered_set<const Structure*> alive;
-  for (const auto& s : scene.structures()) alive.insert(s.get());
-  std::erase_if(meshes_, [&](auto& kv) { return !alive.count(kv.first); });
-  std::erase_if(points_, [&](auto& kv) { return !alive.count(kv.first); });
-  std::erase_if(vectors_, [&](auto& kv) { return !alive.count(kv.first); });
-
-  // Selected indices per object for the current pick mode.
-  std::unordered_map<uint32_t, std::vector<uint32_t>> selected;
-  for (const ElementRef& e : sel.items()) selected[e.object].push_back(e.index);
-  const ElementRef* active = sel.active();
-  const float edge_angle = std::max(settings.flat_edge_angle, 0.0f);
-
+void Renderer::sync_mesh(MeshGpu& g, const SurfaceMesh& m, uint32_t object_id, const MeshSelection& sel,
+                         bool clip, float edge_angle, float edge_band) {
   const BU storage = BU::Storage;
+  if (!g.ubo) g.ubo = gpu_.create_buffer(sizeof(MeshUniforms), BU::Uniform | BU::CopyDst, "mesh uniforms");
+  bool rebind = !g.group;
+  if (g.pos_ver != m.positions_version()) {
+    rebind |= g.positions.upload(gpu_, m.positions().data(), m.positions().size() * 4, storage, "positions");
+    g.pos_ver = m.positions_version();
+  }
+  if (g.topo_ver != m.topology_version()) {
+    rebind |= g.triangles.upload(gpu_, m.triangles().data(), m.triangles().size() * 4, storage, "triangles");
+    rebind |= g.face_segment.upload(gpu_, m.face_segment().data(), m.face_segment().size() * 4, storage,
+                                    "face segment");
+    rebind |= g.vertex_faces.upload(gpu_, m.vertex_faces().data(), m.vertex_faces().size() * 4, storage,
+                                    "vertex faces");
+    g.faces = uint32_t(m.num_faces());
+    g.topo_ver = m.topology_version();
+  }
+
+  // What colors the mesh (modes as in base_color() of mesh.wgsl).
+  const Quantity* q = m.coloring_quantity();
+  uint32_t mode = m.color_source == ColorSource::SegmentPalette ? 1 : 0;
+  if (q) {
+    bool rgb = q->type == QuantityType::Color;
+    switch (q->on) {
+      case ElementKind::Vertex: mode = rgb ? 5 : 2; break;
+      case ElementKind::Face: mode = rgb ? 6 : 3; break;
+      case ElementKind::Segment: mode = rgb ? 1 : 4; break;
+      case ElementKind::Edge: mode = rgb ? 8 : 7; break;
+      default: mode = 0; break;
+    }
+  }
+  std::string key = std::to_string(mode) + (q ? q->name : "");
+  bool mask_stale = g.edge_angle != edge_angle || (edge_angle > 0 && !m.rigid_segments && g.mask_ver != m.positions_version());
+  if (g.attr_ver != m.attributes_version() || g.sel_ver != sel.version || g.color_key != key || mask_stale) {
+    size_t nf = m.num_faces(), ns = m.num_segments();
+    std::vector<SegmentInfo> segs(std::max<size_t>(ns, 1), SegmentInfo{0, 0, 0.0f, 0});
+    for (size_t k = 0; k < ns; ++k) {
+      bool seg_rgb = q && q->on == ElementKind::Segment && q->type == QuantityType::Color;
+      segs[k].color = seg_rgb ? float_to_bits(attr_value(*q, k)) : pack_srgb(m.segment_color(uint32_t(k)));
+      segs[k].flags = m.segment_visible(uint32_t(k)) ? 0u : 1u;
+      segs[k].scalar = mode == 4 ? q->value(k) : 0.0f;
+    }
+    for (uint32_t k : sel.segments)
+      if (k < segs.size()) segs[k].flags |= 2u;
+    if (sel.active_segment >= 0 && size_t(sel.active_segment) < segs.size()) segs[sel.active_segment].flags |= 4u;
+
+    std::vector<uint32_t> face_info(2 * std::max<size_t>(nf, 1), 0);
+    if (mode == 3 || mode == 6)
+      for (size_t f = 0; f < nf; ++f) face_info[2 * f] = float_to_bits(attr_value(*q, f));
+    for (uint32_t f : sel.faces)
+      if (f < nf) face_info[2 * f + 1] |= 1u;
+    if (sel.active_face >= 0 && size_t(sel.active_face) < nf) face_info[2 * sel.active_face + 1] |= 2u;
+    if (edge_angle > 0) {
+      const auto& flat = m.flat_edge_mask(edge_angle);
+      for (size_t f = 0; f < flat.size(); ++f) face_info[2 * f + 1] |= uint32_t(flat[f]) << 2;
+    }
+
+    std::vector<float> attr(1, 0.0f);
+    if (mode == 2 || mode == 5) {
+      attr.resize(std::max<size_t>(m.num_vertices(), 1));
+      for (size_t i = 0; i < m.num_vertices(); ++i) attr[i] = attr_value(*q, i);
+    } else if (mode == 7 || mode == 8) {
+      const auto& fe = m.face_edges();
+      attr.resize(std::max<size_t>(3 * nf, 1));
+      for (size_t k = 0; k < 3 * nf; ++k) attr[k] = attr_value(*q, fe[k]);
+    }
+    rebind |= g.segments.upload(gpu_, segs.data(), segs.size() * sizeof(SegmentInfo), storage, "segments");
+    rebind |= g.face_info.upload(gpu_, face_info.data(), face_info.size() * 4, storage, "face info");
+    rebind |= g.vertex_attr.upload(gpu_, attr.data(), attr.size() * 4, storage, "vertex attr");
+    g.u.scalar_range = m.color_range();
+    g.attr_ver = m.attributes_version();
+    g.sel_ver = sel.version;
+    g.color_key = key;
+    g.edge_angle = edge_angle;
+    g.mask_ver = m.positions_version();
+  }
+  g.u.base_color = glm::vec4(srgb_to_linear(m.color), std::clamp(m.opacity, 0.0f, 1.0f));
+  g.u.color_mode = mode;
+  g.u.cmap_row = uint32_t(std::clamp(m.colormap, 0, kColormapCount - 1));
+  g.u.flags = (m.isolines ? 1u : 0u) | (clip ? 2u : 0u) | (m.smooth_shading ? 4u : 0u);
+  g.u.object_id = object_id;
+  if (!m.auto_range) g.u.scalar_range = m.range;
+  g.u.iso_spacing = m.isoline_spacing;
+  g.u.edge_band = edge_band;
+  g.u.material = glm::vec4(m.metallic, m.roughness, 0, 0);
+  gpu_.queue.WriteBuffer(g.ubo, 0, &g.u, sizeof(MeshUniforms));
+  g.transparent = m.opacity < 0.999f;
+  if (rebind)
+    g.group = make_group(gpu_, mesh_layout_,
+                         {{0, g.ubo}, {1, g.positions.buffer}, {2, g.triangles.buffer}, {3, g.face_segment.buffer},
+                          {4, g.segments.buffer}, {5, g.vertex_attr.buffer}, {6, g.face_info.buffer},
+                          {7, g.vertex_faces.buffer}});
+}
+
+void Renderer::sync_volume(VolumeGpu& g, const VolumeMesh& v, const RenderSettings& s, const Selection& sel) {
+  const bool slicing = s.slice.enabled && v.sliced;
+  const glm::vec4 plane = s.slice.equation();
+  bool geometry = false;
+  if (g.topo != v.topology_version()) {
+    const auto& bf = v.boundary_faces();
+    g.boundary.set_geometry(v.positions().data(), v.num_vertices(), bf.data(), bf.size() / 3);
+    g.topo = v.topology_version();
+    g.pos = v.positions_version();
+    geometry = true;
+  } else if (g.pos != v.positions_version()) {
+    g.boundary.set_positions(v.positions().data());
+    g.pos = v.positions_version();
+    geometry = true;
+  }
+  bool cut_changed = false;
+  if (slicing && (geometry || !g.cut_active || plane != g.plane)) {
+    const VolumeMesh::Section& sec = v.slice(glm::vec3(plane), plane.w);
+    size_t nt = sec.triangles.size() / 3;
+    g.cut.set_geometry(sec.positions.data(), sec.positions.size() / 3, sec.triangles.data(), nt);
+    g.cut.set_segments({0, 0, uint32_t(nt)});  // all faces in segment 1: tells cut from boundary when picking
+    g.plane = plane;
+    cut_changed = true;
+  }
+  g.cut_active = slicing;
+
+  // Both derived meshes take the volume's coloring; its quantity is copied
+  // over (vertex values interpolated onto the cut, cell values per face).
+  if (geometry || cut_changed || g.attr != v.attributes_version()) {
+    const Quantity* q = v.coloring_quantity();
+    const glm::vec2 r = v.color_range();
+    for (SurfaceMesh* m : {&g.boundary, &g.cut}) {
+      m->color = v.color;
+      m->colormap = v.colormap;
+      m->auto_range = false;
+      m->range = r;
+      m->isolines = v.isolines;
+      m->isoline_spacing = v.isoline_spacing;
+      m->metallic = v.metallic;
+      m->roughness = v.roughness;
+      m->color_source = q ? ColorSource::Quantity : ColorSource::Uniform;
+      m->color_quantity = "value";
+    }
+    if (q && (q->on == ElementKind::Vertex || q->on == ElementKind::Cell)) {
+      const int dims = q->type == QuantityType::Color ? 3 : 1;
+      auto get = [&](size_t i, int c) { return dims == 3 ? q->data[3 * i + c] : q->value(i); };
+      auto put = [&](SurfaceMesh& m, ElementKind on, std::vector<float> data) {
+        if (dims == 3)
+          m.add_color("value", on, std::move(data));
+        else
+          m.add_scalar("value", on, std::move(data));
+      };
+      const VolumeMesh::Section& sec = v.last_section();
+      if (q->on == ElementKind::Vertex) {
+        std::vector<float> bd(dims * v.num_vertices());
+        for (size_t i = 0; i < v.num_vertices(); ++i)
+          for (int c = 0; c < dims; ++c) bd[dims * i + c] = get(i, c);
+        put(g.boundary, ElementKind::Vertex, std::move(bd));
+        if (slicing) {
+          std::vector<float> cd(dims * sec.vertex_t.size());
+          for (size_t j = 0; j < sec.vertex_t.size(); ++j)
+            for (int c = 0; c < dims; ++c)
+              cd[dims * j + c] = glm::mix(get(sec.vertex_pair[2 * j], c), get(sec.vertex_pair[2 * j + 1], c),
+                                          sec.vertex_t[j]);
+          put(g.cut, ElementKind::Vertex, std::move(cd));
+        }
+      } else {
+        const auto& bc = v.boundary_cells();
+        std::vector<float> bd(dims * bc.size());
+        for (size_t f = 0; f < bc.size(); ++f)
+          for (int c = 0; c < dims; ++c) bd[dims * f + c] = get(bc[f], c);
+        put(g.boundary, ElementKind::Face, std::move(bd));
+        if (slicing) {
+          std::vector<float> cd(dims * sec.face_cell.size());
+          for (size_t f = 0; f < sec.face_cell.size(); ++f)
+            for (int c = 0; c < dims; ++c) cd[dims * f + c] = get(sec.face_cell[f], c);
+          put(g.cut, ElementKind::Face, std::move(cd));
+        }
+      }
+    }
+    g.boundary.touch_attributes();
+    g.cut.touch_attributes();
+    g.attr = v.attributes_version();
+  }
+  g.boundary.opacity = v.opacity;
+
+  MeshSelection ms;
+  ms.version = sel.version();
+  if (sel.mode() == PickMode::Segment && sel.contains({v.id(), 0})) ms.segments = {0, 1};
+  sync_mesh(g.boundary_gpu, g.boundary, v.id(), ms, slicing, 0.0f, 2.0f);
+  if (slicing) sync_mesh(g.cut_gpu, g.cut, v.id(), ms, false, 0.0f, 2.0f);
+}
+
+void Renderer::sync_arrows(const QuantityStructure& s, bool clip) {
+  for (const Quantity& q : s.quantities()) {
+    if (q.type != QuantityType::Vector || !q.show_arrows || s.count(q.on) == 0) continue;
+    auto& slot = quantity_arrows_[{s.id(), q.name}];
+    if (!slot) {
+      slot = std::make_unique<VectorsGpu>();
+      slot->ubo = gpu_.create_buffer(sizeof(ItemUniforms), BU::Uniform | BU::CopyDst, "arrow uniforms");
+    }
+    VectorsGpu& g = *slot;
+    size_t n = std::min(s.count(q.on), q.data.size() / 3);
+    float mean_len = 0.0f;
+    if (g.ver != s.positions_version() || g.attr_ver != s.attributes_version() || !g.group) {
+      std::vector<glm::vec4> packed(std::max<size_t>(2 * n, 2), glm::vec4(0));
+      for (size_t i = 0; i < n; ++i) {
+        packed[2 * i] = glm::vec4(s.element_position(q.on, uint32_t(i)), 0);
+        packed[2 * i + 1] = glm::vec4(q.data[3 * i], q.data[3 * i + 1], q.data[3 * i + 2], 0);
+      }
+      if (g.arrows.upload(gpu_, packed.data(), packed.size() * sizeof(glm::vec4), BU::Storage, "arrows") || !g.group)
+        g.group = make_group(gpu_, item_layout_, {{0, g.ubo}, {1, g.arrows.buffer}});
+      g.count = uint32_t(n);
+      g.ver = s.positions_version();
+      g.attr_ver = s.attributes_version();
+    }
+    for (size_t i = 0; i < n; ++i) mean_len += q.value(i);
+    mean_len = n ? mean_len / float(n) * q.arrow_scale : 0.0f;
+    float radius = q.arrow_radius > 0 ? q.arrow_radius : std::max(0.04f * mean_len, 1e-5f);
+    ItemUniforms u{glm::vec4(srgb_to_linear(q.arrow_color), 1), glm::vec4(0, 0.4f, 0, 0), radius, q.arrow_scale, 0,
+                   clip ? 2u : 0u};
+    gpu_.queue.WriteBuffer(g.ubo, 0, &u, sizeof(u));
+    draw_arrows_.push_back(&g);
+  }
+}
+
+void Renderer::sync(const Scene& scene, const RenderSettings& settings, const Selection& sel) {
+  // Drop GPU copies of removed structures (and arrows no longer shown).
+  std::unordered_set<uint32_t> alive;
+  std::set<std::pair<uint32_t, std::string>> arrows_alive;
+  for (const auto& s : scene.structures()) {
+    alive.insert(s->id());
+    if (auto* qs = dynamic_cast<const QuantityStructure*>(s.get()))
+      for (const Quantity& q : qs->quantities())
+        if (q.show_arrows && q.type == QuantityType::Vector) arrows_alive.insert({s->id(), q.name});
+  }
+  auto prune = [&](auto& map) { std::erase_if(map, [&](auto& kv) { return !alive.count(kv.first); }); };
+  prune(meshes_);
+  prune(points_);
+  prune(curves_);
+  prune(vectors_);
+  prune(volumes_);
+  std::erase_if(quantity_arrows_, [&](auto& kv) { return !arrows_alive.count(kv.first); });
+  opaque_meshes_.clear();
+  transparent_meshes_.clear();
+  draw_points_.clear();
+  draw_curves_.clear();
+  draw_arrows_.clear();
+
+  const bool solid = settings.shading == Shading::Solid;
+  const float edge_angle = std::max(settings.flat_edge_angle, 0.0f);
+  const float edge_band = std::max(2.0f, 1.5f * settings.wire_width);
+  auto whole_selected = [&](uint32_t id) { return sel.mode() == PickMode::Segment && sel.contains({id, 0}); };
+  auto clip = [&](const Structure& s) { return settings.slice.enabled && s.sliced; };
+  const BU storage = BU::Storage;
+
+  // Faces/segments selected per mesh for the current pick mode.
+  std::unordered_map<uint32_t, MeshSelection> mesh_sel;
+  for (const ElementRef& e : sel.items()) {
+    if (sel.mode() == PickMode::Face) mesh_sel[e.object].faces.push_back(e.index);
+    if (sel.mode() == PickMode::Segment) mesh_sel[e.object].segments.push_back(e.index);
+  }
+  if (const ElementRef* a = sel.active()) {
+    if (sel.mode() == PickMode::Face) mesh_sel[a->object].active_face = a->index;
+    if (sel.mode() == PickMode::Segment) mesh_sel[a->object].active_segment = a->index;
+  }
+
   for (const auto& sp : scene.structures()) {
     const Structure* s = sp.get();
+    if (auto* qs = dynamic_cast<const QuantityStructure*>(s); qs && s->visible) sync_arrows(*qs, clip(*qs));
     if (auto* m = dynamic_cast<const SurfaceMesh*>(s)) {
-      auto& slot = meshes_[s];
-      if (!slot || slot->u.object_id != m->id()) {
-        slot = std::make_unique<MeshGpu>();
-        slot->ubo = gpu_.create_buffer(sizeof(MeshUniforms), BU::Uniform | BU::CopyDst, "mesh uniforms");
+      auto& slot = meshes_[m->id()];
+      if (!slot) slot = std::make_unique<MeshGpu>();
+      MeshSelection& ms = mesh_sel[m->id()];
+      ms.version = sel.version();
+      sync_mesh(*slot, *m, m->id(), ms, clip(*m), edge_angle, edge_band);
+      if (m->visible && slot->faces)
+        (slot->transparent && solid ? transparent_meshes_ : opaque_meshes_).push_back(slot.get());
+    } else if (auto* v = dynamic_cast<const VolumeMesh*>(s)) {
+      auto& slot = volumes_[v->id()];
+      if (!slot) slot = std::make_unique<VolumeGpu>();
+      sync_volume(*slot, *v, settings, sel);
+      if (v->visible) {
+        MeshGpu& b = slot->boundary_gpu;
+        if (b.faces) (b.transparent && solid ? transparent_meshes_ : opaque_meshes_).push_back(&b);
+        if (slot->cut_active && slot->cut_gpu.faces) opaque_meshes_.push_back(&slot->cut_gpu);
       }
-      MeshGpu& g = *slot;
-      bool rebind = !g.group;
-      if (g.pos_ver != m->positions_version()) {
-        rebind |= g.positions.upload(gpu_, m->positions().data(), m->positions().size() * 4, storage, "positions");
-        g.pos_ver = m->positions_version();
-      }
-      if (g.topo_ver != m->topology_version()) {
-        rebind |= g.triangles.upload(gpu_, m->triangles().data(), m->triangles().size() * 4, storage, "triangles");
-        rebind |= g.face_segment.upload(gpu_, m->face_segment().data(), m->face_segment().size() * 4, storage,
-                                        "face segment");
-        g.faces = uint32_t(m->num_faces());
-        g.topo_ver = m->topology_version();
-      }
-
-      // Resolve what colors the mesh.
-      const Quantity* q = m->color_source == ColorSource::Quantity ? m->quantity(m->color_quantity) : nullptr;
-      uint32_t mode = 0;
-      if (m->color_source == ColorSource::SegmentPalette) mode = 1;
-      if (q) mode = q->on == ElementKind::Vertex ? 2 : q->on == ElementKind::Face ? 3
-                  : q->on == ElementKind::Segment ? 4 : 0;
-      std::string key = std::to_string(mode) + (q ? q->name : "");
-      bool mask_stale = g.edge_angle != edge_angle ||
-                        (edge_angle > 0 && !m->rigid_segments && g.mask_ver != m->positions_version());
-      if (g.attr_ver != m->attributes_version() || g.sel_ver != sel.version() || g.color_key != key || mask_stale) {
-        auto value = [&](size_t i) {
-          if (q->dims == 1) return q->data[i];
-          const float* v = &q->data[3 * i];
-          return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-        };
-        const auto& sel_idx = selected[m->id()];
-        std::vector<SegmentInfo> segs(std::max<size_t>(m->num_segments(), 1));
-        for (size_t k = 0; k < m->num_segments(); ++k) {
-          segs[k].color = pack_srgb(m->segment_color(uint32_t(k)));
-          segs[k].flags = m->segment_visible(uint32_t(k)) ? 0u : 1u;
-          segs[k].scalar = mode == 4 && k * q->dims < q->data.size() ? value(k) : 0.0f;
-        }
-        std::vector<uint32_t> face_info(2 * std::max<size_t>(m->num_faces(), 1), 0);
-        if (mode == 3)
-          for (size_t f = 0; f < m->num_faces() && f * q->dims < q->data.size(); ++f) {
-            float v = value(f);
-            std::memcpy(&face_info[2 * f], &v, 4);
-          }
-        bool is_active_obj = active && active->object == m->id();
-        if (sel.mode() == PickMode::Face) {
-          for (uint32_t f : sel_idx)
-            if (f < m->num_faces()) face_info[2 * f + 1] |= 1u;
-          if (is_active_obj && active->index < m->num_faces()) face_info[2 * active->index + 1] |= 2u;
-        }
-        if (sel.mode() == PickMode::Segment) {
-          for (uint32_t k : sel_idx)
-            if (k < segs.size()) segs[k].flags |= 2u;
-          if (is_active_obj && active->index < segs.size()) segs[active->index].flags |= 4u;
-        }
-        if (edge_angle > 0) {
-          const auto& flat = m->flat_edge_mask(edge_angle);
-          for (size_t f = 0; f < flat.size(); ++f) face_info[2 * f + 1] |= uint32_t(flat[f]) << 2;
-        }
-        g.edge_angle = edge_angle;
-        g.mask_ver = m->positions_version();
-        std::vector<float> vs(1, 0.0f);
-        if (mode == 2) {
-          vs.resize(std::max<size_t>(m->num_vertices(), 1));
-          for (size_t i = 0; i < m->num_vertices() && i * q->dims < q->data.size(); ++i) vs[i] = value(i);
-        }
-        rebind |= g.segments.upload(gpu_, segs.data(), segs.size() * sizeof(SegmentInfo), storage, "segments");
-        rebind |= g.face_info.upload(gpu_, face_info.data(), face_info.size() * 4, storage, "face info");
-        rebind |= g.vertex_scalar.upload(gpu_, vs.data(), vs.size() * 4, storage, "vertex scalar");
-        if (q && mode != 0) {
-          glm::vec2 r = m->auto_range ? m->quantity_range(*q) : m->range;
-          g.u.scalar_range = r;
-        }
-        g.attr_ver = m->attributes_version();
-        g.sel_ver = sel.version();
-        g.color_key = key;
-      }
-      g.u.base_color = glm::vec4(srgb_to_linear(m->color), 1.0f);
-      g.u.color_mode = mode;
-      g.u.cmap_row = uint32_t(std::clamp(m->colormap, 0, kColormapCount - 1));
-      g.u.flags = m->isolines ? 1u : 0u;
-      g.u.object_id = m->id();
-      if (!m->auto_range && mode >= 2) g.u.scalar_range = m->range;
-      g.u.iso_spacing = m->isoline_spacing;
-      g.u.material = glm::vec4(m->metallic, m->roughness, 0, 0);
-      gpu_.queue.WriteBuffer(g.ubo, 0, &g.u, sizeof(MeshUniforms));
-      if (rebind)
-        g.group = make_group(gpu_, mesh_layout_,
-                             {{0, g.ubo}, {1, g.positions.buffer}, {2, g.triangles.buffer},
-                              {3, g.face_segment.buffer}, {4, g.segments.buffer}, {5, g.vertex_scalar.buffer},
-                              {6, g.face_info.buffer}});
     } else if (auto* p = dynamic_cast<const PointCloud*>(s)) {
-      auto& slot = points_[s];
+      auto& slot = points_[p->id()];
       if (!slot) {
         slot = std::make_unique<PointsGpu>();
-        slot->ubo = gpu_.create_buffer(sizeof(ItemUniforms), BU::Uniform | BU::CopyDst, "points uniforms");
+        slot->ubo = gpu_.create_buffer(sizeof(PointUniforms), BU::Uniform | BU::CopyDst, "points uniforms");
       }
       PointsGpu& g = *slot;
       bool rebind = !g.group;
-      if (g.ver != p->version()) {
-        rebind |= g.points.upload(gpu_, p->packed().data(), std::max<size_t>(p->packed().size() * 4, 16), storage,
-                                  "points");
+      if (g.pos_ver != p->positions_version()) {
+        rebind |= g.points.upload(gpu_, p->packed().data(), p->packed().size() * 4, storage, "points");
         g.count = uint32_t(p->size());
-        g.ver = p->version();
+        g.pos_ver = p->positions_version();
       }
-      ItemUniforms u{glm::vec4(srgb_to_linear(p->color), 1), glm::vec4(0, 0.35f, 0, 0), p->radius, 0, p->id(), 0};
-      gpu_.queue.WriteBuffer(g.ubo, 0, &u, sizeof(u));
-      if (rebind) g.group = make_group(gpu_, item_layout_, {{0, g.ubo}, {1, g.points.buffer}});
+      const Quantity* q = p->coloring_quantity();
+      uint32_t mode = q ? (q->type == QuantityType::Color ? 5 : 2) : 0;
+      std::string key = std::to_string(mode) + (q ? q->name : "");
+      if (g.attr_ver != p->attributes_version() || g.color_key != key || rebind) {
+        std::vector<float> attr(std::max<size_t>(p->size(), 1), 0.0f);
+        if (q)
+          for (size_t i = 0; i < p->size(); ++i) attr[i] = attr_value(*q, i);
+        rebind |= g.attr.upload(gpu_, attr.data(), attr.size() * 4, storage, "point attr");
+        g.u.scalar_range = p->color_range();
+        g.attr_ver = p->attributes_version();
+        g.color_key = key;
+      }
+      g.u.color = glm::vec4(srgb_to_linear(p->color), 1);
+      g.u.material = glm::vec4(p->metallic, p->roughness, 0, 0);
+      g.u.radius = p->radius;
+      g.u.color_mode = mode;
+      g.u.object_id = p->id();
+      g.u.flags = (clip(*p) ? 2u : 0u) | (whole_selected(p->id()) ? 8u : 0u);
+      if (!p->auto_range) g.u.scalar_range = p->range;
+      g.u.cmap_row = uint32_t(std::clamp(p->colormap, 0, kColormapCount - 1));
+      gpu_.queue.WriteBuffer(g.ubo, 0, &g.u, sizeof(g.u));
+      if (rebind) g.group = make_group(gpu_, points_layout_, {{0, g.ubo}, {1, g.points.buffer}, {2, g.attr.buffer}});
+      if (p->visible && g.count) draw_points_.push_back(&g);
+    } else if (auto* c = dynamic_cast<const CurveNetwork*>(s)) {
+      auto& slot = curves_[c->id()];
+      if (!slot) {
+        slot = std::make_unique<CurvesGpu>();
+        slot->ubo = gpu_.create_buffer(sizeof(CurveUniforms), BU::Uniform | BU::CopyDst, "curve uniforms");
+      }
+      CurvesGpu& g = *slot;
+      bool rebind = !g.group;
+      if (g.pos_ver != c->positions_version()) {
+        rebind |= g.nodes.upload(gpu_, c->nodes().data(), c->nodes().size() * 4, storage, "nodes");
+        g.pos_ver = c->positions_version();
+      }
+      if (g.topo_ver != c->topology_version()) {
+        rebind |= g.edges.upload(gpu_, c->edges().data(), c->edges().size() * 4, storage, "edges");
+        g.count = uint32_t(c->num_edges());
+        g.topo_ver = c->topology_version();
+      }
+      const Quantity* q = c->coloring_quantity();
+      bool rgb = q && q->type == QuantityType::Color;
+      uint32_t mode = !q ? 0 : q->on == ElementKind::Vertex ? (rgb ? 5 : 2) : (rgb ? 6 : 3);
+      std::string key = std::to_string(mode) + (q ? q->name : "");
+      if (g.attr_ver != c->attributes_version() || g.color_key != key || rebind) {
+        std::vector<float> na(std::max<size_t>(c->num_nodes(), 1), 0.0f), ea(std::max<size_t>(c->num_edges(), 1), 0.0f);
+        if (q && q->on == ElementKind::Vertex)
+          for (size_t i = 0; i < c->num_nodes(); ++i) na[i] = attr_value(*q, i);
+        if (q && q->on == ElementKind::Edge)
+          for (size_t i = 0; i < c->num_edges(); ++i) ea[i] = attr_value(*q, i);
+        rebind |= g.node_attr.upload(gpu_, na.data(), na.size() * 4, storage, "node attr");
+        rebind |= g.edge_attr.upload(gpu_, ea.data(), ea.size() * 4, storage, "edge attr");
+        g.u.scalar_range = c->color_range();
+        g.attr_ver = c->attributes_version();
+        g.color_key = key;
+      }
+      g.u.color = glm::vec4(srgb_to_linear(c->color), 1);
+      g.u.material = glm::vec4(c->metallic, c->roughness, 0, 0);
+      g.u.radius = c->radius;
+      g.u.color_mode = mode;
+      g.u.object_id = c->id();
+      g.u.flags = (clip(*c) ? 2u : 0u) | (whole_selected(c->id()) ? 8u : 0u);
+      if (!c->auto_range) g.u.scalar_range = c->range;
+      g.u.cmap_row = uint32_t(std::clamp(c->colormap, 0, kColormapCount - 1));
+      gpu_.queue.WriteBuffer(g.ubo, 0, &g.u, sizeof(g.u));
+      if (rebind)
+        g.group = make_group(gpu_, curves_layout_,
+                             {{0, g.ubo}, {1, g.nodes.buffer}, {2, g.edges.buffer}, {3, g.node_attr.buffer},
+                              {4, g.edge_attr.buffer}});
+      if (c->visible && g.count) draw_curves_.push_back(&g);
     } else if (auto* v = dynamic_cast<const VectorSet*>(s)) {
-      auto& slot = vectors_[s];
+      auto& slot = vectors_[v->id()];
       if (!slot) {
         slot = std::make_unique<VectorsGpu>();
         slot->ubo = gpu_.create_buffer(sizeof(ItemUniforms), BU::Uniform | BU::CopyDst, "vectors uniforms");
@@ -624,9 +960,10 @@ void Renderer::sync(const Scene& scene, const RenderSettings& settings, const Se
         g.ver = v->version();
       }
       ItemUniforms u{glm::vec4(srgb_to_linear(v->color), 1), glm::vec4(0, 0.35f, 0, 0), v->radius,
-                     v->length_scale, v->id(), 0};
+                     v->length_scale, v->id(), clip(*v) ? 2u : 0u};
       gpu_.queue.WriteBuffer(g.ubo, 0, &u, sizeof(u));
       if (rebind) g.group = make_group(gpu_, item_layout_, {{0, g.ubo}, {1, g.arrows.buffer}});
+      if (v->visible && g.count) draw_arrows_.push_back(&g);
     }
   }
 }
@@ -697,6 +1034,7 @@ void Renderer::fill_frame(const Camera& cam, const RenderSettings& s, const Scen
   f.env = glm::vec4(glm::radians(s.env_rotation), s.env_intensity, float(env_.mip_count - 1), 0);
   f.ao = glm::vec4(s.ao_radius, 0.02f, 1.0f, 0);
   f.post = glm::vec4(s.style == Style::EnvironmentPBR ? 1.0f : 0.0f, s.outline_width, 0, 0);
+  f.slice = s.slice.equation();
   for (int k = 0; k < 9; ++k) f.sh[k] = glm::vec4(env_.sh[k], 0);
   gpu_.queue.WriteBuffer(frame_ubo_, 0, &f, sizeof(FrameUniforms));
 }
@@ -706,7 +1044,6 @@ void Renderer::fill_frame(const Camera& cam, const RenderSettings& s, const Scen
 void Renderer::render(const Scene& scene, const Camera& camera, const RenderSettings& s,
                       const Selection& sel, const Overlay& overlay,
                       const std::function<void(wgpu::RenderPassEncoder&)>& ui) {
-  auto t0 = std::chrono::steady_clock::now();
   update_environment(s);
   bool reload = shaders_.poll_changes();
   // On a shader error the previous pipelines stay in use and the error is
@@ -732,34 +1069,37 @@ void Renderer::render(const Scene& scene, const Camera& camera, const RenderSett
 
   const bool ground = s.grid || s.ground_shadow;
   const bool wire_mode = s.shading == Shading::Wireframe;
+  const bool see_through = !wire_mode && !transparent_meshes_.empty();
   wgpu::CommandEncoder enc = gpu_.device.CreateCommandEncoder();
 
-  auto draw_meshes = [&](wgpu::RenderPassEncoder& pass) {
-    for (const auto& sp : scene.structures())
-      if (sp->visible)
-        if (auto it = meshes_.find(sp.get()); it != meshes_.end() && it->second->faces) {
-          pass.SetBindGroup(1, it->second->group);
-          pass.Draw(3 * it->second->faces);
-        }
+  auto draw_meshes = [&](wgpu::RenderPassEncoder& pass, const std::vector<MeshGpu*>& list) {
+    for (MeshGpu* g : list) {
+      pass.SetBindGroup(1, g->group);
+      pass.Draw(3 * g->faces);
+    }
   };
-  auto draw_items = [&](wgpu::RenderPassEncoder& pass, const wgpu::RenderPipeline& pts,
-                        const wgpu::RenderPipeline& arr) {
-    pass.SetPipeline(pts);
-    for (const auto& sp : scene.structures())
-      if (sp->visible)
-        if (auto it = points_.find(sp.get()); it != points_.end() && it->second->count) {
-          pass.SetBindGroup(1, it->second->group);
-          pass.Draw(6, it->second->count);
-        }
-    pass.SetPipeline(arr);
+  auto draw_items = [&](wgpu::RenderPassEncoder& pass, bool prepass) {
+    pass.SetPipeline(prepass ? points_prepass_ : points_main_);
+    for (PointsGpu* g : draw_points_) {
+      pass.SetBindGroup(1, g->group);
+      pass.Draw(6, g->count);
+    }
+    pass.SetPipeline(prepass ? curves_prepass_ : curves_main_);
+    for (CurvesGpu* g : draw_curves_) {
+      pass.SetBindGroup(1, g->group);
+      pass.Draw(36, g->count);
+    }
+    pass.SetPipeline(prepass ? arrows_prepass_ : arrows_main_);
     pass.SetVertexBuffer(0, arrow_template_);
-    for (const auto& sp : scene.structures())
-      if (sp->visible)
-        if (auto it = vectors_.find(sp.get()); it != vectors_.end() && it->second->count) {
-          pass.SetBindGroup(1, it->second->group);
-          pass.Draw(arrow_vertex_count_, it->second->count);
-        }
+    for (VectorsGpu* g : draw_arrows_) {
+      pass.SetBindGroup(1, g->group);
+      pass.Draw(arrow_vertex_count_, g->count);
+    }
   };
+  // In wireframe shading every mesh is drawn (and pickable) as wires.
+  std::vector<MeshGpu*> all_meshes = opaque_meshes_;
+  all_meshes.insert(all_meshes.end(), transparent_meshes_.begin(), transparent_meshes_.end());
+  const std::vector<MeshGpu*>& picked_meshes = wire_mode ? all_meshes : opaque_meshes_;
 
   // 1. Sun shadow map.
   {
@@ -774,11 +1114,11 @@ void Renderer::render(const Scene& scene, const Camera& camera, const RenderSett
     if (s.shadows && !wire_mode) {
       pass.SetPipeline(mesh_shadow_);
       pass.SetBindGroup(0, frame_group_);
-      draw_meshes(pass);
+      draw_meshes(pass, opaque_meshes_);
     }
     pass.End();
   }
-  // 2. Prepass: depth, normals, ids.
+  // 2. Prepass: depth, normals, ids (see-through surfaces take no part).
   {
     wgpu::RenderPassColorAttachment c[2]{};
     c[0].view = pre_normal_view_;
@@ -800,40 +1140,38 @@ void Renderer::render(const Scene& scene, const Camera& camera, const RenderSett
     wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
     pass.SetBindGroup(0, scene_group_);
     pass.SetPipeline(mesh_prepass_);
-    draw_meshes(pass);
-    draw_items(pass, points_prepass_, arrows_prepass_);
+    draw_meshes(pass, picked_meshes);
+    draw_items(pass, true);
     if (ground) {
       pass.SetPipeline(grid_prepass_);
       pass.Draw(3);
     }
     pass.End();
   }
-  // 3. Ambient occlusion.
-  {
-    auto fullscreen = [&](const wgpu::TextureView& target, const wgpu::RenderPipeline* p,
-                          const wgpu::BindGroup* g, double clear) {
-      wgpu::RenderPassColorAttachment c{};
-      c.view = target;
-      c.loadOp = wgpu::LoadOp::Clear;
-      c.storeOp = wgpu::StoreOp::Store;
-      c.clearValue = {clear, clear, clear, 1};
-      wgpu::RenderPassDescriptor rp{};
-      rp.colorAttachmentCount = 1;
-      rp.colorAttachments = &c;
-      wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
-      if (p) {
-        pass.SetPipeline(*p);
-        pass.SetBindGroup(0, *g);
-        pass.Draw(3);
-      }
-      pass.End();
-    };
-    if (s.ssao && s.ao_strength > 0 && !wire_mode) {
-      fullscreen(ao_raw_view_, &ssao_, &ssao_group_, 1.0);
-      fullscreen(ao_view_, &blur_, &blur_group_, 1.0);
-    } else {
-      fullscreen(ao_view_, nullptr, nullptr, 1.0);
+  auto fullscreen = [&](const wgpu::TextureView& target, const wgpu::RenderPipeline* p, const wgpu::BindGroup* g,
+                        double clear) {
+    wgpu::RenderPassColorAttachment c{};
+    c.view = target;
+    c.loadOp = wgpu::LoadOp::Clear;
+    c.storeOp = wgpu::StoreOp::Store;
+    c.clearValue = {clear, clear, clear, 1};
+    wgpu::RenderPassDescriptor rp{};
+    rp.colorAttachmentCount = 1;
+    rp.colorAttachments = &c;
+    wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
+    if (p) {
+      pass.SetPipeline(*p);
+      pass.SetBindGroup(0, *g);
+      pass.Draw(3);
     }
+    pass.End();
+  };
+  // 3. Ambient occlusion.
+  if (s.ssao && s.ao_strength > 0 && !wire_mode) {
+    fullscreen(ao_raw_view_, &ssao_, &ssao_group_, 1.0);
+    fullscreen(ao_view_, &blur_, &blur_group_, 1.0);
+  } else {
+    fullscreen(ao_view_, nullptr, nullptr, 1.0);
   }
   // 4. Main color pass (4x MSAA).
   {
@@ -846,7 +1184,7 @@ void Renderer::render(const Scene& scene, const Camera& camera, const RenderSett
     wgpu::RenderPassDepthStencilAttachment d{};
     d.view = msaa_depth_view_;
     d.depthLoadOp = wgpu::LoadOp::Clear;
-    d.depthStoreOp = wgpu::StoreOp::Discard;
+    d.depthStoreOp = see_through ? wgpu::StoreOp::Store : wgpu::StoreOp::Discard;
     d.depthClearValue = 0.0f;
     wgpu::RenderPassDescriptor rp{};
     rp.colorAttachmentCount = 1;
@@ -860,13 +1198,13 @@ void Renderer::render(const Scene& scene, const Camera& camera, const RenderSett
         pass.SetPipeline(grid_main_);
         pass.Draw(3);
       }
-      draw_items(pass, points_main_, arrows_main_);
+      draw_items(pass, false);
       pass.SetPipeline(mesh_wire_);
-      draw_meshes(pass);
+      draw_meshes(pass, all_meshes);
     } else {
       pass.SetPipeline(mesh_main_);
-      draw_meshes(pass);
-      draw_items(pass, points_main_, arrows_main_);
+      draw_meshes(pass, opaque_meshes_);
+      draw_items(pass, false);
       if (ground) {
         pass.SetPipeline(grid_main_);
         pass.Draw(3);
@@ -874,37 +1212,76 @@ void Renderer::render(const Scene& scene, const Camera& camera, const RenderSett
     }
     pass.End();
   }
-  // 5. Composite, 6. overlays + UI, all on the final texture.
-  {
+  // 5. See-through meshes: weighted blended OIT against the opaque depth.
+  if (see_through) {
+    wgpu::RenderPassColorAttachment c[2]{};
+    c[0].view = oit_accum_msaa_view_;
+    c[0].resolveTarget = oit_accum_view_;
+    c[0].clearValue = {0, 0, 0, 0};
+    c[1].view = oit_reveal_msaa_view_;
+    c[1].resolveTarget = oit_reveal_view_;
+    c[1].clearValue = {1, 1, 1, 1};
+    for (auto& a : c) {
+      a.loadOp = wgpu::LoadOp::Clear;
+      a.storeOp = wgpu::StoreOp::Discard;
+    }
+    wgpu::RenderPassDepthStencilAttachment d{};
+    d.view = msaa_depth_view_;
+    d.depthLoadOp = wgpu::LoadOp::Load;
+    d.depthStoreOp = wgpu::StoreOp::Discard;
+    wgpu::RenderPassDescriptor rp{};
+    rp.colorAttachmentCount = 2;
+    rp.colorAttachments = c;
+    rp.depthStencilAttachment = &d;
+    wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
+    pass.SetBindGroup(0, scene_group_);
+    pass.SetPipeline(mesh_transparent_);
+    draw_meshes(pass, transparent_meshes_);
+    pass.End();
+  } else {
+    fullscreen(oit_reveal_view_, nullptr, nullptr, 1.0);
+  }
+  // 6. Composite, then overlays and the UI on the final texture. When the
+  //    scene image is kept (video without UI), it is copied before the UI.
+  auto begin_final = [&](wgpu::LoadOp load) {
     wgpu::RenderPassColorAttachment c{};
     c.view = final_view_;
-    c.loadOp = wgpu::LoadOp::Clear;
+    c.loadOp = load;
     c.storeOp = wgpu::StoreOp::Store;
     wgpu::RenderPassDescriptor rp{};
     rp.colorAttachmentCount = 1;
     rp.colorAttachments = &c;
-    wgpu::RenderPassEncoder pass = enc.BeginRenderPass(&rp);
-    pass.SetPipeline(composite_);
-    pass.SetBindGroup(0, composite_group_);
-    pass.Draw(3);
-    if (!overlay.lines.empty()) {
-      pass.SetPipeline(lines_);
-      pass.SetBindGroup(0, lines_group_);
-      pass.SetBindGroup(1, lines_storage_group_);
-      pass.Draw(6, uint32_t(overlay.lines.size()));
-    }
-    if (!glyphs.empty()) {
-      pass.SetPipeline(text_);
-      pass.SetBindGroup(0, text_group_);
-      pass.SetBindGroup(1, text_storage_group_);
-      pass.Draw(6, uint32_t(glyphs.size()));
-    }
-    if (ui) ui(pass);
-    pass.End();
+    return enc.BeginRenderPass(&rp);
+  };
+  wgpu::RenderPassEncoder pass = begin_final(wgpu::LoadOp::Clear);
+  pass.SetPipeline(composite_);
+  pass.SetBindGroup(0, composite_group_);
+  pass.Draw(3);
+  if (!overlay.lines.empty()) {
+    pass.SetPipeline(lines_);
+    pass.SetBindGroup(0, lines_group_);
+    pass.SetBindGroup(1, lines_storage_group_);
+    pass.Draw(6, uint32_t(overlay.lines.size()));
   }
+  if (!glyphs.empty()) {
+    pass.SetPipeline(text_);
+    pass.SetBindGroup(0, text_group_);
+    pass.SetBindGroup(1, text_storage_group_);
+    pass.Draw(6, uint32_t(glyphs.size()));
+  }
+  if (keep_scene_) {
+    pass.End();
+    wgpu::TexelCopyTextureInfo src{}, dst{};
+    src.texture = final_;
+    dst.texture = scene_image_;
+    wgpu::Extent3D e{width_, height_, 1};
+    enc.CopyTextureToTexture(&src, &dst, &e);
+    pass = begin_final(wgpu::LoadOp::Load);
+  }
+  if (ui) ui(pass);
+  pass.End();
   wgpu::CommandBuffer cmd = enc.Finish();
   gpu_.queue.Submit(1, &cmd);
-  frame_ms_ = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 void Renderer::blit(const wgpu::TextureView& target, wgpu::TextureFormat format) {
@@ -977,8 +1354,9 @@ std::vector<IdPixel> Renderer::read_ids(int x0, int y0, int w, int h) {
   return out;
 }
 
-bool Renderer::read_final(std::vector<uint8_t>& rgba) {
-  return read_texture(gpu_, final_, 0, 0, int(width_), int(height_), 4, rgba);
+bool Renderer::read_image(std::vector<uint8_t>& rgba, bool with_ui) {
+  const wgpu::Texture& tex = with_ui || !keep_scene_ ? final_ : scene_image_;
+  return read_texture(gpu_, tex, 0, 0, int(width_), int(height_), 4, rgba);
 }
 
 }  // namespace avbd_viz

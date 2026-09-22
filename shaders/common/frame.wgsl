@@ -29,6 +29,7 @@ struct Frame {
   env: vec4f,                // x = env rotation (rad), y = env intensity, z = max mip level
   ao: vec4f,                 // x = radius (world), y = bias, z = intensity
   post: vec4f,               // x = tonemap (0 clamp, 1 PBR neutral), y = outline width px
+  slice: vec4f,              // slice plane: xyz = unit normal toward the cut-away side, w = offset
   sh: array<vec4f, 9>,       // environment irradiance (spherical harmonics, order 2)
 };
 

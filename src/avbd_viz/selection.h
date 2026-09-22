@@ -30,9 +30,14 @@ struct IdPixel {
   uint32_t flags = 0;
 };
 
+// What a selected index means depends on the structure and pick mode:
+//   surface mesh   vertex / edge / face / segment ("body")
+//   curve network  node (Vertex mode) / edge (Edge, Face) / 0 = whole (Body)
+//   volume mesh    vertex (Vertex) / tet cell (Edge, Face) / 0 = whole (Body)
+//   points, vectors  item index, or 0 = whole (Body)
 struct ElementRef {
   uint32_t object = 0;
-  uint32_t index = 0;  // vertex / edge / face / segment (meshes) or item (points, vectors)
+  uint32_t index = 0;
   bool operator==(const ElementRef& o) const { return object == o.object && index == o.index; }
 };
 
@@ -62,12 +67,16 @@ class Selection {
 
 // A point that follows moving geometry.
 struct Anchor {
-  enum Kind { Vertex, Surface, Ground, Point } kind = Ground;
+  enum Kind { Vertex, Surface, Ground, Point, Fixed } kind = Ground;
   uint32_t object = 0;
-  uint32_t index = 0;    // vertex, face or point index
+  uint32_t index = 0;    // vertex/node, face or point index
   glm::vec3 bary{0.0f};  // Surface: barycentric coordinates in the face
-  glm::vec3 point{0.0f}; // Ground: fixed world position
+  glm::vec3 point{0.0f}; // Ground / Fixed: world position
 };
+
+// Element kind a pick mode selects on a structure (Segment for whole
+// structures other than meshes).
+ElementKind picked_kind(const Structure& s, PickMode mode);
 
 enum class MeasureTool : int { Off, Distance, Angle };
 

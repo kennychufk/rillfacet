@@ -126,8 +126,11 @@ int main(int argc, char** argv) {
   std::string out;
   int style = -1, frames = 3;
   bool light = false, wire = false, measure = false;
-  std::string view;
-  bool wire_shading = false;
+  std::string view, record;
+  bool wire_shading = false, slice = false;
+  float opacity = 1.0f, cam[6] = {0, 0, 0, 10, -60, 30};
+  bool use_cam = false;
+  bool selftest_v1 = false;
   bool selftest = false, no_ui = false, no_grid = false, no_ground_shadow = false, no_ssao = false, no_shadows = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -140,8 +143,16 @@ int main(int argc, char** argv) {
     else if (a == "--measure") measure = true;
     else if (a == "--no-grid") no_grid = true;
     else if (a == "--selftest") selftest = opt.headless = true;
+    else if (a == "--selftest-v1") selftest_v1 = slice = opt.headless = true;
     else if (a == "--no-ui") no_ui = true;
     else if (a == "--wire") wire_shading = true;
+    else if (a == "--slice") slice = true;
+    else if (a == "--cam" && i + 6 < argc) {
+      for (int k = 0; k < 6; ++k) cam[k] = std::stof(argv[++i]);
+      use_cam = true;
+    }
+    else if (a == "--opacity" && i + 1 < argc) opacity = std::stof(argv[++i]);
+    else if (a == "--record" && i + 1 < argc) record = argv[++i];
     else if (a == "--view" && i + 1 < argc) view = argv[++i];
     else if (a == "--no-ground-shadow") no_ground_shadow = true;
     else if (a == "--no-ssao") no_ssao = true;
@@ -189,12 +200,84 @@ int main(int argc, char** argv) {
   sheet.color_quantity = "height";
   sheet.isolines = true;
   sheet.isoline_spacing = 0.05f;
+  sheet.smooth_shading = true;
 
   PointCloud& pins = viewer.scene().add_points("pins");
   VectorSet& arrows = viewer.scene().add_vectors("velocity arrows");
   arrows.color = {0.2f, 0.45f, 0.95f};
   arrows.radius = 0.012f;
   arrows.length_scale = 1.0f;
+
+  // A rope: helix curve network colored by height, with tangent arrows.
+  CurveNetwork& rope = viewer.scene().add_curves("rope");
+  {
+    std::vector<float> nodes, height, tangent;
+    const int n = 120;
+    for (int i = 0; i < n; ++i) {
+      float u = float(i) / (n - 1), a = 6.0f * 3.14159265f * u;
+      float x = -1.0f + 2.0f * u, y = 3.4f + 0.45f * std::cos(a), z = 0.9f + 0.45f * std::sin(a);
+      nodes.insert(nodes.end(), {x, y, z});
+      height.push_back(z);
+      tangent.insert(tangent.end(), {0.0f, std::cos(a), std::sin(a)});  // outward normal of the helix
+    }
+    rope.set_polyline(nodes.data(), n);
+    rope.radius = 0.05f;
+    rope.add_scalar("height", ElementKind::Vertex, height);
+    Quantity& tq = rope.add_vector("normal", ElementKind::Vertex, tangent);
+    tq.show_arrows = true;
+    tq.arrow_scale = 0.18f;
+    tq.arrow_color = {0.95f, 0.75f, 0.25f};
+    rope.color_source = ColorSource::Quantity;
+    rope.color_quantity = "height";
+    rope.colormap = 3;  // plasma
+  }
+
+  // A soft block: a tetrahedralized box (6 tets per cube) with vertex and
+  // cell quantities; slice it to see inside.
+  VolumeMesh& block = viewer.scene().add_volume("block");
+  {
+    const int nx = 12, ny = 6, nz = 6;
+    const float h = 0.2f;
+    const glm::vec3 origin(4.2f, -0.6f, 0.0f);
+    std::vector<float> xyz, dist;
+    auto id = [&](int i, int j, int k) { return uint32_t((k * (ny + 1) + j) * (nx + 1) + i); };
+    for (int k = 0; k <= nz; ++k)
+      for (int j = 0; j <= ny; ++j)
+        for (int i = 0; i <= nx; ++i) {
+          glm::vec3 p = origin + h * glm::vec3(i, j, k);
+          xyz.insert(xyz.end(), {p.x, p.y, p.z});
+          dist.push_back(glm::length(p - (origin + 0.5f * h * glm::vec3(nx, ny, nz))));
+        }
+    std::vector<uint32_t> tets;
+    const int perms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+    for (int k = 0; k < nz; ++k)
+      for (int j = 0; j < ny; ++j)
+        for (int i = 0; i < nx; ++i) {
+          auto corner = [&](int bits) { return id(i + (bits & 1), j + ((bits >> 1) & 1), k + ((bits >> 2) & 1)); };
+          for (const auto& p : perms) {
+            int b1 = 1 << p[0], b2 = b1 | (1 << p[1]);
+            tets.insert(tets.end(), {corner(0), corner(b1), corner(b2), corner(7)});
+          }
+        }
+    block.set_geometry(xyz.data(), xyz.size() / 3, tets.data(), tets.size() / 4);
+    block.add_scalar("distance to center", ElementKind::Vertex, dist);
+    std::vector<float> stress(block.num_cells());
+    for (uint32_t c = 0; c < block.num_cells(); ++c) {
+      glm::vec3 m = block.element_position(ElementKind::Cell, c) - origin;
+      stress[c] = std::sin(3.0f * m.x) * std::cos(4.0f * m.z) + 0.3f * m.y;
+    }
+    block.add_scalar("stress", ElementKind::Cell, stress);
+    block.color_source = ColorSource::Quantity;
+    block.color_quantity = "distance to center";
+    block.colormap = 1;  // turbo
+    block.opacity = opacity;
+    if (slice) {
+      viewer.settings().slice.enabled = true;
+      viewer.settings().slice.axis = 1;
+      viewer.settings().slice.offset = 0.0f;
+      viewer.settings().slice.flip = true;  // keep y > 0, so the cut faces the default camera
+    }
+  }
 
   float t = 0.0f;
   bool animate = true;
@@ -211,6 +294,17 @@ int main(int argc, char** argv) {
     sheet.add_scalar("height", ElementKind::Vertex, height);
     sheet.add_scalar("speed", ElementKind::Vertex, speed);
     sheet.add_vector("velocity", ElementKind::Vertex, vel);
+    // Edge stretch relative to the flat sheet.
+    const auto& ed = sheet.edges();
+    std::vector<float> stretch(ed.size() / 2);
+    const float rest = cloth.size / (cloth.n - 1);
+    for (size_t e = 0; e < stretch.size(); ++e) {
+      glm::vec3 a = sheet.vertex(ed[2 * e]), b = sheet.vertex(ed[2 * e + 1]);
+      glm::vec2 d0 = glm::vec2(a) - glm::vec2(b);
+      stretch[e] = glm::length(a - b) / std::max(glm::length(d0), 1e-6f) - 1.0f;
+    }
+    sheet.add_scalar("stretch", ElementKind::Edge, stretch);
+    (void)rest;
     // Pins at the four corners, arrows on a coarse subset of the sheet.
     int n = cloth.n;
     std::vector<float> corners;
@@ -232,10 +326,16 @@ int main(int argc, char** argv) {
   t = 0.7f;
   update();
 
-  viewer.camera().target = {0.0f, 0.2f, 0.8f};
-  viewer.camera().distance = 11.0f;
+  viewer.camera().target = {0.6f, 0.8f, 0.8f};
+  viewer.camera().distance = 13.5f;
   viewer.camera().yaw = -1.25f;
   viewer.camera().pitch = 0.42f;
+  if (use_cam) {  // --cam target_x target_y target_z distance yaw_deg pitch_deg
+    viewer.camera().target = {cam[0], cam[1], cam[2]};
+    viewer.camera().distance = cam[3];
+    viewer.camera().yaw = glm::radians(cam[4]);
+    viewer.camera().pitch = glm::radians(cam[5]);
+  }
   const char* views[] = {"front", "back", "right", "left", "top", "bottom"};
   for (int k = 0; k < 6; ++k)
     if (view == views[k]) {
@@ -271,6 +371,79 @@ int main(int argc, char** argv) {
     viewer.overlay().text(label);
   });
 
+  if (selftest_v1) {
+    // Picking on curves and volumes (the slice plane is on, cut facing the camera).
+    ImGuiIO& io = ImGui::GetIO();
+    viewer.camera().target = {5.4f, 0.0f, 0.6f};
+    viewer.camera().distance = 5.0f;
+    viewer.camera().yaw = glm::radians(-60.0f);
+    viewer.camera().pitch = glm::radians(30.0f);
+    glm::vec2 vp = viewer.viewport();
+    auto px = [&](glm::vec3 p) { glm::vec3 s = viewer.camera().project(p, vp.x, vp.y); return glm::vec2(s.x, s.y); };
+    auto click = [&](glm::vec2 p) {
+      io.AddMousePosEvent(p.x, p.y);
+      viewer.frame();
+      io.AddMouseButtonEvent(0, true);
+      viewer.frame();
+      io.AddMouseButtonEvent(0, false);
+      viewer.frame();
+    };
+    auto key = [&](ImGuiKey k) {
+      io.AddKeyEvent(k, true);
+      viewer.frame();
+      io.AddKeyEvent(k, false);
+      viewer.frame();
+    };
+    for (int i = 0; i < 3; ++i) viewer.frame();
+    auto& items = viewer.selection().items();
+    auto report = [&](const char* what) {
+      if (items.empty()) {
+        std::printf("%s: nothing selected\n", what);
+        return;
+      }
+      const Structure* st = viewer.scene().find(items[0].object);
+      std::printf("%s: %s #%u\n", what, st ? st->name().c_str() : "?", items[0].index);
+    };
+    // A point on the cut (y = 0 plane) inside the block.
+    glm::vec3 on_cut(5.0f, 0.0f, 0.5f);
+    key(ImGuiKey_3);  // face mode -> tet cells on volumes
+    click(px(on_cut));
+    report("cell under the cut");
+    if (!items.empty()) {
+      glm::vec3 c = block.element_position(ElementKind::Cell, items[0].index);
+      std::printf("  cell centroid (%.2f %.2f %.2f), expect near (5.0, 0.0..0.2, 0.5)\n", c.x, c.y, c.z);
+    }
+    key(ImGuiKey_1);
+    click(px({4.2f, 0.0f, 1.2f}));  // the cut's top-left corner is a mesh vertex
+    report("vertex near the cut corner");
+    if (!items.empty()) {
+      glm::vec3 v = block.vertex(items[0].index);
+      std::printf("  vertex (%.2f %.2f %.2f)\n", v.x, v.y, v.z);
+    }
+    key(ImGuiKey_4);
+    click(px(on_cut));
+    report("body mode on the block");
+    Hit h = viewer.pick(px(on_cut).x, px(on_cut).y);
+    std::printf("pick on the cut: valid=%d point=(%.3f %.3f %.3f) (y should be ~0)\n", h.valid, h.point.x, h.point.y,
+                h.point.z);
+    // The rope, seen from its own side.
+    viewer.camera().target = {0.0f, 3.4f, 0.9f};
+    viewer.camera().distance = 3.2f;
+    viewer.camera().yaw = glm::radians(-70.0f);
+    viewer.camera().pitch = glm::radians(25.0f);
+    for (int i = 0; i < 2; ++i) viewer.frame();
+    glm::vec3 node = rope.node(10);
+    key(ImGuiKey_2);  // edge mode -> curve edges
+    click(px(node));
+    report("rope edge");
+    key(ImGuiKey_1);
+    click(px(node));
+    report("rope node (expect 10)");
+    viewer.set_ui_visible(true);
+    viewer.frame();
+    if (!out.empty()) viewer.screenshot(out);
+    return 0;
+  }
   if (selftest) {
     // Drive picking, box select and measuring through injected input events.
     viewer.set_ui_visible(false);
@@ -367,8 +540,16 @@ int main(int argc, char** argv) {
     if (!out.empty()) viewer.screenshot(out);
     return 0;
   }
+  if (!record.empty()) viewer.start_recording(record, 30, false);
   if (opt.headless) {
-    for (int i = 0; i < frames; ++i) viewer.frame();
+    for (int i = 0; i < frames; ++i) {
+      if (!record.empty()) {  // animate while recording
+        t += 1.0f / 30.0f;
+        update();
+      }
+      viewer.frame();
+    }
+    viewer.stop_recording();
     if (!out.empty() && !viewer.screenshot(out)) return 1;
     return 0;
   }

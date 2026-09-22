@@ -9,6 +9,8 @@
 @group(0) @binding(2) var id_tex: texture_2d<u32>;
 @group(0) @binding(3) var depth_tex: texture_depth_2d;
 @group(0) @binding(4) var normal_tex: texture_2d<f32>;
+@group(0) @binding(5) var accum_tex: texture_2d<f32>;   // see-through surfaces: weighted color sum
+@group(0) @binding(6) var reveal_tex: texture_2d<f32>;  // and how much of the background shows
 
 struct VsOut {
   @builtin(position) clip: vec4f,
@@ -92,6 +94,17 @@ fn fs_composite(in: VsOut) -> @location(0) vec4f {
     }
   }
   rgb = mix(rgb, frame.outline_color.rgb, min(edge / 3.0, 1.0) * frame.outline_color.a);
+
+  // See-through surfaces over everything opaque (weighted blended OIT resolve).
+  let reveal = textureLoad(reveal_tex, px, 0).r;
+  if (reveal < 0.999) {
+    let acc = textureLoad(accum_tex, px, 0);
+    var t_rgb = acc.rgb / max(acc.a, 1e-5);
+    if (frame.post.x > 0.5) {
+      t_rgb = tonemap_neutral(t_rgb);
+    }
+    rgb = mix(rgb, t_rgb, 1.0 - reveal);
+  }
   // Selected segments get a bright outline (drawn on both sides of the edge).
   // Wireframe shading colors the selected wires instead.
   var select_width = 0.0;

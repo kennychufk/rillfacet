@@ -45,3 +45,17 @@ if(AVBD_VIZ_BUILD_EXAMPLES)
   add_executable(showcase examples/showcase.cpp)
   target_link_libraries(showcase PRIVATE avbd_viz)
 endif()
+
+# Python module `avbd_viz` (built into python/avbd_viz/; `pip install -e .`
+# makes it importable).
+option(AVBD_VIZ_BUILD_PYTHON "Build the avbd_viz Python module" OFF)
+if(AVBD_VIZ_BUILD_PYTHON)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+  execute_process(COMMAND ${Python3_EXECUTABLE} -m pybind11 --cmakedir
+                  OUTPUT_VARIABLE pybind11_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+  find_package(pybind11 CONFIG REQUIRED)
+  pybind11_add_module(_avbd_viz src/python/module.cpp)
+  target_link_libraries(_avbd_viz PRIVATE avbd_viz)
+  set_target_properties(_avbd_viz PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/python/avbd_viz)
+endif()

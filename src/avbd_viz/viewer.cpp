@@ -16,6 +16,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <csignal>
+#include <cstdlib>
 #include <limits>
 
 namespace avbd_viz {
@@ -91,6 +93,7 @@ Viewer::Viewer(const ViewerOptions& options) : options_(options) {
 }
 
 Viewer::~Viewer() {
+  stop_recording();
   if (ImGui::GetCurrentContext()) {
     ImGui_ImplWGPU_Shutdown();
     if (window_) ImGui_ImplGlfw_Shutdown();
@@ -156,9 +159,11 @@ bool Viewer::frame() {
   camera_.update(dt_);
   ImGui::Render();
 
+  renderer_->keep_scene_image((recording() && !video_with_ui_) || (!shot_path_.empty() && !shot_with_ui_));
   renderer_->render(scene_, camera_, settings_, selection_, overlay_, [](wgpu::RenderPassEncoder& pass) {
     ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), pass.Get());
   });
+  capture_frame();
   if (window_) {
     wgpu::SurfaceTexture st{};
     surface_.GetCurrentTexture(&st);
@@ -181,9 +186,90 @@ void Viewer::run() {
 
 bool Viewer::screenshot(const std::string& path) {
   std::vector<uint8_t> rgba;
-  if (!renderer_->read_final(rgba)) return false;
+  if (!renderer_->read_image(rgba, true)) return false;
   int w = int(renderer_->width()), h = int(renderer_->height());
   return stbi_write_png(path.c_str(), w, h, 4, rgba.data(), w * 4) != 0;
+}
+
+void Viewer::request_screenshot(const std::string& path, bool with_ui) {
+  shot_path_ = path;
+  shot_with_ui_ = with_ui;
+}
+
+static bool have_ffmpeg() {
+  static int found = -1;
+  if (found < 0) found = std::system("ffmpeg -version > /dev/null 2>&1") == 0;
+  return found == 1;
+}
+
+bool Viewer::start_recording(const std::string& path, int fps, bool with_ui) {
+  stop_recording();
+  video_w_ = renderer_->width();
+  video_h_ = renderer_->height();
+  video_fps_ = std::max(fps, 1);
+  video_with_ui_ = with_ui;
+  video_frames_ = 0;
+  video_path_ = path;
+  if (have_ffmpeg()) {
+    // Raw RGBA frames on stdin; H.264 wants even dimensions, so crop a pixel if needed.
+    char cmd[1024];
+    std::snprintf(cmd, sizeof cmd,
+                  "ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgba -s %ux%u -r %d -i - "
+                  "-vf 'crop=trunc(iw/2)*2:trunc(ih/2)*2' -c:v libx264 -preset veryfast -crf 18 "
+                  "-pix_fmt yuv420p \"%s\"",
+                  video_w_, video_h_, video_fps_, path.c_str());
+    // A dying ffmpeg must not take the viewer down with SIGPIPE.
+    std::signal(SIGPIPE, SIG_IGN);
+    video_ = popen(cmd, "w");
+    if (!video_) return false;
+  } else {
+    video_png_ = true;  // numbered PNGs: <path without extension>_00000.png
+  }
+  status_ = "Recording " + path;
+  status_until_ = now_seconds() + 2.0;
+  return true;
+}
+
+void Viewer::stop_recording() {
+  if (!recording()) return;
+  if (video_) pclose(video_);
+  video_ = nullptr;
+  video_png_ = false;
+  status_ = "Saved " + std::to_string(video_frames_) + " frames to " + video_path_;
+  status_until_ = now_seconds() + 4.0;
+}
+
+void Viewer::capture_frame() {
+  if (!shot_path_.empty()) {
+    std::vector<uint8_t> rgba;
+    int w = int(renderer_->width()), h = int(renderer_->height());
+    bool ok = renderer_->read_image(rgba, shot_with_ui_) &&
+              stbi_write_png(shot_path_.c_str(), w, h, 4, rgba.data(), w * 4) != 0;
+    status_ = ok ? "Saved " + shot_path_ : "Screenshot failed";
+    status_until_ = now_seconds() + 2.5;
+    shot_path_.clear();
+  }
+  if (!recording()) return;
+  if (renderer_->width() != video_w_ || renderer_->height() != video_h_) {
+    stop_recording();
+    status_ += " (stopped: the window was resized)";
+    return;
+  }
+  std::vector<uint8_t> rgba;
+  if (!renderer_->read_image(rgba, video_with_ui_)) return;
+  if (video_) {
+    if (fwrite(rgba.data(), 1, rgba.size(), video_) != rgba.size()) {
+      stop_recording();
+      status_ = "Recording failed: ffmpeg stopped";
+      return;
+    }
+  } else {
+    std::string stem = video_path_.substr(0, video_path_.find_last_of('.'));
+    char name[32];
+    std::snprintf(name, sizeof name, "_%05d.png", video_frames_);
+    stbi_write_png((stem + name).c_str(), int(video_w_), int(video_h_), 4, rgba.data(), int(video_w_) * 4);
+  }
+  ++video_frames_;
 }
 
 // ---- Camera helpers ---------------------------------------------------------------
@@ -356,6 +442,15 @@ void Viewer::handle_input() {
     status_ = msg;
     status_until_ = now_seconds() + 3.0;
   }
+  if (pressed(ImGuiKey_F10)) {
+    if (recording()) {
+      stop_recording();
+    } else {
+      char name[64];
+      std::snprintf(name, sizeof name, "avbd_viz_%03d.mp4", screenshot_counter_++);
+      start_recording(name, 30, false);
+    }
+  }
   if (pressed(ImGuiKey_F12)) {
     char name[64];
     std::snprintf(name, sizeof name, "avbd_viz_%03d.png", screenshot_counter_++);
@@ -489,35 +584,57 @@ void Viewer::build_overlays() {
   const glm::vec4 active_color = dark ? srgba(1.0f, 0.93f, 0.75f) : srgba(0.85f, 0.30f, 0.0f);
   const glm::vec4 border = dark ? srgba(0.05f, 0.05f, 0.05f, 1.5f) : srgba(0.1f, 0.1f, 0.1f, 1.5f);
   const ElementRef* active = selection_.active();
+  const bool xray = settings_.shading == Shading::Wireframe;
   for (const ElementRef& e : selection_.items()) {
-    bool is_active = active && e == *active;
-    const SurfaceMesh* m = scene_.get<SurfaceMesh>(e.object);
-    if (!m) {
-      overlay_.dot(element_position(scene_, selection_.mode(), e), is_active ? active_color : sel_color, 10.0f, 0.4f,
-                   border);
-      continue;
-    }
-    if (selection_.mode() == PickMode::Vertex) {
-      overlay_.dot(m->vertex(e.index), is_active ? active_color : sel_color, is_active ? 10.0f : 8.0f, 0.35f, border);
-    } else if (selection_.mode() == PickMode::Edge) {
-      const auto& ed = m->edges();
-      overlay_.line(m->vertex(ed[2 * e.index]), m->vertex(ed[2 * e.index + 1]), is_active ? active_color : sel_color,
-                    3.0f, 0.35f);
-    } else if (selection_.mode() == PickMode::Face && settings_.shading == Shading::Wireframe &&
-               e.index < m->num_faces()) {
-      glm::uvec3 f = m->face(e.index);
-      glm::vec3 p[3] = {m->vertex(f.x), m->vertex(f.y), m->vertex(f.z)};
-      for (int k = 0; k < 3; ++k)
-        overlay_.line(p[k], p[(k + 1) % 3], is_active ? active_color : sel_color, settings_.wire_width + 1.0f, 1.0f);
+    const Structure* s = scene_.find(e.object);
+    if (!s) continue;
+    const bool is_active = active && e == *active;
+    const glm::vec4 col = is_active ? active_color : sel_color;
+    const ElementKind k = picked_kind(*s, selection_.mode());
+    auto dot = [&](const glm::vec3& p) { overlay_.dot(p, col, is_active ? 10.0f : 8.0f, 0.35f, border); };
+    auto line = [&](const glm::vec3& a, const glm::vec3& b, float w, float hidden) {
+      overlay_.line(a, b, col, w, hidden);
+    };
+    if (auto* m = dynamic_cast<const SurfaceMesh*>(s)) {
+      if (k == ElementKind::Vertex && e.index < m->num_vertices()) {
+        dot(m->vertex(e.index));
+      } else if (k == ElementKind::Edge && e.index < m->num_edges()) {
+        const auto& ed = m->edges();
+        line(m->vertex(ed[2 * e.index]), m->vertex(ed[2 * e.index + 1]), 3.0f, 0.35f);
+      } else if (k == ElementKind::Face && xray && e.index < m->num_faces()) {
+        glm::uvec3 f = m->face(e.index);
+        glm::vec3 p[3] = {m->vertex(f.x), m->vertex(f.y), m->vertex(f.z)};
+        for (int c = 0; c < 3; ++c) line(p[c], p[(c + 1) % 3], settings_.wire_width + 1.0f, 1.0f);
+      }
+    } else if (auto* c = dynamic_cast<const CurveNetwork*>(s)) {
+      if (k == ElementKind::Vertex && e.index < c->num_nodes()) dot(c->node(e.index));
+      if (k == ElementKind::Edge && e.index < c->num_edges())
+        line(c->node(c->edge(e.index).x), c->node(c->edge(e.index).y), 3.0f, 1.0f);  // inside the tube
+    } else if (auto* v = dynamic_cast<const VolumeMesh*>(s)) {
+      if (k == ElementKind::Vertex && e.index < v->num_vertices()) dot(v->vertex(e.index));
+      if (k == ElementKind::Cell && e.index < v->num_cells()) {
+        glm::uvec4 t = v->cell(e.index);
+        glm::vec3 p[4] = {v->vertex(t.x), v->vertex(t.y), v->vertex(t.z), v->vertex(t.w)};
+        for (int a = 0; a < 4; ++a)
+          for (int b = a + 1; b < 4; ++b) line(p[a], p[b], 2.0f, 0.6f);
+      }
+    } else if (k != ElementKind::Segment) {
+      overlay_.dot(element_position(scene_, selection_.mode(), e), col, 10.0f, 0.4f, border);
     }
   }
   if (active) {
-    static const char* prefix[] = {"v", "e", "f", ""};
-    std::string text = selection_.mode() == PickMode::Segment
-                           ? (scene_.get<SurfaceMesh>(active->object)
-                                  ? scene_.get<SurfaceMesh>(active->object)->segment_name(active->index)
-                                  : "#" + std::to_string(active->index))
-                           : prefix[int(selection_.mode())] + std::to_string(active->index);
+    static const char* prefix[] = {"v", "e", "f", "", "cell "};
+    const Structure* as = scene_.find(active->object);
+    ElementKind ak = as ? picked_kind(*as, selection_.mode()) : ElementKind::Vertex;
+    std::string text;
+    if (auto* m = scene_.get<SurfaceMesh>(active->object); m && ak == ElementKind::Segment)
+      text = m->segment_name(active->index);
+    else if (ak == ElementKind::Segment)
+      text = as ? as->name() : "";
+    else if (as && (as->kind() == StructureKind::PointCloud || as->kind() == StructureKind::VectorSet))
+      text = "#" + std::to_string(active->index);
+    else
+      text = prefix[int(ak)] + std::to_string(active->index);
     TextLabel l;
     l.text = text;
     l.anchor = element_position(scene_, selection_.mode(), *active);
@@ -533,6 +650,34 @@ void Viewer::build_overlays() {
     l.halo = halo;
     l.hidden_alpha = 0.6f;
     overlay_.text(l);
+  }
+
+  // Slice plane outline across the scene bounds.
+  if (settings_.slice.enabled && settings_.slice.show) {
+    glm::vec3 lo, hi;
+    if (scene_.bounds(lo, hi)) {
+      const int a = settings_.slice.axis, u = (a + 1) % 3, v = (a + 2) % 3;
+      glm::vec3 pad = 0.05f * (hi - lo) + glm::vec3(0.01f);
+      lo -= pad;
+      hi += pad;
+      glm::vec3 p[4];
+      for (int k = 0; k < 4; ++k) {
+        p[k][a] = settings_.slice.offset;
+        p[k][u] = (k == 1 || k == 2) ? hi[u] : lo[u];
+        p[k][v] = k >= 2 ? hi[v] : lo[v];
+      }
+      const glm::vec4 pc = dark ? srgba(0.40f, 0.82f, 1.0f, 0.9f) : srgba(0.0f, 0.45f, 0.75f, 0.9f);
+      for (int k = 0; k < 4; ++k) overlay_.line(p[k], p[(k + 1) % 4], pc, 1.5f, 0.3f);
+      TextLabel l;
+      l.text = std::string("xyz").substr(a, 1) + " = " + ui::format_length(settings_.slice.offset, 0.001);
+      l.anchor = p[2];
+      l.size_px = 12.0f;
+      l.offset = {6.0f, -16.0f};
+      l.color = pc;
+      l.halo = halo;
+      l.hidden_alpha = 0.5f;
+      overlay_.text(l);
+    }
   }
 
   // Measurements.
@@ -568,11 +713,51 @@ void Viewer::build_overlays() {
   draw_measure(pending_measure_, false);
 }
 
+// Appended to the Display window: screenshots and video.
+void Viewer::capture_panel() {
+  if (!ImGui::Begin("Display")) {
+    ImGui::End();
+    return;
+  }
+  ImGui::SeparatorText("Capture");
+  static bool with_ui = false;
+  static int fps = 30;
+  static char path[256] = "avbd_viz.mp4";
+  ImGui::Checkbox("Include UI", &with_ui);
+  if (ImGui::Button("Screenshot")) {
+    char name[64];
+    std::snprintf(name, sizeof name, "avbd_viz_%03d.png", screenshot_counter_++);
+    request_screenshot(name, with_ui);
+  }
+  ImGui::SameLine();
+  if (!recording()) {
+    if (ImGui::Button("Record (F10)")) start_recording(path, fps, with_ui);
+  } else if (ImGui::Button("Stop")) {
+    stop_recording();
+  }
+  ImGui::SetNextItemWidth(-110);
+  ImGui::InputText("File", path, sizeof path);
+  ImGui::SetNextItemWidth(-110);
+  ImGui::SliderInt("Frame rate", &fps, 10, 60);
+  ImGui::End();
+
+  if (recording()) {
+    const ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImVec2 c(io.DisplaySize.x * 0.5f - 60, 20);
+    dl->AddCircleFilled(c, 6, IM_COL32(230, 40, 40, 255));
+    char text[64];
+    std::snprintf(text, sizeof text, "REC  %d frames", video_frames_);
+    dl->AddText(ImVec2(c.x + 12, c.y - 8), IM_COL32(255, 255, 255, 230), text);
+  }
+}
+
 void Viewer::draw_ui() {
   const ImGuiIO& io = ImGui::GetIO();
   glm::vec2 vp(io.DisplaySize.x, io.DisplaySize.y);
   MeasureTool before = measure_tool_;
   ui::display_panel(scene_, settings_, selection_);
+  capture_panel();
   ui::inspector_panel(scene_, selection_, measurements_, measure_tool_, xray_select_, mono_font_);
   if (measure_tool_ != before) pending_measure_ = {};
   ui::nav_gizmo(camera_, settings_, vp);

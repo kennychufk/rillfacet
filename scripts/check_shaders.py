@@ -14,7 +14,7 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 SHADERS = os.path.join(ROOT, "shaders")
 TINT = os.path.join(ROOT, "third_party", "dawn", "bin", "tint")
 STYLES = ["studio", "matcap", "pbr", "technical"]
-ENTRY = ["mesh.wgsl", "points.wgsl", "arrows.wgsl", "grid.wgsl", "ssao.wgsl",
+ENTRY = ["mesh.wgsl", "points.wgsl", "curves.wgsl", "arrows.wgsl", "grid.wgsl", "ssao.wgsl",
          "composite.wgsl", "overlay_lines.wgsl", "overlay_text.wgsl", "blit.wgsl",
          "env_prefilter.wgsl"]
 
