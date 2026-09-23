@@ -281,14 +281,18 @@ int main(int argc, char** argv) {
 
   float t = 0.0f;
   bool animate = true;
-  auto update = [&]() {
+  auto update = [&](float dt) {
     cloth.update(t);
     sheet.set_positions(cloth.pos.data());
     size_t nv = cloth.pos.size() / 3;
+    // Velocity from the time actually elapsed: assuming a 60 Hz frame made
+    // every arrow scale with the frame time (jitter, badly so while panning).
+    const float inv_dt = dt > 1e-6f ? 1.0f / dt : 0.0f;
     std::vector<float> height(nv), speed(nv), vel(3 * nv);
     for (size_t i = 0; i < nv; ++i) {
       height[i] = cloth.pos[3 * i + 2];
-      for (int c = 0; c < 3; ++c) vel[3 * i + c] = (cloth.pos[3 * i + c] - cloth.prev[3 * i + c]) * 60.0f;
+      for (int c = 0; c < 3; ++c)
+        vel[3 * i + c] = (cloth.pos[3 * i + c] - cloth.prev[3 * i + c]) * inv_dt;
       speed[i] = std::sqrt(vel[3 * i] * vel[3 * i] + vel[3 * i + 1] * vel[3 * i + 1] + vel[3 * i + 2] * vel[3 * i + 2]);
     }
     sheet.add_scalar("height", ElementKind::Vertex, height);
@@ -324,7 +328,7 @@ int main(int argc, char** argv) {
   t = 0.7f - 1.0f / 60.0f;
   cloth.update(t);
   t = 0.7f;
-  update();
+  update(1.0f / 60.0f);
 
   viewer.camera().target = {0.6f, 0.8f, 0.8f};
   viewer.camera().distance = 13.5f;
@@ -360,8 +364,9 @@ int main(int argc, char** argv) {
       ImGui::End();
     }
     if (animate && !opt.headless) {
-      t += viewer.frame_seconds();
-      update();
+      const float dt = viewer.frame_seconds();
+      t += dt;
+      update(dt);
     }
     TextLabel label;
     label.text = "cloth: " + std::to_string(cloth.n * cloth.n) + " vertices";
@@ -545,7 +550,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < frames; ++i) {
       if (!record.empty()) {  // animate while recording
         t += 1.0f / 30.0f;
-        update();
+        update(1.0f / 30.0f);
       }
       viewer.frame();
     }

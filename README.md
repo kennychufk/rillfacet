@@ -27,6 +27,12 @@ cmake -S . -B build -G Ninja && cmake --build build
 `build_dawn.sh` pins a Dawn commit. It needs the X11 development headers,
 including `libx11-xcb-dev`.
 
+At startup Dawn prints `maxDynamicUniformBuffersPerPipelineLayout artificially
+reduced from 500000 to 16 ...` and the storage-buffer twin. That is Dawn
+clamping the limits the driver advertises to its own internal cap
+(`NormalizeLimits`), once per device, whatever a client asks for. Nothing here
+binds with dynamic offsets, so the warning is harmless.
+
 Python module (`avbd_viz`, pybind11):
 
 ```bash

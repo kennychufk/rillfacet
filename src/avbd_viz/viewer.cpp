@@ -102,6 +102,10 @@ Viewer::~Viewer() {
   }
   renderer_.reset();
   surface_ = nullptr;
+  // The device must go before the window: releasing it drains the Vulkan
+  // queue, and the driver still talks to the X display glfwTerminate closes.
+  shaders_.reset();
+  gpu_.reset();
   if (window_) {
     glfwDestroyWindow(window_);
     glfwTerminate();
