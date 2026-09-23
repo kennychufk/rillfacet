@@ -50,6 +50,7 @@ v = viz.Viewer()                        # Viewer(headless=True) renders offscree
 cloth = v.scene.add_mesh("cloth")
 cloth.set_geometry(verts, tris)         # numpy, lists or torch tensors (CUDA ok)
 cloth.add_scalar("speed", viz.ElementKind.Vertex, speed)
+cloth.color_source = viz.ColorSource.Quantity
 cloth.color_quantity = "speed"
 cloth.colormap = "viridis"
 
@@ -62,11 +63,21 @@ v.set_callback(callback)
 v.run()
 ```
 
+ImGui has no out-parameters in Python, so widgets that write through a pointer
+in C++ return the new value instead: `changed, value = imgui.SliderFloat(...)`,
+`changed, on = imgui.Checkbox(...)`. `avbd_viz.implot` wraps the line-plot
+subset (`BeginPlot`/`SetupAxis`/`PlotLine`/`SetAxes`), and `imgui.GetIO()` can
+inject input (`AddKeyEvent`, `AddMousePosEvent`, `AddMouseButtonEvent`) so a
+viewer app can be driven headlessly from a test.
+
 Simulator demos (live in avbd-cuda). Python, on the avbd `Simulator`
-(tet bodies as volume meshes, cloth, ropes):
+(tet bodies as volume meshes, cloth, ropes) and on `RigidCompoundSimulator`
+(`mixed_convex_viewer.py`, a port of the C++ demo below sharing its scenes,
+panel and controls):
 
 ```bash
 cd ../avbd-cuda && python examples/viz_demo.py      # --headless --scene 1 --out knot.png
+python examples/mixed_convex_viewer.py              # --num-envs 16, --headless --out shot.png
 ```
 
 C++, on `RigidCompoundSimulator`:

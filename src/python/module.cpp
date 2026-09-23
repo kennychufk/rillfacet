@@ -10,6 +10,7 @@
 #include <imgui.h>
 #include <implot.h>
 #include <pybind11/functional.h>
+#include <pybind11/stl_bind.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -21,6 +22,8 @@
 
 namespace py = pybind11;
 using namespace avbd_viz;
+
+PYBIND11_MAKE_OPAQUE(std::vector<Measurement>);
 
 // ---- glm vectors <-> Python sequences ---------------------------------------------
 
@@ -38,7 +41,7 @@ struct glm_vec_caster {
   }
   static handle cast(const V& v, return_value_policy, handle) {
     tuple t(N);
-    for (int i = 0; i < N; ++i) t[size_t(i)] = float_(v[i]);
+    for (int i = 0; i < N; ++i) t[size_t(i)] = ::pybind11::float_(v[i]);
     return t.release();
   }
 };
@@ -100,7 +103,8 @@ void rethrow_callback_error() {
 
 }  // namespace
 
-static void bind_imgui(py::module_& m);
+static void bind_imgui(py::module_ m);
+static void bind_implot(py::module_ m);
 
 PYBIND11_MODULE(_avbd_viz, m) {
   m.doc() = "avbd-viz: real-time scientific viewer (WebGPU)";
@@ -190,10 +194,11 @@ PYBIND11_MODULE(_avbd_viz, m) {
                     [touch](QuantityStructure& q, glm::vec3 c) { q.color = c; touch(q); })
       .def_property("color_source", [](const QuantityStructure& q) { return q.color_source; },
                     [touch](QuantityStructure& q, ColorSource c) { q.color_source = c; touch(q); })
+      // Names the quantity used when color_source is Quantity; setting it does
+      // not change color_source (the C++ field behaves the same way).
       .def_property("color_quantity", [](const QuantityStructure& q) { return q.color_quantity; },
                     [touch](QuantityStructure& q, const std::string& n) {
                       q.color_quantity = n;
-                      q.color_source = ColorSource::Quantity;
                       touch(q);
                     })
       .def_property("colormap", [](const QuantityStructure& q) { return std::string(colormap_name(q.colormap)); },
@@ -220,6 +225,8 @@ PYBIND11_MODULE(_avbd_viz, m) {
       .def("quantity", py::overload_cast<const std::string&>(&QuantityStructure::quantity),
            py::return_value_policy::reference_internal)
       .def("remove_quantity", &QuantityStructure::remove_quantity)
+      .def("touch_attributes", &QuantityStructure::touch_attributes,
+           "Mark display settings changed when fields were written in place.")
       .def_property_readonly("quantity_names", [](const QuantityStructure& q) {
         std::vector<std::string> n;
         for (const Quantity& x : q.quantities()) n.push_back(x.name);
@@ -241,7 +248,16 @@ PYBIND11_MODULE(_avbd_viz, m) {
         s.set_segments(as_vector<uint32_t>(offsets), std::move(names));
       }, py::arg("triangle_offsets"), py::arg("names") = std::vector<std::string>{})
       .def("set_segment_visible", &SurfaceMesh::set_segment_visible)
+      .def("segment_visible", &SurfaceMesh::segment_visible)
+      .def("segment_hidden_by_app", &SurfaceMesh::segment_hidden_by_app)
+      .def("set_segment_hidden_by_user", &SurfaceMesh::set_segment_hidden_by_user)
+      .def("segment_hidden_by_user", &SurfaceMesh::segment_hidden_by_user)
+      .def("unhide_all_by_user", &SurfaceMesh::unhide_all_by_user)
       .def("set_segment_color", &SurfaceMesh::set_segment_color)
+      .def("segment_color", &SurfaceMesh::segment_color)
+      .def("segment_name", &SurfaceMesh::segment_name)
+      .def("segment_of_face", &SurfaceMesh::segment_of_face)
+      .def("segment_of_vertex", &SurfaceMesh::segment_of_vertex)
       .def_property_readonly("num_vertices", &SurfaceMesh::num_vertices)
       .def_property_readonly("num_faces", &SurfaceMesh::num_faces)
       .def_property_readonly("num_segments", &SurfaceMesh::num_segments)
@@ -381,6 +397,9 @@ PYBIND11_MODULE(_avbd_viz, m) {
       .def_property_readonly("right", &Camera::right)
       .def_property_readonly("up", &Camera::up)
       .def("set_view", &Camera::set_view)
+      .def("update", &Camera::update, py::arg("dt"), "Advance smooth-view animation (dt >= 1 finishes it).")
+      .def_property_readonly("animating", &Camera::animating)
+      .def("aligned_axis", &Camera::aligned_axis)
       .def("project", &Camera::project, py::arg("p"), py::arg("width"), py::arg("height"),
            "World point -> (x, y) pixels (origin top-left) and view depth.")
       .def("ray", &Camera::ray, py::arg("x"), py::arg("y"), py::arg("width"), py::arg("height"))
@@ -404,9 +423,31 @@ PYBIND11_MODULE(_avbd_viz, m) {
       .def("set", [](Selection& s, uint32_t object, uint32_t index) { s.set({object, index}); })
       .def("toggle", [](Selection& s, uint32_t object, uint32_t index) { s.toggle({object, index}); });
 
+  py::class_<Anchor> anchor(m, "Anchor", "A point that follows moving geometry.");
+  py::enum_<Anchor::Kind>(anchor, "Kind")
+      .value("Vertex", Anchor::Vertex)
+      .value("Surface", Anchor::Surface)
+      .value("Ground", Anchor::Ground)
+      .value("Point", Anchor::Point)
+      .value("Fixed", Anchor::Fixed);
+  anchor.def(py::init<>())
+      .def_readwrite("kind", &Anchor::kind)
+      .def_readwrite("object", &Anchor::object)
+      .def_readwrite("index", &Anchor::index)
+      .def_readwrite("bary", &Anchor::bary)
+      .def_readwrite("point", &Anchor::point);
+
+  py::class_<Measurement>(m, "Measurement")
+      .def(py::init<>())
+      .def_readwrite("anchors", &Measurement::anchors)
+      .def_readwrite("angle", &Measurement::angle);
+  py::bind_vector<std::vector<Measurement>>(m, "MeasurementList");
+
   py::class_<Hit>(m, "Hit")
       .def_readonly("valid", &Hit::valid)
       .def_readonly("point", &Hit::point)
+      .def_readonly("surface", &Hit::surface)
+      .def_property_readonly("kind", [](const Hit& h) { return h.surface.kind; })
       .def_property_readonly("object", [](const Hit& h) { return h.surface.object; })
       .def_property_readonly("index", [](const Hit& h) { return h.surface.index; });
 
@@ -450,6 +491,7 @@ PYBIND11_MODULE(_avbd_viz, m) {
       .def_property_readonly("settings", &Viewer::settings, ref)
       .def_property_readonly("selection", &Viewer::selection, ref)
       .def_property_readonly("overlay", &Viewer::overlay, ref)
+      .def_property_readonly("measurements", &Viewer::measurements, ref)
       .def("set_callback", [](Viewer& v, py::object fn) {
         if (fn.is_none()) {
           v.set_callback(nullptr);
@@ -486,21 +528,22 @@ PYBIND11_MODULE(_avbd_viz, m) {
       .def("set_ui_visible", &Viewer::set_ui_visible)
       .def("frame_all", &Viewer::frame_all, py::arg("animate") = true)
       .def("frame_selection", &Viewer::frame_selection)
-      .def("mouse_ray", &Viewer::mouse_ray)
-      .def("mouse", &Viewer::mouse)
+      .def_property_readonly("mouse_ray", &Viewer::mouse_ray, "View ray under the cursor.")
+      .def_property_readonly("mouse", &Viewer::mouse, "Cursor position in pixels (origin top-left).")
       .def_property_readonly("viewport", &Viewer::viewport)
       .def("pick", &Viewer::pick)
       .def_property_readonly("frame_seconds", &Viewer::frame_seconds);
 
   auto im = m.def_submodule("imgui", "Dear ImGui subset, named like polyscope.imgui");
   bind_imgui(im);
+  bind_implot(m.def_submodule("implot", "ImPlot subset: line plots with named axes"));
 }
 
 // ---- Dear ImGui subset ------------------------------------------------------------
 
 static ImVec2 v2(glm::vec2 v) { return ImVec2(v.x, v.y); }
 
-static void bind_imgui(py::module_& im) {
+static void bind_imgui(py::module_ im) {
   im.def("Begin", [](const std::string& name, int flags) { return ImGui::Begin(name.c_str(), nullptr, flags); },
          py::arg("name"), py::arg("flags") = 0);
   im.def("End", &ImGui::End);
@@ -517,6 +560,11 @@ static void bind_imgui(py::module_& im) {
     return py::make_tuple(c, v);
   });
   im.def("RadioButton", [](const std::string& l, bool active) { return ImGui::RadioButton(l.c_str(), active); });
+  im.def("RadioButton", [](const std::string& l, int current, int value) {
+    bool c = ImGui::RadioButton(l.c_str(), &current, value);
+    return py::make_tuple(c, current);
+  }, py::arg("label"), py::arg("current"), py::arg("value"),
+     "Radio button over an int: returns (clicked, current).");
   im.def("SliderFloat", [](const std::string& l, float v, float lo, float hi, const std::string& fmt, int flags) {
     bool c = ImGui::SliderFloat(l.c_str(), &v, lo, hi, fmt.c_str(), flags);
     return py::make_tuple(c, v);
@@ -628,7 +676,23 @@ static void bind_imgui(py::module_& im) {
       .def_property_readonly("MouseWheel", [](const IO&) { return ImGui::GetIO().MouseWheel; })
       .def_property_readonly("DisplaySize", [](const IO&) { return glm::vec2(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y); })
       .def_property_readonly("DeltaTime", [](const IO&) { return ImGui::GetIO().DeltaTime; })
-      .def_property_readonly("Framerate", [](const IO&) { return ImGui::GetIO().Framerate; });
+      .def_property_readonly("Framerate", [](const IO&) { return ImGui::GetIO().Framerate; })
+      // Input injection: drive a viewer callback from a script (headless tests).
+      .def("AddKeyEvent", [](const IO&, int key, bool down) {
+        ImGui::GetIO().AddKeyEvent(ImGuiKey(key), down);
+      }, py::arg("key"), py::arg("down"))
+      .def("AddMousePosEvent", [](const IO&, float x, float y) {
+        ImGui::GetIO().AddMousePosEvent(x, y);
+      }, py::arg("x"), py::arg("y"))
+      .def("AddMouseButtonEvent", [](const IO&, int button, bool down) {
+        ImGui::GetIO().AddMouseButtonEvent(button, down);
+      }, py::arg("button"), py::arg("down"))
+      .def("AddMouseWheelEvent", [](const IO&, float x, float y) {
+        ImGui::GetIO().AddMouseWheelEvent(x, y);
+      }, py::arg("wheel_x"), py::arg("wheel_y"))
+      .def("AddInputCharacter", [](const IO&, unsigned int c) {
+        ImGui::GetIO().AddInputCharacter(c);
+      }, py::arg("c"));
   im.def("GetIO", []() { return IO{}; });
 
   // Constants.
@@ -636,6 +700,11 @@ static void bind_imgui(py::module_& im) {
     std::string name = ImGui::GetKeyName(ImGuiKey(k));
     if (!name.empty() && name.find(' ') == std::string::npos) im.attr(("ImGuiKey_" + name).c_str()) = k;
   }
+  im.attr("ImGuiMod_None") = int(ImGuiMod_None);
+  im.attr("ImGuiMod_Ctrl") = int(ImGuiMod_Ctrl);
+  im.attr("ImGuiMod_Shift") = int(ImGuiMod_Shift);
+  im.attr("ImGuiMod_Alt") = int(ImGuiMod_Alt);
+  im.attr("ImGuiMod_Super") = int(ImGuiMod_Super);
   im.attr("ImGuiMouseButton_Left") = 0;
   im.attr("ImGuiMouseButton_Right") = 1;
   im.attr("ImGuiMouseButton_Middle") = 2;
@@ -661,4 +730,52 @@ static void bind_imgui(py::module_& im) {
       ImPlot::PlotLine(labels[i].c_str(), series[i].data(), int(series[i].size()));
     ImPlot::EndPlot();
   }, py::arg("title"), py::arg("labels"), py::arg("series"), py::arg("size") = glm::vec2(-1.0f, 150.0f));
+}
+
+// ---- ImPlot subset ----------------------------------------------------------------
+
+static void bind_implot(py::module_ m) {
+  m.def("BeginPlot", [](const std::string& title, glm::vec2 size, int flags) {
+    return ImPlot::BeginPlot(title.c_str(), v2(size), flags);
+  }, py::arg("title"), py::arg("size") = glm::vec2(-1.0f, 0.0f), py::arg("flags") = 0);
+  m.def("EndPlot", &ImPlot::EndPlot);
+  m.def("SetupAxes", [](py::object x, py::object y, int x_flags, int y_flags) {
+    std::string xs = x.is_none() ? "" : x.cast<std::string>();
+    std::string ys = y.is_none() ? "" : y.cast<std::string>();
+    ImPlot::SetupAxes(x.is_none() ? nullptr : xs.c_str(), y.is_none() ? nullptr : ys.c_str(), x_flags, y_flags);
+  }, py::arg("x_label") = py::none(), py::arg("y_label") = py::none(), py::arg("x_flags") = 0,
+     py::arg("y_flags") = 0);
+  m.def("SetupAxis", [](int axis, py::object label, int flags) {
+    std::string l = label.is_none() ? "" : label.cast<std::string>();
+    ImPlot::SetupAxis(ImAxis_(axis), label.is_none() ? nullptr : l.c_str(), flags);
+  }, py::arg("axis"), py::arg("label") = py::none(), py::arg("flags") = 0);
+  m.def("SetupAxisLimits", [](int axis, double lo, double hi, int cond) {
+    ImPlot::SetupAxisLimits(ImAxis_(axis), lo, hi, cond);
+  }, py::arg("axis"), py::arg("v_min"), py::arg("v_max"), py::arg("cond") = int(ImPlotCond_Once));
+  m.def("SetAxes", [](int x, int y) { ImPlot::SetAxes(ImAxis_(x), ImAxis_(y)); });
+  m.def("PlotLine", [](const std::string& label, const std::vector<float>& values, py::object xs) {
+    if (xs.is_none()) {
+      ImPlot::PlotLine(label.c_str(), values.data(), int(values.size()));
+    } else {
+      std::vector<float> x = xs.cast<std::vector<float>>();
+      ImPlot::PlotLine(label.c_str(), x.data(), values.data(), int(std::min(x.size(), values.size())));
+    }
+  }, py::arg("label"), py::arg("values"), py::arg("xs") = py::none());
+  m.def("PlotShaded", [](const std::string& label, const std::vector<float>& values, double y_ref) {
+    ImPlot::PlotShaded(label.c_str(), values.data(), int(values.size()), y_ref);
+  }, py::arg("label"), py::arg("values"), py::arg("y_ref") = 0.0);
+
+  m.attr("ImAxis_X1") = int(ImAxis_X1);
+  m.attr("ImAxis_Y1") = int(ImAxis_Y1);
+  m.attr("ImAxis_Y2") = int(ImAxis_Y2);
+  m.attr("ImAxis_Y3") = int(ImAxis_Y3);
+  m.attr("ImPlotAxisFlags_None") = int(ImPlotAxisFlags_None);
+  m.attr("ImPlotAxisFlags_AutoFit") = int(ImPlotAxisFlags_AutoFit);
+  m.attr("ImPlotAxisFlags_AuxDefault") = int(ImPlotAxisFlags_AuxDefault);
+  m.attr("ImPlotAxisFlags_NoGridLines") = int(ImPlotAxisFlags_NoGridLines);
+  m.attr("ImPlotAxisFlags_NoTickLabels") = int(ImPlotAxisFlags_NoTickLabels);
+  m.attr("ImPlotAxisFlags_Opposite") = int(ImPlotAxisFlags_Opposite);
+  m.attr("ImPlotFlags_None") = int(ImPlotFlags_None);
+  m.attr("ImPlotFlags_NoLegend") = int(ImPlotFlags_NoLegend);
+  m.attr("ImPlotFlags_NoTitle") = int(ImPlotFlags_NoTitle);
 }

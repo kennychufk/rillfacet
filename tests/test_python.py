@@ -51,8 +51,12 @@ def test_mesh_quantities(v):
     m.add_scalar("len", viz.ElementKind.Edge, np.ones(m.num_edges))
     m.add_vector("n", viz.ElementKind.Face, np.tile([0, 0, 1], (m.num_faces, 1)))
     m.color_quantity = "x"
+    m.color_source = viz.ColorSource.Quantity
     m.colormap = "turbo"
     assert m.color_source == viz.ColorSource.Quantity
+    m.color_quantity = "len"  # naming a quantity must not change color_source
+    assert m.color_source == viz.ColorSource.Quantity
+    m.color_quantity = "x"
     assert m.colormap == "turbo"
     assert m.quantity_names == ["x", "len", "n"]
     assert m.quantity("x").data.shape == (100,)
@@ -140,3 +144,96 @@ def test_torch_input(v):
     if torch.cuda.is_available():
         m.set_positions(torch.from_numpy(verts).cuda())
     assert m.num_vertices == 100
+
+
+def test_segment_queries(v):
+    verts, tris = grid(n=4)
+    m = v.scene.add_mesh("bodies")
+    m.set_geometry(verts, tris)
+    half = m.num_faces // 2
+    m.set_segments([0, half, m.num_faces], ["a", "b"])
+    assert m.num_segments == 2
+    assert m.segment_name(1) == "b"
+    assert m.segment_of_face(0) == 0 and m.segment_of_face(m.num_faces - 1) == 1
+    assert m.segment_of_vertex(0) == 0
+    m.set_segment_color(1, (0.1, 0.2, 0.3))
+    assert np.allclose(m.segment_color(1), (0.1, 0.2, 0.3), atol=1e-6)
+    # app- and user-hidden are independent
+    m.set_segment_visible(0, False)
+    m.set_segment_hidden_by_user(1, True)
+    assert m.segment_hidden_by_app(0) and m.segment_hidden_by_user(1)
+    assert not m.segment_visible(0) and not m.segment_visible(1)
+    assert m.unhide_all_by_user() == 1
+    assert m.segment_visible(1) and not m.segment_visible(0)  # app-hidden stays hidden
+
+
+def test_measurements_and_anchors(v):
+    verts, tris = grid()
+    m = v.scene.add_mesh("sheet")
+    m.set_geometry(verts, tris)
+    a, b = viz.Anchor(), viz.Anchor()
+    for anc, idx in ((a, 0), (b, 5)):
+        anc.kind = viz.Anchor.Kind.Vertex
+        anc.object = m.id
+        anc.index = idx
+    meas = viz.Measurement()
+    meas.anchors = [a, b]
+    v.measurements.append(meas)
+    assert len(v.measurements) == 1 and len(v.measurements[0].anchors) == 2
+    assert v.frame()
+    v.measurements.clear()
+    assert len(v.measurements) == 0
+
+
+def test_input_injection_and_pick_kind(v):
+    verts, tris = grid(z=0.3)
+    m = v.scene.add_mesh("sheet")
+    m.set_geometry(verts, tris)
+    v.frame_all(False)
+    seen = {}
+
+    def cb():
+        io = viz.imgui.GetIO()
+        seen["ctrl"] = io.KeyCtrl
+        seen["clicked"] = viz.imgui.IsMouseClicked(0)
+        seen["mouse"] = tuple(v.mouse)
+
+    v.set_callback(cb)
+    v.frame()
+    io = viz.imgui.GetIO()
+    w, h = v.viewport
+    x, y, _ = v.camera.project((0.0, 0.0, 0.3), w, h)
+    io.AddKeyEvent(viz.imgui.ImGuiMod_Ctrl, True)
+    io.AddMousePosEvent(x, y)
+    v.frame()
+    io.AddMouseButtonEvent(0, True)
+    v.frame()
+    assert seen["ctrl"] and seen["clicked"]
+    assert seen["mouse"] == pytest.approx((x, y), abs=1.5)
+    hit = v.pick(x, y)
+    assert hit.valid and hit.kind == viz.Anchor.Kind.Surface and hit.object == m.id
+    assert hit.surface.object == m.id
+    io.AddMouseButtonEvent(0, False)
+    io.AddKeyEvent(viz.imgui.ImGuiMod_Ctrl, False)
+    v.frame()
+    v.set_callback(None)
+
+
+def test_implot_panel(v):
+    def cb():
+        if viz.implot.BeginPlot("##h", (-1, 120)):
+            viz.implot.SetupAxes("step", None, viz.implot.ImPlotAxisFlags_AutoFit,
+                                 viz.implot.ImPlotAxisFlags_AutoFit)
+            viz.implot.SetupAxis(viz.implot.ImAxis_Y2, "energy",
+                                 viz.implot.ImPlotAxisFlags_AuxDefault
+                                 | viz.implot.ImPlotAxisFlags_AutoFit)
+            viz.implot.PlotLine("contacts", [1.0, 4.0, 2.0])
+            viz.implot.SetAxes(viz.implot.ImAxis_X1, viz.implot.ImAxis_Y2)
+            viz.implot.PlotLine("energy", [0.5, 0.25, 0.1])
+            viz.implot.EndPlot()
+        changed, mode = viz.imgui.RadioButton("A", 1, 0)
+        assert not changed and mode == 1
+
+    v.set_callback(cb)
+    assert v.frame()
+    v.set_callback(None)
