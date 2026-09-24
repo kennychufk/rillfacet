@@ -96,6 +96,36 @@ struct Hit {
 };
 Hit refine_hit(const Scene& scene, const IdPixel& px, const Ray& ray, float ground_height);
 
+// Vertices of the element under a hit and the weights that reproduce the hit
+// point from them: a mesh face (barycentric), a volume's tet cell
+// (barycentric), a curve edge (linear) or a point. False for the ground and
+// vector sets.
+bool hit_element(const Scene& scene, const Hit& hit, std::vector<uint32_t>& vertices,
+                 std::vector<float>& weights);
+// sum(weights[i] * vertex(vertices[i])) on the structure's current geometry;
+// false if the structure is gone or no longer has those vertices.
+bool weighted_position(const Scene& scene, uint32_t object, const std::vector<uint32_t>& vertices,
+                       const std::vector<float>& weights, glm::vec3& out);
+
+// Ctrl+LMB drag of a scene element, tracked by the Viewer when enabled. The
+// viewer only reports it and draws the grab-to-cursor line; the application
+// decides what moves (pins and moves vertices, pulls a rigid body with a
+// spring, ...). Started and Released each last one frame: they are visible in
+// that frame's callback and after frame() returns.
+struct Drag {
+  enum Phase { Idle, Started, Held, Released };
+  Phase phase = Idle;
+  uint32_t object = 0;             // structure id
+  uint32_t element = 0;            // face (meshes), tet cell (volumes), edge (curves), point
+  std::vector<uint32_t> vertices;  // the element's vertices / nodes / point, structure-local
+  std::vector<float> weights;      // grabbed point = sum of weights[i] * vertex(vertices[i])
+  glm::vec3 grab_point{0.0f};      // world point grabbed
+  glm::vec3 point{0.0f};           // the grabbed point on the current geometry (start of frame, after the callback)
+  glm::vec3 target{0.0f};          // cursor on the plane through grab_point facing the camera
+  glm::vec3 normal{0.0f};          // that plane's normal (view direction at the grab)
+  bool active() const { return phase == Started || phase == Held; }
+};
+
 // Chooses the element of the current pick mode closest to the cursor among
 // the faces seen in a small id window around it. Returns false if none.
 bool pick_element(const Scene& scene, const Camera& cam, PickMode mode,

@@ -15,7 +15,9 @@
 //   H hide selected bodies, Alt+H unhide the bodies the user hid.
 // Shading: Shift+Z Solid <-> Wireframe (see-through), Z wire overlay on Solid.
 // Tools: M measure (distance -> angle -> off), F12 screenshot, F10 start/stop video.
-// Ctrl+LMB is left to the application (e.g. dragging simulated bodies).
+// Drag: with set_drag_enabled(true), Ctrl+LMB grabs the element under the
+// cursor of a `draggable` structure and drag() reports it every frame (see
+// Drag); otherwise Ctrl+LMB is left to the application.
 
 #include "avbd_viz/camera.h"
 #include "avbd_viz/overlay.h"
@@ -78,6 +80,16 @@ class Viewer {
   // Exact 3D hit under a pixel (reads the last frame's id buffer).
   Hit pick(float x, float y);
   float frame_seconds() const { return dt_; }
+
+  // Ctrl+LMB drag (off by default). The begin/to/end calls script a drag
+  // without the mouse, e.g. for tests or recorded interactions.
+  void set_drag_enabled(bool on);
+  bool drag_enabled() const { return drag_enabled_; }
+  const Drag& drag() const { return drag_; }
+  bool begin_drag(float x, float y);  // grab what is under pixel (x, y); false if nothing draggable
+  void drag_to(float x, float y);     // target := cursor ray at pixel (x, y) on the drag plane
+  void end_drag();                    // Released, then Idle
+  void cancel_drag();                 // Idle at once, no Released (e.g. the scene was rebuilt)
   ImFont* mono_font() const { return mono_font_; }
 
  private:
@@ -86,6 +98,8 @@ class Viewer {
   void handle_box(const glm::vec2& a, const glm::vec2& b, bool extend);
   void handle_measure_click(const glm::vec2& p);
   void build_overlays();
+  void update_drag();
+  void set_drag_phase(Drag::Phase phase);
   void draw_ui();
   void capture_panel();
   void capture_frame();
@@ -112,6 +126,9 @@ class Viewer {
   MeasureTool measure_tool_ = MeasureTool::Off;
   bool xray_select_ = false;
   std::function<void()> callback_;
+  Drag drag_;
+  bool drag_enabled_ = false, drag_by_mouse_ = false, in_frame_ = false;
+  uint64_t frame_index_ = 0, drag_phase_frame_ = 0;
 
   // Mouse gesture state.
   bool lmb_down_ = false, box_active_ = false, nav_drag_ = false;

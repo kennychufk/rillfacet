@@ -155,11 +155,15 @@ bool Viewer::frame() {
     io.DeltaTime = dt_;
   }
   ImGui::NewFrame();
+  ++frame_index_;
+  in_frame_ = true;
   overlay_.clear();
+  update_drag();
   handle_input();
   if (callback_) callback_();
   if (ui_visible_) draw_ui();
   build_overlays();
+  in_frame_ = false;
   camera_.update(dt_);
   ImGui::Render();
 
@@ -339,6 +343,67 @@ Hit Viewer::pick(float x, float y) {
   return refine_hit(scene_, px[0], camera_.ray(x, y, vp.x, vp.y), settings_.ground_height);
 }
 
+// ---- Drag ----------------------------------------------------------------------------
+
+void Viewer::set_drag_enabled(bool on) {
+  drag_enabled_ = on;
+  if (!on) cancel_drag();
+}
+
+// Started / Released set during frame N are seen by frame N's callback and
+// after it returns; set between frames, they belong to the next frame.
+void Viewer::set_drag_phase(Drag::Phase phase) {
+  drag_.phase = phase;
+  drag_phase_frame_ = in_frame_ ? frame_index_ : frame_index_ + 1;
+}
+
+bool Viewer::begin_drag(float x, float y) {
+  cancel_drag();
+  if (!drag_enabled_) return false;
+  Hit h = pick(x, y);
+  const Structure* s = h.valid ? scene_.find(h.surface.object) : nullptr;
+  if (!s || !s->draggable || !hit_element(scene_, h, drag_.vertices, drag_.weights)) return false;
+  drag_.object = h.surface.object;
+  drag_.element = h.surface.index;
+  drag_.grab_point = drag_.point = drag_.target = h.point;
+  drag_.normal = camera_.forward();
+  set_drag_phase(Drag::Started);
+  return true;
+}
+
+void Viewer::drag_to(float x, float y) {
+  if (!drag_.active()) return;
+  glm::vec2 vp = viewport();
+  Ray r = camera_.ray(x, y, vp.x, vp.y);
+  float denom = glm::dot(r.dir, drag_.normal);
+  if (std::abs(denom) < 1e-6f) return;
+  float s = glm::dot(drag_.grab_point - r.origin, drag_.normal) / denom;
+  if (s > 0.0f) drag_.target = r.origin + r.dir * s;
+}
+
+void Viewer::end_drag() {
+  drag_by_mouse_ = false;
+  if (drag_.active()) set_drag_phase(Drag::Released);
+}
+
+void Viewer::cancel_drag() {
+  drag_by_mouse_ = false;
+  drag_ = Drag{};
+}
+
+// Start of a frame: retire last frame's Started / Released, end drags whose
+// structure went away and follow the geometry with `point`.
+void Viewer::update_drag() {
+  if (drag_phase_frame_ < frame_index_) {
+    if (drag_.phase == Drag::Started) drag_.phase = Drag::Held;
+    if (drag_.phase == Drag::Released) drag_ = Drag{};
+  }
+  if (!drag_.active()) return;
+  const Structure* s = scene_.find(drag_.object);
+  if (!s || !s->draggable || !weighted_position(scene_, drag_.object, drag_.vertices, drag_.weights, drag_.point))
+    end_drag();
+}
+
 // ---- Input --------------------------------------------------------------------------
 
 void Viewer::handle_input() {
@@ -364,7 +429,20 @@ void Viewer::handle_input() {
   if (!nav_button) nav_drag_ = false;
   if (!over_ui && io.MouseWheel != 0.0f) camera_.dolly(io.MouseWheel);
 
-  // Selection / measuring with the left button (Ctrl+LMB belongs to the app).
+  // Ctrl+LMB drag (when enabled; otherwise Ctrl+LMB belongs to the app).
+  if (drag_enabled_) {
+    const glm::vec2 mp = mouse();
+    if (!drag_.active() && !over_ui && !nav_drag_ && ctrl && !alt && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+      drag_by_mouse_ = begin_drag(mp.x, mp.y);
+    if (drag_.active() && drag_by_mouse_) {
+      if (ImGui::IsMouseDown(ImGuiMouseButton_Left) && ctrl)
+        drag_to(mp.x, mp.y);
+      else
+        end_drag();
+    }
+  }
+
+  // Selection / measuring with the left button (Ctrl+LMB belongs to the drag / the app).
   if (!over_ui && !nav_drag_ && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ctrl && !alt) {
     lmb_down_ = true;
     box_active_ = false;
@@ -523,6 +601,14 @@ static std::string format_measure(double d) {
 void Viewer::build_overlays() {
   const bool dark = settings_.theme == Theme::Dark;
   const glm::vec2 vp = viewport();
+
+  // Drag: grabbed point (on the geometry the callback just updated) to the cursor.
+  if (drag_.active()) {
+    weighted_position(scene_, drag_.object, drag_.vertices, drag_.weights, drag_.point);
+    const glm::vec4 c(0.3f, 0.85f, 1.0f, 1.0f);
+    overlay_.line(drag_.point, drag_.target, c, 2.0f, 0.6f);
+    overlay_.dot(drag_.target, c, 8.0f, 0.6f);
+  }
   const glm::vec4 halo = dark ? srgba(0.05f, 0.05f, 0.06f, 0.75f) : srgba(1, 1, 1, 0.85f);
 
   // Grid rulers: labelled ticks along the grid plane's two axes (or along

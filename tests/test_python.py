@@ -19,6 +19,7 @@ def v(viewer):
     viewer.scene.clear()
     viewer.selection.clear()
     viewer.set_callback(None)
+    viewer.drag_enabled = False
     viewer.settings.slice.enabled = False
     return viewer
 
@@ -237,3 +238,129 @@ def test_implot_panel(v):
     v.set_callback(cb)
     assert v.frame()
     v.set_callback(None)
+
+
+def _center(v):
+    w, h = v.viewport
+    return w / 2, h / 2
+
+
+def _weighted(verts, d):
+    return (np.asarray(verts)[d.vertices] * d.weights[:, None]).sum(0)
+
+
+def test_drag_phases_and_target(v):
+    verts, tris = grid()
+    m = v.scene.add_mesh("sheet")
+    m.set_geometry(verts, tris)
+    v.frame_all(False)
+    v.frame()
+    assert not v.drag_enabled and not v.begin_drag(*_center(v))
+
+    v.drag_enabled = True
+    seen = []
+    v.set_callback(lambda: seen.append(v.drag.phase))
+    assert v.begin_drag(*_center(v))
+    d = v.drag
+    assert d.phase == viz.Drag.Phase.Started and d.object == m.id
+    assert len(d.vertices) == 3 and abs(d.weights.sum() - 1) < 1e-5
+    assert np.allclose(_weighted(verts, d), d.grab_point, atol=1e-4)
+
+    v.frame()  # Started is this frame's
+    assert seen[-1] == viz.Drag.Phase.Started and v.drag.phase == viz.Drag.Phase.Started
+    x, y = _center(v)
+    v.drag_to(x, y - 60)
+    v.frame()
+    assert seen[-1] == viz.Drag.Phase.Held
+    g, t, n = map(np.asarray, (d.grab_point, d.target, d.normal))
+    assert np.linalg.norm(t - g) > 0.05 and abs(np.dot(t - g, n)) < 1e-4
+
+    # The grabbed point follows the geometry.
+    m.set_positions(verts + [0.0, 0.0, 0.25])
+    v.frame()
+    assert np.allclose(d.point, g + [0.0, 0.0, 0.25], atol=1e-4)
+
+    v.end_drag()
+    v.frame()
+    assert seen[-1] == viz.Drag.Phase.Released and v.drag.phase == viz.Drag.Phase.Released
+    v.frame()
+    assert seen[-1] == viz.Drag.Phase.Idle and not v.drag.active
+    v.drag_enabled = False
+
+
+def test_drag_elements_and_filters(v):
+    v.drag_enabled = True
+    try:
+        verts, tets = cube_tets()
+        vol = v.scene.add_volume("cube")
+        vol.set_geometry(verts - 0.5, tets)
+        v.frame_all(False)
+        v.frame()
+        assert v.begin_drag(*_center(v))
+        d = v.drag
+        assert d.object == vol.id and len(d.vertices) == 4
+        assert np.allclose(_weighted(verts - 0.5, d), d.grab_point, atol=1e-4)
+        assert d.weights.min() > -1e-4  # the hit is inside (on) the tet
+
+        vol.draggable = False
+        v.frame()  # a structure that stops being draggable releases
+        assert v.drag.phase == viz.Drag.Phase.Released
+        v.cancel_drag()
+        assert v.drag.phase == viz.Drag.Phase.Idle
+        assert not v.begin_drag(*_center(v))
+
+        v.scene.clear()
+        nodes = np.array([[-1, 0, 0], [0, 0, 0], [1, 0, 0]], np.float32)
+        c = v.scene.add_curves("rope")
+        c.set_nodes(nodes)
+        c.set_edges(np.array([[0, 1], [1, 2]]))
+        c.radius = 0.1
+        v.frame_all(False)
+        v.frame()
+        x, y = _center(v)
+        assert v.begin_drag(x + 20, y)
+        d = v.drag
+        assert len(d.vertices) == 2 and abs(d.weights.sum() - 1) < 1e-5
+        v.scene.clear()  # the structure went away: Released, not a dangling drag
+        v.frame()
+        assert v.drag.phase == viz.Drag.Phase.Released
+        v.frame()
+        assert v.drag.phase == viz.Drag.Phase.Idle
+    finally:
+        v.drag_enabled = False
+
+
+def test_drag_with_mouse(v):
+    verts, tris = grid()
+    m = v.scene.add_mesh("sheet")
+    m.set_geometry(verts, tris)
+    v.frame_all(False)
+    v.frame()
+    io = viz.imgui.GetIO()
+    x, y = _center(v)
+    v.drag_enabled = True
+    v.set_ui_visible(False)  # the panels cover the middle of a small viewport
+    # ImGui trickles queued input: one kind of event per frame.
+    io.AddMousePosEvent(x, y)
+    v.frame()
+    io.AddKeyEvent(viz.imgui.ImGuiMod_Ctrl, True)
+    v.frame()
+    io.AddMouseButtonEvent(0, True)
+    v.frame()
+    try:
+        assert v.drag.phase == viz.Drag.Phase.Started and v.drag.object == m.id
+        assert not v.selection.items  # Ctrl+LMB does not select
+        io.AddMousePosEvent(x, y - 60)
+        v.frame()
+        assert v.drag.phase == viz.Drag.Phase.Held
+        assert np.linalg.norm(np.subtract(v.drag.target, v.drag.grab_point)) > 0.05
+        io.AddMouseButtonEvent(0, False)
+        v.frame()
+        assert v.drag.phase == viz.Drag.Phase.Released
+    finally:
+        io.AddMouseButtonEvent(0, False)
+        io.AddKeyEvent(viz.imgui.ImGuiMod_Ctrl, False)
+        v.frame()
+        v.frame()
+        v.set_ui_visible(True)
+    assert v.drag.phase == viz.Drag.Phase.Idle

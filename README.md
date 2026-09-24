@@ -70,6 +70,18 @@ subset (`BeginPlot`/`SetupAxis`/`PlotLine`/`SetAxes`), and `imgui.GetIO()` can
 inject input (`AddKeyEvent`, `AddMousePosEvent`, `AddMouseButtonEvent`) so a
 viewer app can be driven headlessly from a test.
 
+Dragging: with `v.drag_enabled = True`, Ctrl+LMB grabs the element under the
+cursor (mesh face, tet, curve edge or point) of any structure whose
+`draggable` is true, and `v.drag` reports it every frame: `phase`
+(`Started` / `Held` / `Released` / `Idle`, Started and Released lasting one
+frame), `object`, `element`, the element's `vertices` and the `weights` that
+reproduce the grabbed point, `grab_point`, the current `point`, and `target`,
+the cursor on the camera-facing plane through the grab point. The viewer draws
+the grab-to-cursor line; what moves is up to the application (pin and move
+vertices, pull a rigid body with a spring). `cancel_drag()` drops a drag
+silently (e.g. after rebuilding the scene); `begin_drag(x, y)`, `drag_to(x, y)`
+and `end_drag()` script one without the mouse.
+
 Simulator demos (live in avbd-cuda). Python, on the avbd `Simulator`
 (tet bodies as volume meshes, cloth, ropes) and on `RigidCompoundSimulator`
 (`mixed_convex_viewer.py`, a port of the C++ demo below sharing its scenes,
@@ -104,6 +116,7 @@ cmake --build build-viewer --target mixed_convex_viewer
 | Hide | H hides selected bodies, Alt+H unhides all; or tick them in Display → Structures → Bodies |
 | Measure | M cycles distance → angle → off; clicks snap to vertices within 12 px |
 | Misc | Alt+A / Esc clear selection, F12 screenshot, F10 start/stop video |
+| Drag | Ctrl+LMB, when the app enables it (`drag_enabled`) |
 | Sim demo | Space shoot box, Ctrl+LMB drag body, P pause, → step |
 
 Axis views (numpad or gizmo) switch to orthographic; in the side views the grid

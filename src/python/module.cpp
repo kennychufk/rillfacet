@@ -181,6 +181,7 @@ PYBIND11_MODULE(_avbd_viz, m) {
       .def_readwrite("visible", &Structure::visible)
       .def_readwrite("opacity", &Structure::opacity)
       .def_readwrite("sliced", &Structure::sliced)
+      .def_readwrite("draggable", &Structure::draggable, "Ctrl+LMB can grab it (when the viewer's drag is enabled).")
       .def("bounds", [](const Structure& s) -> py::object {
         glm::vec3 lo, hi;
         if (!s.bounds(lo, hi)) return py::none();
@@ -451,6 +452,31 @@ PYBIND11_MODULE(_avbd_viz, m) {
       .def_property_readonly("object", [](const Hit& h) { return h.surface.object; })
       .def_property_readonly("index", [](const Hit& h) { return h.surface.index; });
 
+  py::class_<Drag> drag(m, "Drag", "Ctrl+LMB drag state (Viewer.drag). Started and Released last one frame.");
+  py::enum_<Drag::Phase>(drag, "Phase")
+      .value("Idle", Drag::Idle)
+      .value("Started", Drag::Started)
+      .value("Held", Drag::Held)
+      .value("Released", Drag::Released);
+  drag.def_readonly("phase", &Drag::phase)
+      .def_property_readonly("active", &Drag::active, "Started or Held.")
+      .def_readonly("object", &Drag::object, "Structure id.")
+      .def_readonly("element", &Drag::element, "Face (meshes), tet cell (volumes), edge (curves) or point.")
+      .def_property_readonly("vertices", [](const Drag& d) {
+        py::array_t<uint32_t> out(d.vertices.size());
+        std::copy(d.vertices.begin(), d.vertices.end(), out.mutable_data());
+        return out;
+      }, "The element's vertices / nodes / point, structure-local.")
+      .def_property_readonly("weights", [](const Drag& d) {
+        py::array_t<float> out(d.weights.size());
+        std::copy(d.weights.begin(), d.weights.end(), out.mutable_data());
+        return out;
+      }, "Grabbed point = sum of weights[i] * vertex(vertices[i]).")
+      .def_readonly("grab_point", &Drag::grab_point, "World point grabbed.")
+      .def_readonly("point", &Drag::point, "The grabbed point on the current geometry.")
+      .def_readonly("target", &Drag::target, "Cursor on the plane through grab_point facing the camera.")
+      .def_readonly("normal", &Drag::normal, "That plane's normal.");
+
   py::class_<Overlay>(m, "Overlay")
       .def("line", &Overlay::line, py::arg("a"), py::arg("b"), py::arg("color") = glm::vec4(1.0f),
            py::arg("width_px") = 2.0f, py::arg("hidden_alpha") = 0.35f, py::arg("border") = glm::vec4(0.0f))
@@ -532,6 +558,14 @@ PYBIND11_MODULE(_avbd_viz, m) {
       .def_property_readonly("mouse", &Viewer::mouse, "Cursor position in pixels (origin top-left).")
       .def_property_readonly("viewport", &Viewer::viewport)
       .def("pick", &Viewer::pick)
+      .def_property("drag_enabled", &Viewer::drag_enabled, &Viewer::set_drag_enabled,
+                    "Ctrl+LMB grabs elements of draggable structures; read the state from `drag`.")
+      .def_property_readonly("drag", &Viewer::drag, ref, "Ctrl+LMB drag state (live).")
+      .def("begin_drag", &Viewer::begin_drag, py::arg("x"), py::arg("y"),
+           "Grab what is under pixel (x, y) as Ctrl+LMB would; False if nothing draggable.")
+      .def("drag_to", &Viewer::drag_to, py::arg("x"), py::arg("y"), "Move the drag target to pixel (x, y).")
+      .def("end_drag", &Viewer::end_drag, "Release: Released, then Idle.")
+      .def("cancel_drag", &Viewer::cancel_drag, "Idle at once, no Released (e.g. the scene was rebuilt).")
       .def_property_readonly("frame_seconds", &Viewer::frame_seconds);
 
   auto im = m.def_submodule("imgui", "Dear ImGui subset, named like polyscope.imgui");

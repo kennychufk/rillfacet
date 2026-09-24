@@ -58,6 +58,7 @@ class Structure {
   bool visible = true;
   float opacity = 1.0f;  // below 1 the structure is see-through (and no longer pickable)
   bool sliced = true;    // cut by the slice plane when it is on
+  bool draggable = true; // Ctrl+LMB can grab it (when the viewer's drag is enabled)
 
  private:
   friend class Scene;

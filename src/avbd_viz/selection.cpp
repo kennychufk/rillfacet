@@ -213,6 +213,66 @@ Hit refine_hit(const Scene& scene, const IdPixel& px, const Ray& ray, float grou
   return hit;
 }
 
+bool hit_element(const Scene& scene, const Hit& hit, std::vector<uint32_t>& vertices,
+                 std::vector<float>& weights) {
+  vertices.clear();
+  weights.clear();
+  if (!hit.valid) return false;
+  const Anchor& a = hit.surface;
+  const Structure* s = scene.find(a.object);
+  if (!s) return false;
+  if (auto* m = dynamic_cast<const SurfaceMesh*>(s); m && a.kind == Anchor::Surface && a.index < m->num_faces()) {
+    glm::uvec3 f = m->face(a.index);
+    vertices = {f.x, f.y, f.z};
+    weights = {a.bary.x, a.bary.y, a.bary.z};
+  } else if (auto* v = dynamic_cast<const VolumeMesh*>(s); v && a.index < v->num_cells()) {
+    glm::uvec4 c = v->cell(a.index);
+    glm::vec3 x0 = v->vertex(c.x);
+    glm::mat3 e(v->vertex(c.y) - x0, v->vertex(c.z) - x0, v->vertex(c.w) - x0);
+    if (std::abs(glm::determinant(e)) < 1e-20f) return false;
+    glm::vec3 b = glm::inverse(e) * (hit.point - x0);
+    vertices = {c.x, c.y, c.z, c.w};
+    weights = {1.0f - b.x - b.y - b.z, b.x, b.y, b.z};
+  } else if (auto* cn = dynamic_cast<const CurveNetwork*>(s); cn && a.index < cn->num_edges()) {
+    glm::uvec2 e = cn->edge(a.index);
+    glm::vec3 p0 = cn->node(e.x), u = cn->node(e.y) - p0;
+    float uu = glm::dot(u, u);
+    float t = uu > 1e-20f ? glm::clamp(glm::dot(hit.point - p0, u) / uu, 0.0f, 1.0f) : 0.0f;
+    vertices = {e.x, e.y};
+    weights = {1.0f - t, t};
+  } else if (auto* p = dynamic_cast<const PointCloud*>(s); p && a.kind == Anchor::Point && a.index < p->size()) {
+    vertices = {a.index};
+    weights = {1.0f};
+  } else {
+    return false;
+  }
+  return true;
+}
+
+bool weighted_position(const Scene& scene, uint32_t object, const std::vector<uint32_t>& vertices,
+                       const std::vector<float>& weights, glm::vec3& out) {
+  const Structure* s = scene.find(object);
+  if (!s || vertices.empty() || vertices.size() != weights.size()) return false;
+  auto sum = [&](size_t n, auto&& position) {
+    glm::vec3 x(0.0f);
+    for (size_t i = 0; i < vertices.size(); ++i) {
+      if (vertices[i] >= n) return false;
+      x += weights[i] * position(vertices[i]);
+    }
+    out = x;
+    return true;
+  };
+  if (auto* m = dynamic_cast<const SurfaceMesh*>(s))
+    return sum(m->num_vertices(), [&](uint32_t i) { return m->vertex(i); });
+  if (auto* v = dynamic_cast<const VolumeMesh*>(s))
+    return sum(v->num_vertices(), [&](uint32_t i) { return v->vertex(i); });
+  if (auto* cn = dynamic_cast<const CurveNetwork*>(s))
+    return sum(cn->num_nodes(), [&](uint32_t i) { return cn->node(i); });
+  if (auto* p = dynamic_cast<const PointCloud*>(s))
+    return sum(p->size(), [&](uint32_t i) { return p->point(i); });
+  return false;
+}
+
 // ---- Picking --------------------------------------------------------------------
 
 static float dist_to_segment(const glm::vec2& p, const glm::vec2& a, const glm::vec2& b) {
