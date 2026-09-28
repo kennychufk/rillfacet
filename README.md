@@ -82,14 +82,15 @@ vertices, pull a rigid body with a spring). `cancel_drag()` drops a drag
 silently (e.g. after rebuilding the scene); `begin_drag(x, y)`, `drag_to(x, y)`
 and `end_drag()` script one without the mouse.
 
-Simulator demos (live in avbd-cuda). Python, on the avbd `Simulator`
-(tet bodies as volume meshes, cloth, ropes) and on `RigidCompoundSimulator`
-(`mixed_convex_viewer.py`, a port of the C++ demo below sharing its scenes,
-panel and controls):
+Simulator demos (live in avbd-cuda, listed in its docs/VISUALIZATION.md).
+Python, on the avbd `Simulator` (cloth, tet bodies as volume meshes, ropes)
+and on the rigid simulators (`mixed_convex_demo.py` has the scenes of the C++
+demo below):
 
 ```bash
-cd ../avbd-cuda && python examples/viz_demo.py      # --headless --scene 1 --out knot.png
-python examples/mixed_convex_viewer.py              # --num-envs 16, --headless --out shot.png
+cd ../avbd-cuda && python examples/soft_body_demo.py   # --headless --scene 1 --steps 400 --out knot.png
+python examples/cloth_demo.py                          # rope_demo.py, rigid_demo.py box, ...
+python examples/mixed_convex_demo.py                   # --num-envs 16, --headless --out shot.png
 ```
 
 C++, on `RigidCompoundSimulator`:
