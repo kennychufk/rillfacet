@@ -346,9 +346,10 @@ def read_index(root: str) -> list:
         return json.load(f)
 
 
-def read_record(path: str):
-    """``(meta, Record, summary)`` of the record directory ``path`` (pose
-    tracks decoded)."""
+def read_record(path: str, *, raw_poses: bool = False):
+    """``(meta, Record, summary)`` of the record directory ``path``. Pose
+    tracks are decoded, or with ``raw_poses`` left as their
+    :func:`encode_poses` dicts (what the web replay sends)."""
     with open(os.path.join(path, "meta.json")) as f:
         meta = json.load(f)
     with open(os.path.join(path, "summary.json")) as f:
@@ -361,8 +362,9 @@ def read_record(path: str):
         k = e["key"]
         if e.get("codec") == "poses_q16":
             pre = f"{k}/poses."
-            v = decode_poses({n[len(pre):]: z[n] for n in z.files
-                              if n.startswith(pre)})
+            v = {n[len(pre):]: z[n] for n in z.files if n.startswith(pre)}
+            if not raw_poses:
+                v = decode_poses(v)
         else:
             v = z[f"{k}/v"]
         tracks[(e["object"], e["field"])] = (z[f"{k}/t"], v)

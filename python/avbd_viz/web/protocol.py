@@ -14,17 +14,34 @@ uint16, uint8 (float64 goes out as float32, int64 as int32, bool as uint8).
 
 Messages (``type``):
 
-- ``hello``: ``version``, ``name`` (the run), ``streams`` [{"name", "kind"}].
+- ``hello``: ``version``, ``name`` (the run), ``streams`` [{"name", "kind"}],
+  ``replay`` {"evals": bool, "ring": bool} (what can be replayed).
 - ``scene``: ``stream``, ``version``, ``objects`` [{"kind", "name",
   "attrs", "arrays"}], ``camera``, ``channels`` — a ``Scene.snapshot()``.
 - ``frame``: ``stream``, ``seq``, ``time``, ``scene_version``, ``objects``
   {name: {field: array}} (the whole dynamic state: rigid ``poses``, box
   ``lo``/``hi``/``colors``, label ``values``, ``points``), ``channels``.
 - ``event``: ``level``, ``text``.
+- ``evals``: ``evals`` — the saved-eval index (``record.read_index``
+  entries: ``id``, ``timestep``, ``checkpoint``, ``summary`` batch rates);
+  sent on connect and whenever it changes.
+- ``replay``: ``id`` (per connection), ``source`` ("eval" | "ring"),
+  ``name``, ``meta``, ``summary`` (per-env outcomes, ``envs[e].end_step``),
+  ``tick_seconds``, ``duration`` (last tick), ``scene`` (the start snapshot:
+  ``objects``, ``camera``), ``tracks`` [{"object", "field", "t" int32 [K],
+  and "values" [K, ...] or, for poses, "pose" {"samples", "envs",
+  "bodies", "static_mask", "static_poses", "pos_lo", "pos_span", "chunk",
+  "chunks"}}]. See :mod:`avbd_viz.web.replay`.
+- ``replay_chunk``: ``id``, ``track``, ``start``, ``count``, ``shape``
+  [n, moving bodies, 7], ``data`` (uint8: zlib of int16 samples,
+  delta-coded along time).
 
 Browser -> server messages are JSON text: ``{"type": "subscribe", "stream",
-"rate"}`` and ``{"type": "ack", "stream", "seq"}`` (flow control: the server
-sends a stream's next frame once the previous one is acked).
+"rate"}``, ``{"type": "unsubscribe", "stream"}``, ``{"type": "ack",
+"stream", "seq"}`` (flow control: the server sends a stream's next frame
+once the previous one is acked), ``{"type": "open_replay", "source":
+"eval", "id"}`` or ``{"source": "ring"}``, and ``{"type": "replay_ack",
+"id", "n"}`` (chunks received so far).
 """
 from __future__ import annotations
 

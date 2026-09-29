@@ -25,6 +25,13 @@ background tab drops frames instead of queueing them. :meth:`Stream.wanted`
 is False while nobody is connected, so an unwatched run pays nothing.
 Frames carry the whole dynamic state (not deltas), so a dropped frame
 loses nothing. A client connecting mid-run gets the latest scene first.
+
+Replay (:mod:`avbd_viz.web.replay`): with ``evals=`` (a records directory)
+clients are sent the eval index, again whenever it changes, and can open
+any eval; with :attr:`VizServer.ring` (a :class:`~.replay.RingMailbox`)
+they can ask the producing process for its latest training episodes. A
+replay is read, encoded and sent off the caller's thread, its pose chunks
+paced by the client's acks (at most :data:`REPLAY_WINDOW` in flight).
 See :mod:`avbd_viz.web.protocol` for the messages.
 """
 from __future__ import annotations
@@ -42,10 +49,20 @@ import numpy as np
 from ..scene_api import Backend, Boxes, Labels, Points, Polyline, RigidMesh
 from .protocol import VERSION, encode
 
-__all__ = ["VizServer", "Stream", "StreamBackend", "ACK_TIMEOUT"]
+__all__ = ["VizServer", "Stream", "StreamBackend", "ACK_TIMEOUT",
+           "REPLAY_WINDOW"]
 
 #: Seconds a client may leave a frame unacked before it is sent the next one.
 ACK_TIMEOUT = 2.0
+
+#: Replay chunks a client may have unacked.
+REPLAY_WINDOW = 4
+
+#: Seconds to wait for the producing process to build a ring replay.
+RING_TIMEOUT = 120.0
+
+#: Seconds between checks of the eval index for new records.
+EVALS_POLL = 1.0
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "static")
@@ -87,6 +104,11 @@ class _Client:
         self.awaiting = False
         self.sent_at = 0.0
         self.dropped = 0
+        self.replay_task = None
+        self.replay_id = 0
+        self.replay_sent = 0
+        self.replay_acked = 0
+        self.replay_wake = asyncio.Event()
 
     def ready(self, now: float) -> bool:
         return not self.awaiting or now - self.sent_at > ACK_TIMEOUT
@@ -172,13 +194,20 @@ class Stream:
 class VizServer:
     """HTTP + WebSocket server on ``host:port``, started on construction
     (a daemon thread). If the port is taken, the next free one up to
-    ``port + 20`` is used; :attr:`url` tells which."""
+    ``port + 20`` is used; :attr:`url` tells which. ``evals`` is a records
+    directory (:class:`~.replay.EvalLibrary`) to offer for replay; set
+    :attr:`ring` to a :class:`~.replay.RingMailbox` to offer the producer's
+    in-memory episodes."""
 
     def __init__(self, host: str = "0.0.0.0", port: int = 8080, *,
                  name: str = "", static_dir: str | None = None,
-                 verbose: bool = True):
+                 evals: str | None = None, verbose: bool = True):
+        from .replay import EvalLibrary
         self.host, self.name = host, name
         self.static_dir = static_dir or STATIC_DIR
+        self.evals = EvalLibrary(evals) if evals else None
+        self._evals_dirty = False
+        self.ring = None
         self.streams: dict = {}
         self._loop = None
         self._server = None
@@ -207,6 +236,13 @@ class VizServer:
     def url(self) -> str:
         host = socket.gethostname() if self.host in ("0.0.0.0", "") else self.host
         return f"http://{host}:{self.port}/"
+
+    def offer_evals(self, root: str) -> None:
+        """Offer the records under ``root`` for replay (it may not exist
+        yet); connected clients get its index within :data:`EVALS_POLL`."""
+        from .replay import EvalLibrary
+        self.evals = EvalLibrary(root)
+        self._evals_dirty = True            # push it to connected clients
 
     def stream(self, name: str, kind: str = "live") -> Stream:
         s = self.streams.get(name)
@@ -240,7 +276,9 @@ class VizServer:
                 started.set()
                 return
             started.set()
+            watch = asyncio.create_task(self._watch_evals())
             await self._server.wait_closed()
+            watch.cancel()
 
         try:
             asyncio.run(main())
@@ -297,7 +335,11 @@ class VizServer:
         await conn.send(encode(dict(
             type="hello", version=VERSION, name=self.name,
             streams=[dict(name=s.name, kind=s.kind)
-                     for s in self.streams.values()])))
+                     for s in self.streams.values()],
+            replay=dict(evals=self.evals is not None,
+                        ring=self.ring is not None))))
+        if self.evals is not None:
+            await conn.send(self._evals_msg(self.evals.entries))
         sender = asyncio.create_task(self._send_loop(client, subs))
         try:
             async for raw in conn:
@@ -306,6 +348,19 @@ class VizServer:
                 try:
                     m = json.loads(raw)
                 except ValueError:
+                    continue
+                kind = m.get("type")
+                if kind == "open_replay":
+                    if client.replay_task is not None:
+                        client.replay_task.cancel()
+                    client.replay_task = asyncio.create_task(
+                        self._serve_replay(client, m))
+                    continue
+                if kind == "replay_ack":
+                    if int(m.get("id", -1)) == client.replay_id:
+                        client.replay_acked = max(client.replay_acked,
+                                                  int(m.get("n", 0)))
+                        client.replay_wake.set()
                     continue
                 s = self.streams.get(m.get("stream", ""))
                 if s is None:
@@ -327,9 +382,78 @@ class VizServer:
             pass
         finally:
             sender.cancel()
+            if client.replay_task is not None:
+                client.replay_task.cancel()
             for s in subs.values():
                 s.clients.discard(client)
             self._clients.discard(client)
+
+    # -- replay -----------------------------------------------------------------
+
+    @staticmethod
+    def _evals_msg(entries: list) -> bytes:
+        return encode(dict(type="evals", evals=entries))
+
+    async def _watch_evals(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(EVALS_POLL)
+            lib = self.evals
+            if lib is None:
+                continue
+            changed, entries = await loop.run_in_executor(None, lib.index)
+            if not (changed or self._evals_dirty):
+                continue
+            self._evals_dirty = False
+            data = self._evals_msg(entries)
+            for c in list(self._clients):
+                try:
+                    await c.conn.send(data)
+                except Exception:                  # noqa: BLE001 (closed)
+                    pass
+
+    async def _serve_replay(self, client: _Client, m: dict):
+        loop = asyncio.get_running_loop()
+        client.replay_id += 1
+        rid = client.replay_id
+        client.replay_sent = client.replay_acked = 0
+        try:
+            if m.get("source") == "ring":
+                if self.ring is None:
+                    raise ValueError("this server has no training ring")
+                data = await asyncio.wait_for(
+                    asyncio.wrap_future(self.ring.ask()), RING_TIMEOUT)
+            else:
+                if self.evals is None:
+                    raise ValueError("this server has no saved evals")
+                data = await loop.run_in_executor(
+                    None, self.evals.load, str(m.get("id", "")))
+            head = await loop.run_in_executor(
+                None, lambda: encode(data.header(rid)))
+            await client.conn.send(head)
+            chunks = data.chunks(rid)
+            while True:
+                msg = await loop.run_in_executor(None, next, chunks, None)
+                if msg is None:
+                    break
+                while client.replay_sent - client.replay_acked >= REPLAY_WINDOW:
+                    client.replay_wake.clear()
+                    try:
+                        await asyncio.wait_for(client.replay_wake.wait(),
+                                               ACK_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        break
+                await client.conn.send(encode(msg))
+                client.replay_sent += 1
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:                     # noqa: BLE001
+            try:
+                await client.conn.send(encode(dict(
+                    type="event", level="error",
+                    text=f"replay failed: {type(e).__name__}: {e}")))
+            except Exception:                      # noqa: BLE001 (closed)
+                pass
 
     async def _send_loop(self, client: _Client, subs: dict):
         try:

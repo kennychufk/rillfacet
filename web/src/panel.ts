@@ -1,6 +1,10 @@
 // The side panel: connection state, stream clock, and the stream's channels
-// — scalars (batch stats) as a list, per-env arrays as a table.
+// — scalars (batch stats) as a list, per-env arrays as a table (in replay,
+// with each env's outcome).
 import { type Arr, isArr } from "./protocol";
+import { OUTCOMES } from "./replay";
+
+const OUTCOME_COLOR: Record<string, string> = Object.fromEntries(OUTCOMES);
 
 const fmt = (v: number) => {
   if (!Number.isFinite(v)) return String(v);
@@ -46,18 +50,24 @@ export class Panel {
     });
   }
 
-  setStatus(s: StreamStats) {
-    const live = s.status === "live";
-    this.statusEl.className = `head ${live ? "ok" : s.status === "connecting" ? "wait" : "bad"}`;
-    this.statusEl.querySelector(".status")!.textContent =
-      `${s.name || "avbd-viz"} — ${s.status}`;
-    const age = s.lastFrameAt ? (performance.now() - s.lastFrameAt) / 1000 : NaN;
-    this.clockEl.textContent =
-      `step ${s.time ?? "–"} · ${s.frames} frames (${s.dropped} dropped) · ` +
-      `${s.fps.toFixed(1)} fps · last ${Number.isFinite(age) ? age.toFixed(1) + " s" : "–"} ago`;
+  setHeader(state: "ok" | "wait" | "bad", title: string, clock: string) {
+    this.statusEl.className = `head ${state}`;
+    this.statusEl.querySelector(".status")!.textContent = title;
+    this.clockEl.textContent = clock;
   }
 
-  setChannels(channels: Record<string, number | Arr>, numEnvs: number) {
+  setStatus(s: StreamStats) {
+    const live = s.status === "live";
+    const age = s.lastFrameAt ? (performance.now() - s.lastFrameAt) / 1000 : NaN;
+    this.setHeader(live ? "ok" : s.status === "connecting" ? "wait" : "bad",
+      `${s.name || "avbd-viz"} — ${s.status}`,
+      `step ${s.time ?? "–"} · ${s.frames} frames (${s.dropped} dropped) · ` +
+      `${s.fps.toFixed(1)} fps · last ${Number.isFinite(age) ? age.toFixed(1) + " s" : "–"} ago`);
+  }
+
+  // `outcomes` (replay): each env's outcome, shown once `ended[e]`.
+  setChannels(channels: Record<string, number | Arr>, numEnvs: number,
+    outcomes?: string[], ended?: boolean[]) {
     const scalars: [string, number][] = [];
     const perEnv: [string, Arr][] = [];
     for (const [k, v] of Object.entries(channels)) {
@@ -71,11 +81,18 @@ export class Panel {
       this.tableEl.innerHTML = `<div class="empty">none</div>`;
       return;
     }
-    const head = `<tr><th>env</th>${perEnv.map(([k]) => `<th>${k}</th>`).join("")}</tr>`;
+    const oc = outcomes ? `<th>outcome</th>` : "";
+    const head = `<tr><th>env</th>${oc}${perEnv.map(([k]) => `<th>${k}</th>`).join("")}</tr>`;
     const rows: string[] = [];
     for (let e = 0; e < numEnvs; e++) {
       const cls = e === this.focus ? ` class="focus"` : "";
-      rows.push(`<tr data-env="${e}"${cls}><td>${e}</td>${perEnv
+      let cell = "";
+      if (outcomes) {
+        const o = ended?.[e] ? outcomes[e] : "";
+        const color = OUTCOME_COLOR[o];
+        cell = `<td class="oc"${color ? ` style="color:${color}"` : ""}>${o || "…"}</td>`;
+      }
+      rows.push(`<tr data-env="${e}"${cls}><td>${e}</td>${cell}${perEnv
         .map(([, a]) => `<td class="num">${fmt(a.data[e])}</td>`).join("")}</tr>`);
     }
     this.tableEl.innerHTML = `<table>${head}${rows.join("")}</table>`;

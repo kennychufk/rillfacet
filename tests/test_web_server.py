@@ -148,3 +148,132 @@ def test_port_in_use_moves_on(server):
         assert other.port > server.port
     finally:
         other.close()
+
+
+# -- replay ------------------------------------------------------------------
+
+def make_record(K=600, n=2):
+    """A recorded session: one moving and one static body per env, a box
+    set and a channel, clock 0..K-1."""
+    from avbd_viz.web.record import Recorder
+    rec = Recorder()
+    sc = Scene(rec)
+    v, t = box_mesh([[0, 0, 0], [2, 0, 0]], [[1, 1, 1], [3, 1, 1]])
+    body = np.repeat([0, 1], 8)
+    rm = sc.rigid_mesh("bodies", v, body, t, [0, 12, 24], instances=n)
+    bars = sc.boxes("bars", [[0, 0, 0]], [[1, 1, 1]])
+
+    def pose(k):
+        p = np.zeros((n, 2, 7), np.float32)
+        p[..., 6] = 1
+        p[:, 0, 0] = np.sin(0.01 * k) + np.arange(n)
+        return p
+
+    rm.set_poses(pose(0))
+    sc.set_channels(flux=np.zeros(n, np.float32))
+    rec.start(sc)
+    for k in range(1, K):
+        rec.tick(k)
+        rm.set_poses(pose(k))
+        if k % 10 == 0:
+            bars.set_boxes([[0, 0, 0]], [[1 + k, 1, 1]])
+            sc.set_channels(flux=np.full(n, k, np.float32))
+    return rec.finish(), np.stack([pose(k) for k in range(K)])
+
+
+def read_replay(ws):
+    """The ``replay`` header and its pose tracks, reassembled from the
+    chunks (acking each)."""
+    from avbd_viz.web.replay import decode_chunk
+    head = recv(ws)
+    assert head["type"] == "replay", head
+    poses = {}
+    total = sum(t["pose"]["chunks"] for t in head["tracks"] if "pose" in t)
+    for k in range(total):
+        m = recv(ws)
+        assert m["type"] == "replay_chunk" and m["id"] == head["id"]
+        poses.setdefault(m["track"], []).append((m["start"], decode_chunk(m)))
+        ws.send(json.dumps(dict(type="replay_ack", id=m["id"], n=k + 1)))
+    out = {}
+    for i, parts in poses.items():
+        p = head["tracks"][i]["pose"]
+        q = np.concatenate([c for _, c in sorted(parts, key=lambda x: x[0])])
+        pos = ((q[..., :3].astype(np.float32) + 32768.0) / 65535.0
+               * p["pos_span"] + p["pos_lo"])
+        out[i] = pos
+    return head, out
+
+
+def test_eval_index_push_and_replay(tmp_path):
+    from avbd_viz.web.record import write_record
+    root = tmp_path / "evals"
+    rec, truth = make_record()
+    srv = VizServer("127.0.0.1", 18780, name="r", static_dir=str(tmp_path),
+                    verbose=False)
+    try:
+        with connect(f"ws://127.0.0.1:{srv.port}/ws") as ws:
+            hello = recv(ws)
+            assert hello["replay"] == {"evals": False, "ring": False}
+            srv.offer_evals(str(root))              # before any eval exists
+            assert recv(ws) == {"type": "evals", "evals": []}
+            write_record(str(root), "t000000100", rec,
+                         meta=dict(timestep=100, dt=0.01,
+                               clock="physics_step"),
+                         summary=dict(envs=[dict(env=0, end_step=599)] * 2,
+                                      batch=dict(success=0.5)))
+            ev = recv(ws)                           # pushed on change
+            assert ev["type"] == "evals"
+            assert ev["evals"][0]["id"] == "t000000100"
+            assert ev["evals"][0]["summary"] == {"success": 0.5}
+
+            ws.send(json.dumps(dict(type="open_replay", source="eval",
+                                    id="t000000100")))
+            head, poses = read_replay(ws)
+            assert head["source"] == "eval" and head["duration"] == 599
+            assert head["tick_seconds"] == pytest.approx(0.01)
+            assert head["meta"]["timestep"] == 100
+            assert [o["name"] for o in head["scene"]["objects"]] == ["bodies",
+                                                                     "bars"]
+            tracks = {(t["object"], t["field"]): t for t in head["tracks"]}
+            flux = tracks[("channels", "flux")]
+            assert flux["t"].tolist() == [0] + list(range(10, 600, 10))
+            assert flux["values"][-1].tolist() == [590, 590]
+            p = tracks[("bodies", "poses")]["pose"]
+            assert p["samples"] == 600 and p["chunks"] == 3
+            assert p["static_mask"].tolist() == [0, 1]
+            i = head["tracks"].index(tracks[("bodies", "poses")])
+            err = np.abs(poses[i][:, :, 0] - truth[:, :, 0, :3]).max()
+            assert err < 1e-4
+
+            ws.send(json.dumps(dict(type="open_replay", source="eval",
+                                    id="../x")))
+            e = recv(ws)
+            assert e["type"] == "event" and e["level"] == "error"
+    finally:
+        srv.close()
+
+
+def test_ring_replay_is_built_by_the_producer(tmp_path):
+    from avbd_viz.web.replay import RingMailbox
+    srv = VizServer("127.0.0.1", 18790, static_dir=str(tmp_path),
+                    verbose=False)
+    srv.ring = box = RingMailbox()
+    rec, truth = make_record(K=50)
+    try:
+        with connect(f"ws://127.0.0.1:{srv.port}/ws") as ws:
+            assert recv(ws)["replay"]["ring"] is True
+            ws.send(json.dumps(dict(type="open_replay", source="ring")))
+            for _ in range(200):                     # the producer's loop
+                if box.pending:
+                    break
+                time.sleep(0.01)
+            assert box.pending
+            box.fulfil(lambda: (dict(tick_seconds=0.05), rec,
+                                dict(envs=[], batch={})))
+            head, poses = read_replay(ws)
+            assert head["source"] == "ring" and head["tick_seconds"] == 0.05
+            assert head["duration"] == 49
+            (i, pos), = poses.items()
+            assert np.abs(pos[:, :, 0] - truth[:, :, 0, :3]).max() < 1e-4
+    finally:
+        srv.close()

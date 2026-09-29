@@ -8,6 +8,8 @@
   --wait: #d9a441;
   --bad: #e05a4f;
   --accent: #4d8fd6;
+  --warn: #e0913f;
+  --purple: #a66bd6;
   color-scheme: dark;
 }
 * { box-sizing: border-box; }
@@ -36,3 +38,30 @@ tr.focus { background: rgba(77, 143, 214, 0.25); }
 .empty { color: var(--muted); }
 #error { display: none; position: fixed; inset: auto 12px 12px 12px; padding: 10px 12px;
   background: #3a1f1d; border: 1px solid var(--bad); border-radius: 8px; }
+#panel { max-height: calc(100vh - 24px - var(--bar-h, 0px)); }
+
+/* bottom bar: mode switch, eval timeline, episode scrubber */
+#bar { position: fixed; left: 12px; right: 12px; bottom: 12px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; display: flex;
+  flex-direction: column; gap: 6px; }
+#bar button, #bar select { font: inherit; color: var(--text); background: #2a2c31;
+  border: 1px solid var(--line); border-radius: 5px; padding: 2px 8px; cursor: pointer; }
+#bar button:disabled { opacity: 0.35; cursor: default; }
+#bar button:focus-visible, #bar select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.bar-row { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.modes { display: flex; gap: 4px; flex: none; }
+.modes button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.outer-wrap { flex: 1; min-width: 0; padding: 0 8px; }
+.outer { position: relative; height: 26px; border-bottom: 1px solid var(--line); }
+.outer .empty { position: absolute; top: 5px; }
+#bar .outer .tick { position: absolute; bottom: 0; width: 8px; height: 22px; margin-left: -4px;
+  padding: 0; border: 1px solid transparent; border-radius: 2px; background: #3a3d44; overflow: hidden; }
+#bar .outer .tick i { position: absolute; left: 0; right: 0; display: block; }
+#bar .outer .tick:hover { border-color: var(--muted); }
+#bar .outer .tick.sel { border-color: var(--text); height: 26px; }
+.inner { display: flex; flex-direction: column; gap: 4px; }
+.controls { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.controls .time { color: var(--muted); font-variant-numeric: tabular-nums; margin: 0 8px; flex: 1; min-width: 12em; }
+.plot { width: 100%; height: 56px; display: block; cursor: col-resize; touch-action: none;
+  background: rgba(0, 0, 0, 0.2); border-radius: 4px; }
+td.oc { font-weight: 500; }
