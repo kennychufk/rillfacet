@@ -19,7 +19,14 @@
         <button id="eval" title="Write a checkpoint and run the side eval on it">Run eval now</button>
       </div>
     </header>
-    <aside id="panel"></aside>
+    <aside id="panel">
+      <details id="inspect-wrap" open><summary>Inspect</summary><div id="inspect"></div></details>
+      <div id="stats"></div>
+    </aside>
+    <div id="hud"></div>
+    <div id="scalebar"></div>
+    <div id="gizmo"></div>
+    <div id="selbox" hidden></div>
     <aside id="display" hidden aria-label="Display"></aside>
     <footer id="bar"></footer>
     <div id="toasts" aria-live="polite"></div>

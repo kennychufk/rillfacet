@@ -15,7 +15,11 @@ record's own (``look_at_grid``) and must be given for records without one.
 ``--display`` sets the same display options on both sides, e.g.
 ``'{"style": "pbr", "environment": 1, "slice": {"enabled": true, "axis": 0,
 "offset": 0.3}, "objects": {"oven envs": {"opacity": 0.4}}}'`` (web
-``DisplaySettings`` / ``ObjectDisplay`` names; everything else at defaults).
+``DisplaySettings`` / ``ObjectDisplay`` names; everything else at defaults),
+``{"shading": "wireframe", "faceOpacity": 0.2, "ortho": true}``, or a
+selection on both sides, ``{"select": {"mode": 3, "object": "oven envs",
+"indices": [0, 5]}}`` (mode 0-3 = vertex / edge / face / body; native
+element numbering).
 """
 import argparse
 import json
@@ -38,7 +42,10 @@ SETTINGS = dict(shadows="shadows", shadowStrength="shadow_strength", ssao="ssao"
                 aoStrength="ao_strength", aoRadius="ao_radius",
                 outlineWidth="outline_width", exposure="exposure", grid="grid",
                 groundShadow="ground_shadow", envIntensity="env_intensity",
-                envRotation="env_rotation")
+                envRotation="env_rotation", wireframe="wireframe",
+                wireWidth="wire_width", flatEdgeAngle="flat_edge_angle",
+                wireObjectColors="wire_object_colors",
+                faceOpacity="face_opacity")
 
 
 def apply_display(v, disp):
@@ -62,6 +69,18 @@ def apply_display(v, disp):
         st = v.scene.get(name)
         for k, val in d.items():
             setattr(st, k, val)
+    if "shading" in disp:
+        s.shading = getattr(avbd_viz.Shading, disp["shading"].capitalize())
+    v.camera.ortho = bool(disp.get("ortho", False))
+    sel = disp.get("select")
+    if sel:
+        v.selection.mode = list(avbd_viz.PickMode.__members__.values())[sel["mode"]]
+        oid = v.scene.get(sel["object"]).id
+        for i, idx in enumerate(sel["indices"]):
+            if i == 0:
+                v.selection.set(oid, idx)
+            else:
+                v.selection.toggle(oid, idx)
 
 
 def native(snapshot, record, tick, size, eye, target, out, disp):

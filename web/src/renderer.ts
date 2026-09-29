@@ -1,6 +1,7 @@
 // WebGPU renderer of the web client, a port of the native viewer's
 // src/avbd_viz/renderer.cpp for the scenes the web streams (rigid meshes,
-// boxes, labels), dark theme, solid shading, in any of its four styles:
+// boxes, labels), dark theme, solid shading in any of its four styles or
+// wireframe shading (see-through wires, X-ray):
 //
 //   1. sun shadow map                      5. see-through meshes: weighted
 //   2. prepass: depth, normals, ids (+ ground)  blended OIT against the opaque depth
@@ -13,9 +14,13 @@
 // overlay_lines / overlay_text / env_prefilter shaders and the style files
 // run unchanged; only the geometry shaders are web-specific
 // (shaders/rigid.wgsl: body-local vertices + per-segment poses; dynamic.wgsl:
-// CPU-built boxes). Display options (DisplaySettings, per-object
-// ObjectDisplay) mirror RenderSettings and the structures' opacity / sliced /
-// metallic / roughness.
+// CPU-built boxes; both pull triangles like the native mesh.wgsl and share
+// its fragment stages in surface.wgsl). Display options (DisplaySettings,
+// per-object ObjectDisplay) mirror RenderSettings and the structures'
+// opacity / sliced / metallic / roughness. Selection flags (selected /
+// active faces and bodies, hidden bodies) and the extra overlay lines and
+// labels come from the viewer (interaction.ts); element numbering is the
+// native viewer's (geometry.ts).
 import rigidStudio from "./shaders/rigid.wgsl?style=studio";
 import rigidMatcap from "./shaders/rigid.wgsl?style=matcap";
 import rigidPbr from "./shaders/rigid.wgsl?style=pbr";
@@ -30,7 +35,9 @@ import compositeSrc from "./shaders/native_composite.wgsl";
 import linesSrc from "./shaders/native_lines.wgsl";
 import textSrc from "./shaders/native_text.wgsl";
 import { type Arr } from "./protocol";
-import { invert, lookAt, mul, OrbitCamera, type Vec3 } from "./math";
+import { Camera, invert, lookAt, mul, type Vec3 } from "./math";
+import { BoxGeo, type Geo, PointsGeoImpl, RigidGeo } from "./geometry";
+import { type ElementRef, GROUND_ID, type IdPixel, PickMode } from "./selection";
 import { formatLength, GLYPH_FLOATS, type FontInfo, type Label, loadFont, niceStep, pyFormat, TextLayout } from "./text";
 import { buildEnvironment, type GpuEnvironment, makeEnvironment, makeMatcap } from "./environment";
 
@@ -56,9 +63,15 @@ const SOURCES: Record<StyleName, [string, string]> = {
   pbr: [rigidPbr, dynPbr], technical: [rigidTechnical, dynTechnical],
 };
 
-// RenderSettings (renderer.h), the parts that apply to solid shading.
+// RenderSettings (renderer.h), the parts the web viewer uses.
 export interface DisplaySettings {
-  style: StyleName;
+  shading: "solid" | "wireframe";
+  style: StyleName; // solid shading look
+  wireframe: boolean; // edge overlay on solid shading
+  wireWidth: number; // px
+  flatEdgeAngle: number; // hide edges between faces closer than this (deg); 0 = all edges
+  wireObjectColors: boolean; // wireframe shading: wires take the object's colors
+  faceOpacity: number; // wireframe shading: faint face fill (Blender's X-ray alpha)
   shadows: boolean; shadowStrength: number;
   ssao: boolean; aoStrength: number; aoRadius: number;
   outline: number; outlineWidth: number; // 0 off, 1 silhouettes, 2 + creases
@@ -73,7 +86,8 @@ export interface DisplaySettings {
 
 export function defaultSettings(): DisplaySettings {
   return {
-    style: "studio", shadows: true, shadowStrength: 0.6, ssao: true, aoStrength: 0.8, aoRadius: 0.35,
+    shading: "solid", style: "studio", wireframe: false, wireWidth: 1, flatEdgeAngle: 0,
+    wireObjectColors: false, faceOpacity: 0, shadows: true, shadowStrength: 0.6, ssao: true, aoStrength: 0.8, aoRadius: 0.35,
     outline: 1, outlineWidth: 1, exposure: 1, grid: true, groundShadow: true,
     studioSpecular: 0.35, studioWrap: 0.35, studioAmbient: 0.38, matcap: 0, matcapTint: 1,
     environment: 0, envIntensity: 1, envRotation: 0, goochShift: 1, goochContrast: 0.8,
@@ -96,9 +110,7 @@ export interface ObjectDisplay { opacity: number; sliced: boolean; metallic: num
 const defaultDisplay = (): ObjectDisplay => ({ opacity: 1, sliced: true, metallic: 0, roughness: 0.45 });
 
 const SUN_DIR: Vec3 = [0.25, -0.35, 1.0];
-const GROUND = 0;
-// Segment color alpha byte: 0 hidden, SELECTED outlined (see rigid.wgsl).
-const SELECTED = 254;
+export const GROUND = 0;
 
 const srgbToLinear = (c: number) =>
   c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
@@ -112,42 +124,53 @@ export function packColor(r: number, g: number, b: number, a = 1): number {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type SceneObject = { kind: string; name: string; attrs: any; arrays: Record<string, Arr> };
 
+// Where the grid is drawn (renderer.cpp grid_plane): normally the ground; in
+// an axis-aligned orthographic side view, the view plane through the origin,
+// behind everything (Blender behavior): YZ looking along X, XZ along Y.
+export interface GridPlane { normal: number; u: number; v: number; offset: number; background: boolean }
+
+export function gridPlane(cam: Camera): GridPlane {
+  const axis = cam.alignedAxis();
+  if (cam.ortho && (axis === 0 || axis === 1)) return { normal: axis, u: axis === 0 ? 1 : 0, v: 2, offset: 0, background: true };
+  return { normal: 2, u: 0, v: 1, offset: GROUND, background: false };
+}
+
+// Selection flags of one object (Renderer::sync's MeshSelection).
+interface ObjectSelection { faces: number[]; segments: number[]; activeFace: number; activeSegment: number }
+
 interface RigidGpu {
   kind: "rigid";
   id: number;
-  instances: number;
-  bodies: number;
-  indexCount: number;
+  geo: RigidGeo;
   buffers: GPUBuffer[];
   params: GPUBuffer;
-  pos: GPUBuffer;
-  body: GPUBuffer;
-  index: GPUBuffer;
   poses: GPUBuffer;
-  colors: GPUBuffer;
-  offsets: Float32Array; // [instances, 4]
+  segments: GPUBuffer;
+  faceInfo: GPUBuffer;
   bind: GPUBindGroup;
   poseScratch: Float32Array;
-  poseHost: Float32Array | null; // latest poses [n, B, 7]
   poseVersion: number;
-  local: Float32Array; // body-local vertices [V, 3]
-  vertexBody: Uint32Array;
   baseColors: Uint32Array; // packed, as sent
+  flagsKey: string;
 }
 
 interface DynGpu {
   kind: "dyn";
   id: number;
   obj: SceneObject;
+  geo: BoxGeo; // what is drawn (boxes, or a box per point)
+  points: PointsGeoImpl | null; // what is picked for a point cloud
   params: GPUBuffer;
-  bind: GPUBindGroup;
+  segments: GPUBuffer;
+  bind: GPUBindGroup | null;
   pos?: GPUBuffer;
   color?: GPUBuffer;
-  index?: GPUBuffer;
-  indexCount: number;
-  capacity: number;
-  lo: Float32Array;
-  hi: Float32Array;
+  tris?: GPUBuffer;
+  faceInfo?: GPUBuffer;
+  faces: number;
+  capacity: number; // boxes
+  flagsKey: string;
+  version: number;
 }
 
 interface LabelSet {
@@ -159,18 +182,19 @@ interface LabelSet {
 type Gpu = RigidGpu | DynGpu | LabelSet;
 type Geometry = RigidGpu | DynGpu;
 
-const BOX_CORNERS = [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1];
-const BOX_TRIS = [0, 3, 2, 0, 2, 1, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5,
-  2, 3, 7, 2, 7, 6, 3, 0, 4, 3, 4, 7];
-
 const VF = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
 const PARAMS_SIZE = 32; // Params in rigid.wgsl / dynamic.wgsl
 
+// Extra overlay items drawn this frame (Overlay in overlay.h): line items
+// (OverlayLine, 16 floats each) and labels.
+export interface Overlay { lines: number[]; labels: Label[] }
+
 export class Renderer {
-  camera = new OrbitCamera();
+  camera = new Camera();
   settings = defaultSettings();
   // Per scene object, by name (kept across scenes, like a viewer's settings).
   display = new Map<string, ObjectDisplay>();
+  overlay: Overlay = { lines: [], labels: [] };
   private frame = new Float32Array(F.size);
   private frameBuf: GPUBuffer;
   private objects: Map<string, Gpu> = new Map();
@@ -197,7 +221,9 @@ export class Renderer {
   private lineCap = 0;
   private lineGroup!: GPUBindGroup;
   private isolated = -1;
-  private selected = -1;
+  private selection = new Map<number, ObjectSelection>();
+  private selectionVersion = 0;
+  private hiddenVersion = 0;
 
   private constructor(
     private device: GPUDevice,
@@ -207,13 +233,13 @@ export class Renderer {
     font: { info: FontInfo; image: ImageBitmap },
   ) {
     const dev = device;
-    this.camera.fovy = (40 * Math.PI) / 180; // native Camera::fov_y
     this.frameBuf = dev.createBuffer({ size: F.size * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 
     // -- bind-group layouts (renderer.cpp's make_layout calls) --
     const L = (entries: GPUBindGroupLayoutEntry[]) => dev.createBindGroupLayout({ entries });
     const ubo = (b: number): GPUBindGroupLayoutEntry => ({ binding: b, visibility: VF, buffer: { type: "uniform" } });
-    const ro = (b: number): GPUBindGroupLayoutEntry => ({ binding: b, visibility: VF, buffer: { type: "read-only-storage" } });
+    const ro = (b: number, visibility = VF): GPUBindGroupLayoutEntry => ({ binding: b, visibility, buffer: { type: "read-only-storage" } });
+    const vro = (b: number) => ro(b, GPUShaderStage.VERTEX);
     const tex = (b: number, sampleType: GPUTextureSampleType = "float"): GPUBindGroupLayoutEntry =>
       ({ binding: b, visibility: VF, texture: { sampleType } });
     const smp = (b: number, type: GPUSamplerBindingType = "filtering"): GPUBindGroupLayoutEntry =>
@@ -221,8 +247,8 @@ export class Renderer {
     this.layouts = {
       frame: L([ubo(0)]),
       scene: L([ubo(0), smp(1), tex(2), tex(3), tex(4), tex(5, "depth"), smp(6, "comparison"), tex(7), smp(8)]),
-      rigid: L([ubo(0), ro(1), ro(2), ro(3)]),
-      dyn: L([ubo(0)]),
+      rigid: L([ubo(0), vro(1), vro(2), vro(3), vro(4), vro(5), vro(6), vro(7)]),
+      dyn: L([ubo(0), vro(1), vro(2), vro(3), vro(4), vro(5)]),
       ssao: L([ubo(0), tex(1, "depth"), tex(2, "unfilterable-float")]),
       blur: L([ubo(0), tex(1, "depth"), tex(3, "unfilterable-float")]),
       composite: L([ubo(0), tex(1, "unfilterable-float"), tex(2, "uint"), tex(3, "depth"),
@@ -302,17 +328,13 @@ export class Renderer {
     const dev = this.device;
     const [rigidSrc, dynSrc] = SOURCES[style];
     const tri: GPUPrimitiveState = { topology: "triangle-list", cullMode: "none" };
-    const buffers: GPUVertexBufferLayout[] = [
-      { arrayStride: 12, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }] },
-      { arrayStride: 4, attributes: [{ shaderLocation: 1, offset: 0, format: "uint32" }] },
-    ];
     const oit: GPUColorTargetState[] = [
       { format: HDR, blend: { color: { srcFactor: "one", dstFactor: "one" }, alpha: { srcFactor: "one", dstFactor: "one" } } },
       { format: "r16float", blend: { color: { srcFactor: "zero", dstFactor: "one-minus-src" }, alpha: { srcFactor: "zero", dstFactor: "one-minus-src" } } },
     ];
     for (const [name, src, objLayout] of [["rigid", rigidSrc, this.layouts.rigid], ["dyn", dynSrc, this.layouts.dyn]] as const) {
       const m = dev.createShaderModule({ code: src });
-      const vertex = { module: m, entryPoint: "vs_main", buffers };
+      const vertex = { module: m, entryPoint: "vs_main" };
       const layout = this.pipelineLayout(this.layouts.scene, objLayout);
       this.pipes[`${name}Main`] = dev.createRenderPipeline({
         layout, primitive: tri, vertex, fragment: { module: m, entryPoint: "fs_main", targets: [{ format: HDR }] },
@@ -322,13 +344,19 @@ export class Renderer {
         layout, primitive: tri, vertex, fragment: { module: m, entryPoint: "fs_transparent", targets: oit },
         depthStencil: this.depthGreater(false), multisample: { count: SAMPLES },
       });
+      // Wireframe shading: premultiplied wires over everything, no depth test.
+      this.pipes[`${name}Wire`] = dev.createRenderPipeline({
+        layout, primitive: tri, vertex,
+        fragment: { module: m, entryPoint: "fs_wire", targets: [{ format: HDR, blend: this.premult }] },
+        depthStencil: { format: DEPTH, depthWriteEnabled: false, depthCompare: "always" }, multisample: { count: SAMPLES },
+      });
       this.pipes[`${name}Pre`] = dev.createRenderPipeline({
         layout, primitive: tri, vertex, fragment: { module: m, entryPoint: "fs_prepass", targets: this.prepassTargets },
         depthStencil: this.depthGreater(),
       });
       this.pipes[`${name}Shadow`] = dev.createRenderPipeline({
         layout: this.pipelineLayout(this.layouts.frame, objLayout), primitive: tri,
-        vertex: { module: m, entryPoint: "vs_shadow", buffers },
+        vertex: { module: m, entryPoint: "vs_shadow" },
         fragment: { module: m, entryPoint: "fs_shadow", targets: [] },
         depthStencil: { format: DEPTH, depthWriteEnabled: true, depthCompare: "less" },
       });
@@ -367,6 +395,12 @@ export class Renderer {
     return b;
   }
 
+  private buffer(data: ArrayBufferView, usage = GPUBufferUsage.STORAGE) {
+    const b = this.device.createBuffer({ size: Math.max(16, align4(data.byteLength)), usage: usage | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(b, 0, data.buffer, data.byteOffset, data.byteLength);
+    return b;
+  }
+
   // -- scene --------------------------------------------------------------
 
   clear() {
@@ -380,6 +414,15 @@ export class Renderer {
     return [...this.objects].filter(([, o]) => o.kind !== "labels").map(([name, o]) => ({ name, kind: o.kind }));
   }
 
+  // Pickable geometry, in scene order (ids as in the prepass).
+  geometries(): Geo[] {
+    const out: Geo[] = [];
+    for (const o of this.objects.values())
+      if (o.kind === "rigid") out.push(o.geo);
+      else if (o.kind === "dyn") out.push(o.points ?? o.geo);
+    return out;
+  }
+
   displayOf(name: string): ObjectDisplay {
     let d = this.display.get(name);
     if (!d) this.display.set(name, (d = defaultDisplay()));
@@ -388,14 +431,18 @@ export class Renderer {
 
   setScene(objects: SceneObject[]) {
     this.clear();
+    this.isolated = -1;
+    this.selection.clear();
     for (const o of objects) {
       if (o.kind === "rigid_mesh") this.objects.set(o.name, this.makeRigid(o));
       else if (o.kind === "boxes" || o.kind === "points") {
+        const id = this.nextId++;
         const params = this.device.createBuffer({ size: PARAMS_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
         const d: DynGpu = {
-          kind: "dyn", id: this.nextId++, obj: o, params, indexCount: 0, capacity: 0,
-          bind: this.device.createBindGroup({ layout: this.layouts.dyn, entries: [{ binding: 0, resource: { buffer: params } }] }),
-          lo: new Float32Array(0), hi: new Float32Array(0),
+          kind: "dyn", id, obj: o, params, geo: new BoxGeo(o.name, id),
+          points: o.kind === "points" ? new PointsGeoImpl(o.name, id) : null,
+          segments: this.device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+          bind: null, faces: 0, capacity: 0, flagsKey: "", version: 0,
         };
         this.objects.set(o.name, d);
         this.rebuildDyn(d);
@@ -404,100 +451,119 @@ export class Renderer {
         this.objects.set(o.name, { kind: "labels", obj: o, values: v ? Float32Array.from(v) : null });
       }
     }
-    this.isolated = -1;
-    this.selected = -1;
   }
 
   // The rigid mesh's segment layout: instances (envs) and bodies each.
-  rigidInfo(): { name: string; id: number; instances: number; bodies: number; offsets: Float32Array } | null {
+  rigidInfo(): { name: string; id: number; instances: number; bodies: number; offsets: Float32Array; geo: RigidGeo } | null {
     for (const [name, o] of this.objects)
-      if (o.kind === "rigid") return { name, id: o.id, instances: o.instances, bodies: o.bodies, offsets: o.offsets };
+      if (o.kind === "rigid")
+        return { name, id: o.id, instances: o.geo.instances, bodies: o.geo.B, offsets: o.geo.offsets, geo: o.geo };
     return null;
   }
 
   private makeRigid(o: SceneObject): RigidGpu {
     const dev = this.device;
-    const a = o.arrays;
-    const instances: number = o.attrs.instances;
-    const bodies = a.body_triangle_offsets.data.length - 1;
     const id = this.nextId++;
-    const buf = (data: ArrayBufferView, usage: number) => {
-      const b = dev.createBuffer({ size: Math.max(16, align4(data.byteLength)), usage: usage | GPUBufferUsage.COPY_DST });
-      dev.queue.writeBuffer(b, 0, data.buffer, data.byteOffset, data.byteLength);
-      return b;
-    };
-    const local = a.local_vertices.data;
-    const vb = new Uint32Array(a.vertex_body.data);
-    const pos = buf(local, GPUBufferUsage.VERTEX);
-    const body = buf(vb, GPUBufferUsage.VERTEX);
-    const index = buf(a.triangles.data, GPUBufferUsage.INDEX);
-    const segs = instances * bodies;
-    const poses = dev.createBuffer({ size: segs * 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const geo = new RigidGeo(o.name, id, o);
+    const segs = geo.numSegments;
+    const poses = dev.createBuffer({ size: Math.max(32, segs * 32), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     const scratch = new Float32Array(segs * 8);
     for (let s = 0; s < segs; s++) scratch[s * 8 + 7] = 1; // identity rotations
     dev.queue.writeBuffer(poses, 0, scratch);
-    const colors = dev.createBuffer({ size: Math.max(16, segs * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    const offsets = new Float32Array(instances * 4);
-    for (let k = 0; k < instances; k++)
-      for (let i = 0; i < 3; i++) offsets[k * 4 + i] = a.offsets.data[k * 3 + i];
-    const offBuf = buf(offsets, GPUBufferUsage.STORAGE);
+    const segments = dev.createBuffer({ size: Math.max(16, segs * 8), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const faceInfo = dev.createBuffer({ size: Math.max(16, geo.numFaces * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    const offBuf = this.buffer(geo.offsets);
+    const local = this.buffer(geo.local);
+    const vb = this.buffer(geo.vertexBody);
+    const tris = this.buffer(geo.tris);
     const params = dev.createBuffer({ size: PARAMS_SIZE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     const bind = dev.createBindGroup({
       layout: this.layouts.rigid,
-      entries: [
-        { binding: 0, resource: { buffer: params } },
-        { binding: 1, resource: { buffer: poses } },
-        { binding: 2, resource: { buffer: colors } },
-        { binding: 3, resource: { buffer: offBuf } },
-      ],
+      entries: [params, poses, segments, offBuf, local, vb, tris, faceInfo]
+        .map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
     const baseColors = new Uint32Array(segs);
-    const c = a.segment_colors.data, vis = a.segment_visible?.data;
-    for (let s = 0; s < segs; s++)
-      baseColors[s] = packColor(c[3 * s], c[3 * s + 1], c[3 * s + 2], vis && !vis[s] ? 0 : 1);
+    const c = o.arrays.segment_colors.data;
+    for (let s = 0; s < segs; s++) baseColors[s] = packColor(c[3 * s], c[3 * s + 1], c[3 * s + 2]);
     const g: RigidGpu = {
-      kind: "rigid", id, instances, bodies, indexCount: a.triangles.data.length,
-      buffers: [pos, body, index, poses, colors, offBuf, params], params,
-      pos, body, index, poses, colors, offsets, bind, poseScratch: scratch, poseHost: null, poseVersion: 0,
-      local: Float32Array.from(local), vertexBody: vb, baseColors,
+      kind: "rigid", id, geo, buffers: [params, poses, segments, faceInfo, offBuf, local, vb, tris], params,
+      poses, segments, faceInfo, bind, poseScratch: scratch, poseVersion: 0, baseColors, flagsKey: "",
     };
-    if (a.poses) this.setPoses(g, a.poses);
-    this.writeColors(g);
+    if (o.arrays.poses) this.setPoses(g, o.arrays.poses);
     return g;
   }
 
-  // Segment colors with the isolate / selection state applied.
-  private writeColors(g: RigidGpu) {
-    const out = new Uint32Array(g.baseColors);
-    for (let s = 0; s < out.length; s++) {
-      const inst = Math.floor(s / g.bodies);
-      if (out[s] >>> 24 === 0) continue;
-      if (this.isolated >= 0 && inst !== this.isolated) out[s] &= 0x00ffffff;
-      else if (inst === this.selected) out[s] = ((out[s] & 0x00ffffff) | (SELECTED << 24)) >>> 0;
-    }
-    this.device.queue.writeBuffer(g.colors, 0, out);
-  }
-
-  // Env shown alone (-1: all), and env outlined as selected (-1: none).
-  setEnvState(isolated: number, selected: number) {
-    if (isolated === this.isolated && selected === this.selected) return;
-    this.isolated = isolated;
-    this.selected = selected;
+  // Env shown alone (-1: all).
+  setIsolated(env: number) {
+    if (env === this.isolated) return;
+    this.isolated = env;
     for (const o of this.objects.values()) {
-      if (o.kind === "rigid") this.writeColors(o);
+      if (o.kind === "rigid") o.geo.isolated = env;
       else if (o.kind === "dyn") this.rebuildDyn(o);
     }
   }
 
+  get isolatedEnv() {
+    return this.isolated;
+  }
+
+  // Selected / active faces and bodies per object for the shaders (vertices
+  // and edges are drawn as overlays).
+  setSelection(mode: PickMode, items: readonly ElementRef[], active: ElementRef | null) {
+    this.selection.clear();
+    const of = (id: number) => {
+      let s = this.selection.get(id);
+      if (!s) this.selection.set(id, (s = { faces: [], segments: [], activeFace: -1, activeSegment: -1 }));
+      return s;
+    };
+    for (const e of items) {
+      if (mode === PickMode.Face) of(e.object).faces.push(e.index);
+      if (mode === PickMode.Body) of(e.object).segments.push(e.index);
+    }
+    if (active && mode === PickMode.Face) of(active.object).activeFace = active.index;
+    if (active && mode === PickMode.Body) of(active.object).activeSegment = active.index;
+    this.selectionVersion++;
+  }
+
+  // Bodies hidden by the user (H) changed.
+  hiddenChanged() {
+    this.hiddenVersion++;
+  }
+
+  // Segment flags and per-face info of a rigid mesh (Renderer::sync).
+  private writeRigidFlags(g: RigidGpu) {
+    const geo = g.geo, angle = Math.max(this.settings.flatEdgeAngle, 0);
+    const key = `${this.selectionVersion}/${this.hiddenVersion}/${this.isolated}/${angle}`;
+    if (key === g.flagsKey) return;
+    g.flagsKey = key;
+    const sel = this.selection.get(g.id);
+    const S = geo.numSegments;
+    const segs = new Uint32Array(2 * S);
+    for (let s = 0; s < S; s++) {
+      segs[2 * s] = g.baseColors[s];
+      segs[2 * s + 1] = geo.segmentVisible(s) ? 0 : 1;
+    }
+    for (const s of sel?.segments ?? []) if (s < S) segs[2 * s + 1] |= 2;
+    if (sel && sel.activeSegment >= 0 && sel.activeSegment < S) segs[2 * sel.activeSegment + 1] |= 4;
+    this.device.queue.writeBuffer(g.segments, 0, segs);
+    const flat = geo.flatMask(angle), T = geo.T;
+    const info = new Uint32Array(geo.numFaces);
+    for (let k = 0; k < geo.instances; k++)
+      for (let t = 0; t < T; t++) info[k * T + t] = flat[t] << 2;
+    for (const f of sel?.faces ?? []) if (f < info.length) info[f] |= 1;
+    if (sel && sel.activeFace >= 0 && sel.activeFace < info.length) info[sel.activeFace] |= 2;
+    this.device.queue.writeBuffer(g.faceInfo, 0, info);
+  }
+
   private setPoses(g: RigidGpu, p: Arr) {
-    const n = g.instances * g.bodies;
+    const n = g.geo.numSegments;
     const s = g.poseScratch;
     for (let i = 0; i < n; i++) {
       for (let k = 0; k < 3; k++) s[8 * i + k] = p.data[7 * i + k];
       for (let k = 0; k < 4; k++) s[8 * i + 4 + k] = p.data[7 * i + 3 + k];
     }
     this.device.queue.writeBuffer(g.poses, 0, s);
-    g.poseHost = Float32Array.from(p.data as ArrayLike<number>);
+    g.geo.poses = Float32Array.from(p.data as ArrayLike<number>);
     g.poseVersion++;
   }
 
@@ -510,9 +576,8 @@ export class Renderer {
         if (fields.poses) this.setPoses(g, fields.poses);
         if (fields.segment_colors) {
           const c = fields.segment_colors.data;
-          for (let s = 0; s < g.baseColors.length; s++)
-            g.baseColors[s] = packColor(c[3 * s], c[3 * s + 1], c[3 * s + 2], g.baseColors[s] >>> 24 ? 1 : 0);
-          this.writeColors(g);
+          for (let s = 0; s < g.baseColors.length; s++) g.baseColors[s] = packColor(c[3 * s], c[3 * s + 1], c[3 * s + 2]);
+          g.flagsKey = "";
         }
       } else if (g.kind === "labels") {
         if (fields.values) g.values = Float32Array.from(fields.values.data as ArrayLike<number>);
@@ -524,7 +589,7 @@ export class Renderer {
   }
 
   // Env (display grid cell) a world point belongs to: the nearest instance offset.
-  private envOf(x: number, y: number): number {
+  envOf(x: number, y: number): number {
     const r = this.rigidInfo();
     if (!r) return -1;
     let best = -1, bd = Infinity;
@@ -535,6 +600,8 @@ export class Renderer {
     return best;
   }
 
+  // Boxes (or a box per point) of a dynamic object; boxes of envs not shown
+  // stay (numbering as native) but are flagged hidden.
   private rebuildDyn(d: DynGpu) {
     const o = d.obj;
     let lo: ArrayLike<number>, hi: ArrayLike<number>, n: number;
@@ -551,48 +618,69 @@ export class Renderer {
           l[3 * i + k] = p[3 * i + k] - rad; h[3 * i + k] = p[3 * i + k] + rad;
         }
       lo = l; hi = h;
+      const pts = d.points!;
+      pts.points = Float32Array.from(p as ArrayLike<number>);
+      pts.radii = r ? Float32Array.from(r as ArrayLike<number>) : null;
+      pts.defaultRadius = o.attrs.radius;
     }
-    d.lo = Float32Array.from(lo);
-    d.hi = Float32Array.from(hi);
-    const keep: number[] = [];
-    for (let b = 0; b < n; b++) {
-      if (this.isolated >= 0) {
+    const hidden = new Uint8Array(n);
+    if (this.isolated >= 0)
+      for (let b = 0; b < n; b++) {
         const cx = 0.5 * (lo[3 * b] + hi[3 * b]), cy = 0.5 * (lo[3 * b + 1] + hi[3 * b + 1]);
-        if (this.envOf(cx, cy) !== this.isolated) continue;
+        hidden[b] = this.envOf(cx, cy) !== this.isolated ? 1 : 0;
       }
-      keep.push(b);
-    }
-    const m = keep.length;
-    const pos = new Float32Array(m * 24);
-    const col = new Uint32Array(m * 8);
-    const idx = new Uint32Array(m * 36);
+    d.geo.set(lo, hi, hidden);
+    if (d.points) d.points.hidden = hidden;
+    const col = new Uint32Array(n * 8);
     const cols = o.arrays.colors?.data;
     const base = o.attrs.color as number[];
-    keep.forEach((b, j) => {
-      const c = cols ? packColor(cols[3 * b], cols[3 * b + 1], cols[3 * b + 2])
-        : packColor(base[0], base[1], base[2]);
-      for (let v = 0; v < 8; v++) {
-        for (let k = 0; k < 3; k++)
-          pos[j * 24 + v * 3 + k] = lo[3 * b + k] + BOX_CORNERS[v * 3 + k] * (hi[3 * b + k] - lo[3 * b + k]);
-        col[j * 8 + v] = c;
-      }
-      for (let t = 0; t < 36; t++) idx[j * 36 + t] = BOX_TRIS[t] + 8 * j;
-    });
+    for (let b = 0; b < n; b++)
+      col.fill(cols ? packColor(cols[3 * b], cols[3 * b + 1], cols[3 * b + 2]) : packColor(base[0], base[1], base[2]),
+        8 * b, 8 * b + 8);
     const dev = this.device;
-    if (d.capacity < pos.byteLength || !d.pos) {
-      d.pos?.destroy(); d.color?.destroy(); d.index?.destroy();
-      const cap = Math.max(96, pos.byteLength);
-      d.pos = dev.createBuffer({ size: cap, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-      d.color = dev.createBuffer({ size: cap / 3, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-      d.index = dev.createBuffer({ size: cap * 1.5, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+    if (d.capacity < n || !d.pos) {
+      d.pos?.destroy(); d.color?.destroy(); d.tris?.destroy(); d.faceInfo?.destroy();
+      const cap = Math.max(4, n);
+      const mk = (bytes: number) => dev.createBuffer({ size: bytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      d.pos = mk(cap * 96);
+      d.color = mk(cap * 32);
+      d.tris = mk(cap * 144);
+      d.faceInfo = mk(cap * 48);
       d.capacity = cap;
+      d.bind = dev.createBindGroup({
+        layout: this.layouts.dyn,
+        entries: [d.params, d.pos, d.color, d.tris, d.faceInfo, d.segments]
+          .map((buffer, binding) => ({ binding, resource: { buffer } })),
+      });
     }
-    if (m) {
-      dev.queue.writeBuffer(d.pos!, 0, pos);
+    if (n) {
+      dev.queue.writeBuffer(d.pos!, 0, d.geo.pos);
       dev.queue.writeBuffer(d.color!, 0, col);
-      dev.queue.writeBuffer(d.index!, 0, idx);
+      dev.queue.writeBuffer(d.tris!, 0, d.geo.tris);
     }
-    d.indexCount = idx.length;
+    d.faces = 12 * n;
+    d.version++;
+  }
+
+  // Face info (flat edges, selection, hidden boxes) and the segment flags of
+  // a dynamic object.
+  private writeDynFlags(d: DynGpu) {
+    const angle = Math.max(this.settings.flatEdgeAngle, 0);
+    const key = `${this.selectionVersion}/${this.hiddenVersion}/${d.version}/${angle}`;
+    if (key === d.flagsKey || !d.faceInfo) return;
+    d.flagsKey = key;
+    const sel = this.selection.get(d.id);
+    const nf = d.faces;
+    const info = new Uint32Array(Math.max(nf, 1));
+    const flat = d.points ? null : d.geo.flatMask(angle);
+    for (let f = 0; f < nf; f++) info[f] = (flat ? flat[f] << 2 : 0) | (d.geo.hidden[Math.floor(f / 12)] ? 32 : 0);
+    if (!d.points) {
+      for (const f of sel?.faces ?? []) if (f < nf) info[f] |= 1;
+      if (sel && sel.activeFace >= 0 && sel.activeFace < nf) info[sel.activeFace] |= 2;
+    }
+    this.device.queue.writeBuffer(d.faceInfo, 0, info);
+    const segFlags = (d.geo.userHidden ? 1 : 0) | (sel?.segments.includes(0) ? 2 : 0) | (sel?.activeSegment === 0 ? 4 : 0);
+    this.device.queue.writeBuffer(d.segments, 0, new Uint32Array([0, segFlags, 0, 0]));
   }
 
   // -- targets and style resources ------------------------------------------
@@ -665,34 +753,23 @@ export class Renderer {
 
   // -- frame uniforms -----------------------------------------------------
 
-  // Exact world bounds of a rigid mesh's shown instances (its vertices,
-  // posed), cached until its poses or the isolated env change.
+  // Exact world bounds of a rigid mesh's shown bodies (its vertices, posed),
+  // cached until its poses or the shown bodies change.
   private rigidBounds = new WeakMap<RigidGpu, { key: string; lo: Vec3; hi: Vec3 }>();
 
   private boundsOf(o: RigidGpu): { lo: Vec3; hi: Vec3 } | null {
-    const p = o.poseHost;
-    if (!p) return null;
-    const key = `${o.poseVersion}/${this.isolated}`;
+    const geo = o.geo;
+    if (!geo.poses) return null;
+    const key = `${o.poseVersion}/${this.isolated}/${this.hiddenVersion}`;
     const c = this.rigidBounds.get(o);
     if (c?.key === key) return c;
     const lo: Vec3 = [Infinity, Infinity, Infinity], hi: Vec3 = [-Infinity, -Infinity, -Infinity];
-    const L = o.local, VB = o.vertexBody, V = VB.length;
-    for (let e = 0; e < o.instances; e++) {
-      if (this.isolated >= 0 && e !== this.isolated) continue;
-      const ox = o.offsets[4 * e], oy = o.offsets[4 * e + 1], oz = o.offsets[4 * e + 2];
-      for (let v = 0; v < V; v++) {
-        const i = (e * o.bodies + VB[v]) * 7;
-        const x = L[3 * v], y = L[3 * v + 1], z = L[3 * v + 2];
-        const qx = p[i + 3], qy = p[i + 4], qz = p[i + 5], qw = p[i + 6];
-        // v + 2 qw (q x v) + 2 q x (q x v)
-        const ux = 2 * (qy * z - qz * y), uy = 2 * (qz * x - qx * z), uz = 2 * (qx * y - qy * x);
-        const w = [p[i] + ox + x + qw * ux + (qy * uz - qz * uy),
-          p[i + 1] + oy + y + qw * uy + (qz * ux - qx * uz),
-          p[i + 2] + oz + z + qw * uz + (qx * uy - qy * ux)];
-        for (let k = 0; k < 3; k++) {
-          if (w[k] < lo[k]) lo[k] = w[k];
-          if (w[k] > hi[k]) hi[k] = w[k];
-        }
+    for (let i = 0; i < geo.numVertices; i++) {
+      if (!geo.segmentVisible(geo.segmentOfVertex(i))) continue;
+      const w = geo.vertex(i);
+      for (let k = 0; k < 3; k++) {
+        if (w[k] < lo[k]) lo[k] = w[k];
+        if (w[k] > hi[k]) hi[k] = w[k];
       }
     }
     const out = { key, lo, hi };
@@ -703,22 +780,22 @@ export class Renderer {
   // World bounds of everything drawn (Scene::bounds).
   bounds(): [Vec3, Vec3] | null {
     const lo: Vec3 = [Infinity, Infinity, Infinity], hi: Vec3 = [-Infinity, -Infinity, -Infinity];
-    const add = (x: number, y: number, z: number) => {
-      lo[0] = Math.min(lo[0], x); lo[1] = Math.min(lo[1], y); lo[2] = Math.min(lo[2], z);
-      hi[0] = Math.max(hi[0], x); hi[1] = Math.max(hi[1], y); hi[2] = Math.max(hi[2], z);
+    const add = (p: ArrayLike<number>, i = 0) => {
+      for (let k = 0; k < 3; k++) {
+        lo[k] = Math.min(lo[k], p[i + k]);
+        hi[k] = Math.max(hi[k], p[i + k]);
+      }
     };
     for (const o of this.objects.values()) {
       if (o.kind === "rigid") {
         const b = this.boundsOf(o);
-        if (b) {
-          add(...b.lo);
-          add(...b.hi);
+        if (b && Number.isFinite(b.lo[0])) {
+          add(b.lo);
+          add(b.hi);
         }
       } else if (o.kind === "dyn") {
-        for (let b = 0; b < o.lo.length / 3; b++) {
-          add(o.lo[3 * b], o.lo[3 * b + 1], o.lo[3 * b + 2]);
-          add(o.hi[3 * b], o.hi[3 * b + 1], o.hi[3 * b + 2]);
-        }
+        const g = o.geo;
+        if (!g.userHidden) for (let v = 0; v < g.numVertices; v++) if (!g.hidden[Math.floor(v / 8)]) add(g.pos, 3 * v);
       }
     }
     return Number.isFinite(lo[0]) ? [lo, hi] : null;
@@ -730,6 +807,10 @@ export class Renderer {
     const n = [0, 0, 0];
     n[sl.axis] = sl.flip ? -1 : 1;
     return [...n, sl.flip ? -sl.offset : sl.offset];
+  }
+
+  private get wireMode() {
+    return this.settings.shading === "wireframe";
   }
 
   private writeFrame() {
@@ -747,7 +828,7 @@ export class Renderer {
     f.set(invert(proj), F.invProj);
     f.set(invert(view), F.invView);
     const eye = cam.eye();
-    f.set([eye[0], eye[1], eye[2], 0], F.cameraPos);
+    f.set([eye[0], eye[1], eye[2], cam.ortho ? 1 : 0], F.cameraPos);
     f.set([w, h, 1 / w, 1 / h], F.viewport);
 
     // Sun shadow: orthographic box around everything visible and the ground below.
@@ -766,20 +847,27 @@ export class Renderer {
     f.set([sun[0], sun[1], sun[2], S.shadowStrength], F.sunDir);
 
     // Dark theme (Renderer::fill_frame).
+    const wire = this.wireMode;
+    const gp = gridPlane(cam);
     f.set(lin(0.235, 0.243, 0.259), F.bgTop);
     f.set(lin(0.114, 0.118, 0.129), F.bgBottom);
     f.set(lin(0.62, 0.64, 0.68, 0.2), F.gridMinor);
     f.set(lin(0.74, 0.76, 0.8, 0.42), F.gridMajor);
-    f.set([GROUND, Math.max(cam.distance * 12, 8), S.grid ? 1 : 0, S.groundShadow ? 1 : 0], F.gridParams);
-    f.set([2, 0, 0, 1], F.gridPlane);
-    f.set(lin(0.92, 0.26, 0.34, 0.85), F.axisU);
-    f.set(lin(0.52, 0.8, 0.2, 0.85), F.axisV);
-    f.set([...lin(0.05, 0.05, 0.06).slice(0, 3), 0], F.wire);
-    f.set([0, 0, 0, 0], F.wireMode);
+    f.set([gp.offset, Math.max(cam.distance * 12, 8), S.grid ? 1 : 0, S.groundShadow && !wire ? 1 : 0], F.gridParams);
+    f.set([gp.normal, gp.background ? 1 : 0, gp.u, gp.v], F.gridPlane);
+    const axisColors = [lin(0.92, 0.26, 0.34, 0.85), lin(0.52, 0.8, 0.2, 0.85), lin(0.24, 0.52, 0.96, 0.85)];
+    f.set(axisColors[gp.u], F.axisU);
+    f.set(axisColors[gp.v], F.axisV);
+    // Wires: dark over shaded surfaces; in wireframe shading they contrast with
+    // the background instead.
+    if (wire) f.set([...lin(0.7, 0.72, 0.76).slice(0, 3), Math.max(S.wireWidth, 1)], F.wire);
+    else f.set([...lin(0.05, 0.05, 0.06).slice(0, 3), S.wireframe ? S.wireWidth : 0], F.wire);
+    f.set([wire ? 1 : 0, S.faceOpacity, S.wireObjectColors ? 1 : 0, 0], F.wireMode);
     f.set(lin(1, 0.63, 0.2), F.select);
     f.set(lin(1, 0.88, 0.62), F.active);
     f.set(lin(0.02, 0.02, 0.025, 0.85), F.outline);
-    f.set([S.ssao ? S.aoStrength : 0, S.exposure, S.shadows ? 1 : 0, S.outline], F.style);
+    // Wireframe shading has no surfaces to shadow, occlude or outline.
+    f.set([S.ssao && !wire ? S.aoStrength : 0, S.exposure, S.shadows && !wire ? 1 : 0, wire ? 0 : S.outline], F.style);
     const style2 = { studio: [S.studioSpecular, S.studioWrap, S.studioAmbient, 0], matcap: [S.matcapTint, 0, 0, 0],
       pbr: [0, 0, 0, 0], technical: [S.goochShift, S.goochContrast, 0, 0] }[S.style];
     f.set(style2, F.style2);
@@ -791,7 +879,8 @@ export class Renderer {
     this.device.queue.writeBuffer(this.frameBuf, 0, f);
   }
 
-  // Per-object uniforms: flags (cut by the slice plane) and material.
+  // Per-object uniforms (flags: cut by the slice plane; material) and the
+  // selection / hidden flags.
   private writeObjectParams() {
     const cut = this.settings.slice.enabled;
     for (const [name, o] of this.objects) {
@@ -800,8 +889,13 @@ export class Renderer {
       const flags = cut && d.sliced ? 2 : 0;
       const data = new ArrayBuffer(PARAMS_SIZE);
       const u = new Uint32Array(data), fl = new Float32Array(data);
-      if (o.kind === "rigid") u.set([o.bodies, o.id, flags, 0]);
-      else u.set([o.id, flags, 0, 0]);
+      if (o.kind === "rigid") {
+        u.set([o.geo.B, o.id, flags, o.geo.T]);
+        this.writeRigidFlags(o);
+      } else {
+        u.set([o.id, flags, 0, 0]);
+        this.writeDynFlags(o);
+      }
       fl.set([d.metallic, d.roughness, Math.min(Math.max(d.opacity, 0), 1), 0], 4);
       this.device.queue.writeBuffer(o.params, 0, data);
     }
@@ -813,14 +907,16 @@ export class Renderer {
 
   // -- overlays -----------------------------------------------------------
 
+  // Canvas size in device pixels (the last frame's).
+  get viewport(): [number, number] {
+    return [this.size[0] || 1, this.size[1] || 1];
+  }
+
   private view() {
     const cam = this.camera;
-    const eye = cam.eye();
-    const fwd: Vec3 = [cam.target[0] - eye[0], cam.target[1] - eye[1], cam.target[2] - eye[2]];
-    const fl = Math.hypot(...fwd) || 1;
     return {
-      eye, forward: [fwd[0] / fl, fwd[1] / fl, fwd[2] / fl] as Vec3, near: Math.max(1e-4, cam.distance * 1e-3),
-      fovy: cam.fovy, height: this.size[1],
+      eye: cam.eye(), forward: cam.forward(), near: cam.nearPlane(), fovy: cam.fovy, height: this.size[1],
+      ortho: cam.ortho, viewHeight: cam.viewHeight(),
     };
   }
 
@@ -872,46 +968,44 @@ export class Renderer {
         labels.push({ text, anchor, color: a.color, align: a.align, worldHeight: a.world_height, sizePx: a.size_px });
       }
     }
-    const view = this.view();
-    if (this.settings.grid) labels.push(...this.rulers(view));
+    if (this.settings.grid) labels.push(...this.rulers());
     labels.push(...extra);
     const out: number[] = [];
-    this.text.layout(labels, view, out);
+    this.text.layout(labels, this.view(), out);
     return out;
   }
 
-  // Grid rulers: labelled ticks along the ground's x and y axes, or along
+  // Grid rulers: labelled ticks along the grid plane's two axes, or along
   // grid lines through the view target when an axis is off screen
-  // (Viewer::build_overlays, perspective ground grid, dark theme).
-  private rulers(view: { eye: Vec3; forward: Vec3; near: number; fovy: number; height: number }): Label[] {
+  // (Viewer::build_overlays, dark theme).
+  private rulers(): Label[] {
     const [W, H] = this.size;
     const cam = this.camera;
-    const z0 = GROUND;
-    const vmat = cam.view(), pmat = cam.proj(W / H);
-    const project = (p: Vec3): [number, number, number] => {
-      const v = [0, 0, 0, 0], c = [0, 0, 0, 0];
-      for (let r = 0; r < 4; r++) v[r] = vmat[r] * p[0] + vmat[4 + r] * p[1] + vmat[8 + r] * p[2] + vmat[12 + r];
-      for (let r = 0; r < 4; r++) c[r] = pmat[r] * v[0] + pmat[4 + r] * v[1] + pmat[8 + r] * v[2] + pmat[12 + r] * v[3];
-      if (c[3] <= 1e-8) return [-1e9, -1e9, v[2]];
-      return [(c[0] / c[3] * 0.5 + 0.5) * W, (0.5 - c[1] / c[3] * 0.5) * H, v[2]];
+    const gp = gridPlane(cam);
+    const at = (a: number, b: number): Vec3 => {
+      const p: Vec3 = [0, 0, 0];
+      p[gp.normal] = gp.offset;
+      p[gp.u] = a;
+      p[gp.v] = b;
+      return p;
     };
+    const project = cam.projector(W, H);
     const onScreen = (p: Vec3): [number, number] | null => {
       const q = project(p);
-      return q[2] < 0 && q[0] > 8 && q[1] > 8 && q[0] < W - 8 && q[1] < H - 8 ? [q[0], q[1]] : null;
+      return (cam.ortho || q[2] < 0) && q[0] > 8 && q[1] > 8 && q[0] < W - 8 && q[1] < H - 8 ? [q[0], q[1]] : null;
     };
-    const tu = cam.target[0], tv = cam.target[1];
-    const t: Vec3 = [tu, tv, z0];
-    const depth = Math.max((t[0] - view.eye[0]) * view.forward[0] + (t[1] - view.eye[1]) * view.forward[1] +
-      (t[2] - view.eye[2]) * view.forward[2], view.near);
-    const step = niceStep(((2 * depth * Math.tan(0.5 * cam.fovy)) / H) * 90);
+    const tu = cam.target[gp.u], tv = cam.target[gp.v];
+    const step = niceStep(cam.pixelSizeAt(at(tu, tv), H) * 90);
     const halo = [0.05, 0.05, 0.06, 0.75];
-    const colors = [[0.98, 0.66, 0.7, 1], [0.74, 0.9, 0.56, 1]];
+    const colors = [[0.98, 0.66, 0.7, 1], [0.74, 0.9, 0.56, 1], [0.62, 0.78, 1, 1]];
     const out: Label[] = [];
-    for (let axis = 0; axis < 2; axis++) {
-      const at = (a: number, b: number): Vec3 => [a, b, z0];
+    for (let axis = 0; axis < 2; axis++) { // 0: along the u axis, 1: along the v axis
       const visible = onScreen(axis === 0 ? at(tu, 0) : at(0, tv)) !== null;
       const line = visible ? 0 : Math.round((axis === 0 ? tv : tu) / step) * step;
       const center = axis === 0 ? tu : tv;
+      const color = colors[axis === 0 ? gp.u : gp.v];
+      // A vertical axis in a side view gets its labels to the right.
+      const beside = gp.background && axis === 1;
       let first: [number, number] = [-1e9, -1e9];
       for (const dir of [1, -1]) {
         let last = first;
@@ -925,8 +1019,8 @@ export class Renderer {
           if (k === 0) first = s;
           if (Math.abs(v) < 1e-9 * step && axis === 1) continue; // origin labelled once
           out.push({
-            text: formatLength(v, step), anchor: p, color: colors[axis], align: [0.5, 0], offset: [0, 6],
-            worldHeight: 0, sizePx: 12, halo, hiddenAlpha: 0,
+            text: formatLength(v, step), anchor: p, color, align: beside ? [0, 0.5] : [0.5, 0],
+            offset: beside ? [8, 0] : [0, 6], worldHeight: 0, sizePx: 12, halo, hiddenAlpha: 0,
           });
         }
       }
@@ -936,11 +1030,13 @@ export class Renderer {
 
   // -- drawing ------------------------------------------------------------
 
-  private drawGeometry(pass: GPURenderPassEncoder, which: "Main" | "Pre" | "Shadow" | "Transparent") {
+  private drawGeometry(pass: GPURenderPassEncoder, which: "Main" | "Pre" | "Shadow" | "Transparent" | "Wire") {
+    // In wireframe shading every mesh is drawn (and pickable) as wires.
+    const all = which === "Wire" || (which === "Pre" && this.wireMode);
     const wantSeeThrough = which === "Transparent";
     for (const [name, g] of this.objects) {
       if (g.kind === "labels") continue;
-      if (this.transparent(name) !== wantSeeThrough) continue;
+      if (!all && this.transparent(name) !== wantSeeThrough) continue;
       this.drawOne(pass, g, which);
     }
   }
@@ -949,17 +1045,11 @@ export class Renderer {
     if (g.kind === "rigid") {
       pass.setPipeline(this.pipes[`rigid${which}`]);
       pass.setBindGroup(1, g.bind);
-      pass.setVertexBuffer(0, g.pos);
-      pass.setVertexBuffer(1, g.body);
-      pass.setIndexBuffer(g.index, "uint32");
-      pass.drawIndexed(g.indexCount, g.instances);
-    } else if (g.indexCount > 0) {
+      pass.draw(3 * g.geo.T, g.geo.instances);
+    } else if (g.faces > 0 && g.bind) {
       pass.setPipeline(this.pipes[`dyn${which}`]);
       pass.setBindGroup(1, g.bind);
-      pass.setVertexBuffer(0, g.pos!);
-      pass.setVertexBuffer(1, g.color!);
-      pass.setIndexBuffer(g.index!, "uint32");
-      pass.drawIndexed(g.indexCount);
+      pass.draw(3 * g.faces);
     }
   }
 
@@ -969,15 +1059,17 @@ export class Renderer {
     this.writeFrame();
     this.writeObjectParams();
     const S = this.settings;
+    const wire = this.wireMode;
     const slice = this.sliceOverlay();
-    const glyphs = this.glyphs(slice.label ? [slice.label] : []);
+    const glyphs = this.glyphs([...(slice.label ? [slice.label] : []), ...this.overlay.labels]);
     const nGlyphs = glyphs.length / GLYPH_FLOATS;
     if (nGlyphs > this.glyphCap) this.glyphBuf = this.storageBuffer("glyph", Math.max(nGlyphs, 2 * this.glyphCap));
     if (nGlyphs) this.device.queue.writeBuffer(this.glyphBuf, 0, new Float32Array(glyphs));
-    const nLines = slice.lines.length / 16;
+    const lineItems = [...slice.lines, ...this.overlay.lines];
+    const nLines = lineItems.length / 16;
     if (nLines > this.lineCap) this.lineBuf = this.storageBuffer("line", Math.max(nLines, 2 * this.lineCap));
-    if (nLines) this.device.queue.writeBuffer(this.lineBuf, 0, new Float32Array(slice.lines));
-    const seeThrough = [...this.objects].some(([n, o]) => o.kind !== "labels" && this.transparent(n));
+    if (nLines) this.device.queue.writeBuffer(this.lineBuf, 0, new Float32Array(lineItems));
+    const seeThrough = !wire && [...this.objects].some(([n, o]) => o.kind !== "labels" && this.transparent(n));
     const ground = S.grid || S.groundShadow;
 
     const dev = this.device;
@@ -994,12 +1086,13 @@ export class Renderer {
       colorAttachments: [],
       depthStencilAttachment: { view: this.shadowView, depthLoadOp: "clear", depthStoreOp: "store", depthClearValue: 1 },
     });
-    if (S.shadows) {
+    if (S.shadows && !wire) {
       pass.setBindGroup(0, this.groups.frame);
       this.drawGeometry(pass, "Shadow");
     }
     pass.end();
-    // 2. Prepass: depth, normals, ids (+ the ground); see-through meshes take no part.
+    // 2. Prepass: depth, normals, ids (+ the ground); see-through meshes take
+    //    no part (in wireframe shading, every mesh does).
     pass = enc.beginRenderPass({
       colorAttachments: [color(view("preNormal"), [0, 0, 0, 0]), color(view("preIds"), [0, 0, 0, 0])],
       depthStencilAttachment: { view: view("preDepth"), depthLoadOp: "clear", depthStoreOp: "store", depthClearValue: 0 },
@@ -1012,7 +1105,7 @@ export class Renderer {
     }
     pass.end();
     // 3. Ambient occlusion.
-    if (S.ssao && S.aoStrength > 0) {
+    if (S.ssao && S.aoStrength > 0 && !wire) {
       for (const [target, pipe] of [["aoRaw", "ssao"], ["ao", "blur"]]) {
         pass = enc.beginRenderPass({ colorAttachments: [color(view(target), [1, 1, 1, 1])] });
         pass.setPipeline(this.pipes[pipe]);
@@ -1021,7 +1114,9 @@ export class Renderer {
         pass.end();
       }
     } else clearOnly("ao", 1);
-    // 4. Main color pass (4x MSAA): opaque meshes, then the grid over the ground.
+    // 4. Main color pass (4x MSAA): opaque meshes, then the grid over the
+    //    ground; in wireframe shading (X-ray) the grid first, then wires over
+    //    everything.
     pass = enc.beginRenderPass({
       colorAttachments: [color(view("msaaColor"), [0, 0, 0, 0], view("resolved"))],
       depthStencilAttachment: {
@@ -1029,10 +1124,18 @@ export class Renderer {
       },
     });
     pass.setBindGroup(0, this.groups.scene);
-    this.drawGeometry(pass, "Main");
-    if (ground) {
-      pass.setPipeline(this.pipes.gridMain);
-      pass.draw(3);
+    if (wire) {
+      if (ground) {
+        pass.setPipeline(this.pipes.gridMain);
+        pass.draw(3);
+      }
+      this.drawGeometry(pass, "Wire");
+    } else {
+      this.drawGeometry(pass, "Main");
+      if (ground) {
+        pass.setPipeline(this.pipes.gridMain);
+        pass.draw(3);
+      }
     }
     pass.end();
     // 5. See-through meshes: weighted blended OIT against the opaque depth.
@@ -1069,23 +1172,38 @@ export class Renderer {
     dev.queue.submit([enc.finish()]);
   }
 
-  // Prepass ids under a canvas pixel (CSS px) of the last frame: the object
-  // and segment there, or null (see-through objects are not pickable).
-  async pick(x: number, y: number): Promise<{ object: string; segment: number } | null> {
-    const dpr = window.devicePixelRatio || 1;
-    const px = Math.floor(x * dpr), py = Math.floor(y * dpr);
-    if (px < 0 || py < 0 || px >= this.size[0] || py >= this.size[1] || !this.t.preIds) return null;
-    const buf = this.device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  // Prepass id pixels of the last frame in a rectangle (device pixels,
+  // clipped to the canvas), row-major; pixels outside are empty.
+  async readIds(x0: number, y0: number, w: number, h: number): Promise<IdPixel[]> {
+    const out: IdPixel[] = Array.from({ length: w * h }, () => ({ object: 0, element: 0, segment: 0, flags: 0 }));
+    const [W, H] = this.size;
+    const cx0 = Math.max(x0, 0), cy0 = Math.max(y0, 0);
+    const cx1 = Math.min(x0 + w, W), cy1 = Math.min(y0 + h, H);
+    if (cx1 <= cx0 || cy1 <= cy0 || !this.t.preIds) return out;
+    const cw = cx1 - cx0, ch = cy1 - cy0;
+    const bytesPerRow = Math.ceil((cw * 16) / 256) * 256;
+    const buf = this.device.createBuffer({ size: bytesPerRow * ch, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     const enc = this.device.createCommandEncoder();
-    enc.copyTextureToBuffer({ texture: this.t.preIds, origin: [px, py] }, { buffer: buf, bytesPerRow: 256 }, [1, 1]);
+    enc.copyTextureToBuffer({ texture: this.t.preIds, origin: [cx0, cy0] }, { buffer: buf, bytesPerRow }, [cw, ch]);
     this.device.queue.submit([enc.finish()]);
     await buf.mapAsync(GPUMapMode.READ);
-    const ids = new Uint32Array(buf.getMappedRange().slice(0, 16));
+    const ids = new Uint32Array(buf.getMappedRange());
+    for (let y = 0; y < ch; y++)
+      for (let x = 0; x < cw; x++) {
+        const i = (y * bytesPerRow) / 4 + 4 * x;
+        out[(y + cy0 - y0) * w + (x + cx0 - x0)] = { object: ids[i], element: ids[i + 1], segment: ids[i + 2], flags: ids[i + 3] };
+      }
     buf.unmap();
     buf.destroy();
-    for (const [name, o] of this.objects)
-      if (o.kind !== "labels" && o.id === ids[0]) return { object: name, segment: ids[2] };
-    return null;
+    return out;
+  }
+
+  // Geometry by prepass object id (GROUND_ID: none).
+  geoById(id: number): Geo | undefined {
+    if (id === 0 || id === GROUND_ID) return undefined;
+    for (const o of this.objects.values())
+      if (o.kind !== "labels" && o.id === id) return o.kind === "rigid" ? o.geo : (o.points ?? o.geo);
+    return undefined;
   }
 }
 
@@ -1109,6 +1227,6 @@ function align4(n: number) {
 function destroy(o: Gpu) {
   if (o.kind === "rigid") for (const b of o.buffers) b.destroy();
   else if (o.kind === "dyn") {
-    o.pos?.destroy(); o.color?.destroy(); o.index?.destroy(); o.params.destroy();
+    o.pos?.destroy(); o.color?.destroy(); o.tris?.destroy(); o.faceInfo?.destroy(); o.params.destroy(); o.segments.destroy();
   }
 }

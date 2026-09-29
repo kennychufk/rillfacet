@@ -2,13 +2,18 @@
 // training process, or a replay server). Modes: Live (the "live" stream),
 // Training ring (the trainer's last episode per streamed env) and Evals
 // (saved evals, picked on the outer timeline); the replay modes play a
-// Replay under the episode scrubber. Click an env to focus it, double-click
-// to show it alone (Esc: back to all).
+// Replay under the episode scrubber. The viewport works as the native
+// viewer's (interaction.ts: Blender-style navigation, vertex / edge / face /
+// body selection, measuring, wireframe shading); the selected element's env
+// is the panel's focus. Double-click an env to show it alone (Esc: all).
 import "./style.css";
 import { LiveHistory, Panel, type SeriesSource, type StreamStats } from "./panel";
 import { type Arr, decode } from "./protocol";
 import { applyStyleDefaults, defaultSettings, Renderer, type SceneObject } from "./renderer";
 import { type Vec3 } from "./math";
+import { Interaction } from "./interaction";
+import { Inspector } from "./inspector";
+import { Hud } from "./hud";
 import { envOutcome, OUTCOMES, Replay, type ChunkMsg, type ReplayMsg } from "./replay";
 import { type EvalEntry, type Mode, Timeline } from "./timeline";
 import { DisplayPanel } from "./display";
@@ -18,7 +23,7 @@ const STREAM = "live";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const canvas = $<HTMLCanvasElement>("view");
 const top = $("top");
-const panel = new Panel($("panel"));
+const panel = new Panel($("stats"));
 const bar = $("bar");
 const timeline = new Timeline(bar);
 const errorEl = $("error");
@@ -46,6 +51,9 @@ type SceneMsg = { objects: SceneObject[]; camera: [Vec3, Vec3] | null; info?: { 
 
 let renderer: Renderer | null = null;
 let display: DisplayPanel | null = null;
+let ix: Interaction | null = null;
+let inspector: Inspector | null = null;
+let hud: Hud | null = null;
 let dirty = true;
 let pendingAck: number | null = null;
 let lastSeq = 0;
@@ -89,6 +97,13 @@ function send(m: object) {
 
 function showScene(msg: SceneMsg) {
   renderer!.setScene(msg.objects);
+  // Object ids restart with every scene.
+  if (ix) {
+    ix.measurements.length = 0;
+    ix.pending = { anchors: [], angle: false };
+    ix.selection.clear();
+    ix.changed();
+  }
   const rigid = renderer!.rigidInfo();
   numEnvs = rigid ? rigid.instances : 0;
   if (msg.camera) sceneCamera = msg.camera;
@@ -131,8 +146,6 @@ function frameOnce(objects: Record<string, Record<string, Arr>>) {
 
 // -- focus / isolate ----------------------------------------------------------
 
-let fly: { from: Vec3; to: Vec3; d0: number; d1: number; t0: number } | null = null;
-
 function envCenter(env: number): Vec3 | null {
   const r = renderer?.rigidInfo();
   if (!r || env < 0 || env >= r.instances) return null;
@@ -142,11 +155,12 @@ function envCenter(env: number): Vec3 | null {
 
 function flyTo(target: Vec3, distance: number) {
   const c = renderer!.camera;
-  fly = { from: [...c.target], to: target, d0: c.distance, d1: distance, t0: performance.now() };
+  c.animateTo(target, distance, c.yaw, c.pitch, 0.35);
+  dirty = true;
 }
 
 function applyEnvState() {
-  renderer?.setEnvState(stats.isolated, stats.focus);
+  renderer?.setIsolated(stats.isolated);
   panel.focus = stats.focus;
   timeline.focus = stats.focus;
   timeline.drawPlot();
@@ -154,10 +168,15 @@ function applyEnvState() {
   dirty = true;
 }
 
-function focusEnv(env: number, move = true) {
+// An env picked in the panel: select its bodies and fly there (none: back
+// to the scene's view).
+function focusEnv(env: number) {
+  const r = renderer?.rigidInfo();
+  if (r && ix && env >= 0 && env < r.instances)
+    ix.selectSegments(r.id, Array.from({ length: r.bodies }, (_, b) => env * r.bodies + b));
   stats.focus = env;
   applyEnvState();
-  if (!renderer || !move) return;
+  if (!renderer) return;
   const c = envCenter(env);
   if (c) flyTo(c, Math.min(renderer.camera.distance, 2.5));
   else if (sceneCamera && stats.isolated < 0) {
@@ -175,32 +194,6 @@ function isolateEnv(env: number) {
 }
 
 panel.onFocus = (env) => focusEnv(env);
-
-// Click (no drag) picks an env; double-click shows it alone.
-{
-  let down: [number, number] | null = null;
-  let clickTimer = 0;
-  canvas.addEventListener("pointerdown", (e) => (down = [e.clientX, e.clientY]));
-  canvas.addEventListener("pointerup", async (e) => {
-    if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 4 || e.button !== 0) return;
-    down = null;
-    const r = canvas.getBoundingClientRect();
-    const hit = await renderer?.pick(e.clientX - r.left, e.clientY - r.top);
-    const rigid = renderer?.rigidInfo();
-    const env = hit && rigid && hit.object === rigid.name ? Math.floor(hit.segment / rigid.bodies) : -1;
-    if (e.detail >= 2) {
-      clearTimeout(clickTimer);
-      if (env >= 0) isolateEnv(env);
-    } else {
-      clickTimer = window.setTimeout(() => focusEnv(env, env >= 0 || stats.focus >= 0), 220);
-    }
-  });
-  window.addEventListener("keydown", (e) => {
-    if (e.key !== "Escape") return;
-    stats.isolated = -1;
-    focusEnv(-1);
-  });
-}
 
 // -- top bar ------------------------------------------------------------------
 
@@ -454,7 +447,7 @@ function connect() {
 (window as unknown as { __golden: unknown }).__golden = async (id: string, t: number, eye: Vec3, target: Vec3, disp: any = {}) => {
   document.body.classList.add("bare");
   const r0 = renderer!;
-  const { style, slice, objects, ...rest } = disp;
+  const { style, slice, objects, ortho, select, ...rest } = disp;
   r0.settings = defaultSettings();
   if (style) applyStyleDefaults(r0.settings, style);
   Object.assign(r0.settings, rest);
@@ -470,7 +463,15 @@ function connect() {
   }
   timeline.seek(t);
   renderer!.camera.lookAt(eye, target);
+  renderer!.camera.ortho = !!ortho;
   cameraSet = true;
+  // select: {mode: 0-3, object: name, indices: [...]}
+  if (select && ix) {
+    ix.selection.setMode(select.mode);
+    const g = renderer!.geometries().find((x) => x.name === select.object);
+    if (g) ix.selection.add(select.indices.map((index: number) => ({ object: g.id, index })), false);
+    ix.changed();
+  }
   dirty = true;
   for (let k = 0; k < 3; k++) await new Promise((r) => requestAnimationFrame(r));
   return replay ? "ok" : "no replay";
@@ -511,22 +512,18 @@ function loop(now: number) {
   const dt = Math.min(0.1, (now - lastT) / 1000);
   lastT = now;
   if (stats.mode !== "live" && timeline.advance(dt)) applyReplay();
-  if (fly && renderer) {
-    const k = Math.min(1, (now - fly.t0) / 350);
-    const e = k * k * (3 - 2 * k);
-    const c = renderer.camera;
-    for (let i = 0; i < 3; i++) c.target[i] = fly.from[i] + (fly.to[i] - fly.from[i]) * e;
-    c.distance = fly.d0 + (fly.d1 - fly.d0) * e;
-    if (k >= 1) fly = null;
-    dirty = true;
-  }
+  if (ix?.update(dt)) dirty = true;
   // Golden captures keep presenting frames, so a screenshot never finds
   // the canvas without one.
   if (document.body.classList.contains("bare")) dirty = true;
   if (renderer && dirty) {
     renderer.render();
     dirty = false;
+    hud?.rendered(now);
   }
+  hud?.update(now);
+  inspector?.update(now);
+  display?.sync();
   if (pendingAck !== null && ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "ack", stream: STREAM, seq: pendingAck }));
     pendingAck = null;
@@ -545,10 +542,23 @@ Renderer.create(canvas)
       display!.toggle();
       btn.setAttribute("aria-expanded", String(display!.open));
     });
-    r.camera.attach(canvas, () => {
-      fly = null;
-      dirty = true;
-    });
+    ix = new Interaction(canvas, r, $("selbox"));
+    ix.onDirty = () => (dirty = true);
+    ix.onSelection = () => {
+      const a = ix!.selection.active;
+      stats.focus = a ? ix!.envOf(a) : -1;
+      applyEnvState();
+    };
+    ix.onIsolate = isolateEnv;
+    ix.onStatus = (m) => toast(m);
+    ix.onEscape = () => {
+      if (stats.isolated < 0) return false;
+      isolateEnv(-1);
+      return true;
+    };
+    (window as unknown as { __ix: unknown }).__ix = ix; // automated checks
+    inspector = new Inspector($("inspect"), ix);
+    hud = new Hud($("gizmo"), $("hud"), $("scalebar"), r, ix, () => (dirty = true));
     new ResizeObserver(() => (dirty = true)).observe(canvas);
     renderTop();
     connect();

@@ -138,7 +138,7 @@ export class Panel {
       this.focusList.update(perEnv.map(([k, a]) => [k, a.data[f], p.series?.perEnv(k, f) ?? null]));
     } else {
       this.focusHead.textContent = "Focus";
-      this.focusList.update([], "click an env (or a row below) to focus it; double-click to show it alone");
+      this.focusList.update([], "select something in an env (or click a row below) to focus it; double-click an env to show it alone");
     }
     this.batchList.update(scalars.map(([k, v]) => [k, v, p.series?.scalar(k) ?? null]));
 

@@ -47,6 +47,8 @@ export interface View {
   near: number;
   fovy: number;
   height: number; // pixels
+  ortho?: boolean;
+  viewHeight?: number; // world height of an orthographic view
 }
 
 export class TextLayout {
@@ -68,8 +70,9 @@ export class TextLayout {
       if (l.worldHeight > 0) {
         const d = [l.anchor[0] - view.eye[0], l.anchor[1] - view.eye[1], l.anchor[2] - view.eye[2]];
         const depth = d[0] * view.forward[0] + d[1] * view.forward[1] + d[2] * view.forward[2];
-        if (depth <= view.near) continue;
-        const pixel = (2 * Math.max(depth, view.near) * Math.tan(0.5 * view.fovy)) / view.height;
+        if (!view.ortho && depth <= view.near) continue;
+        const pixel = view.ortho ? view.viewHeight! / view.height
+          : (2 * Math.max(depth, view.near) * Math.tan(0.5 * view.fovy)) / view.height;
         sizePx = l.worldHeight / Math.max(pixel, 1e-12);
         if (sizePx < MIN_PX) continue;
       }
@@ -161,3 +164,6 @@ export function formatLength(v: number, step: number): string {
   if (a >= 0.001) return `${(v * 1000).toFixed(0)} mm`;
   return `${(v * 1e6).toFixed(0)} \u00b5m`;
 }
+
+// C printf "%.<p>g".
+export const formatG = (v: number, p: number) => (Number.isFinite(v) ? pyGeneral(v, p) : String(v));

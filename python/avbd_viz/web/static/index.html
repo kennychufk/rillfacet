@@ -4,8 +4,8 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>avbd-viz</title>
-    <script type="module" crossorigin src="./assets/index-BkosKniv.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-D0KHRZrU.css">
+    <script type="module" crossorigin src="./assets/index-D5PDiU24.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-iHMRj5OW.css">
   </head>
   <body>
     <canvas id="view"></canvas>
@@ -21,7 +21,14 @@
         <button id="eval" title="Write a checkpoint and run the side eval on it">Run eval now</button>
       </div>
     </header>
-    <aside id="panel"></aside>
+    <aside id="panel">
+      <details id="inspect-wrap" open><summary>Inspect</summary><div id="inspect"></div></details>
+      <div id="stats"></div>
+    </aside>
+    <div id="hud"></div>
+    <div id="scalebar"></div>
+    <div id="gizmo"></div>
+    <div id="selbox" hidden></div>
     <aside id="display" hidden aria-label="Display"></aside>
     <footer id="bar"></footer>
     <div id="toasts" aria-live="polite"></div>
