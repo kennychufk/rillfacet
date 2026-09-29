@@ -11,6 +11,7 @@
 #include <glm/glm.hpp>
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -40,7 +41,9 @@ struct Quantity {
   float value(size_t i) const;  // scalar, or the magnitude of a vector
 };
 
-enum class ColorSource : int { Uniform, SegmentPalette, Quantity };
+// Texture: a surface mesh with per-vertex UVs sampling one of the scene's
+// images (Scene::set_image), e.g. a camera frame on a billboard.
+enum class ColorSource : int { Uniform, SegmentPalette, Quantity, Texture };
 
 enum class StructureKind : uint8_t { SurfaceMesh, PointCloud, VectorSet, CurveNetwork, VolumeMesh };
 const char* structure_kind_name(StructureKind kind);
@@ -59,6 +62,26 @@ class Structure {
   float opacity = 1.0f;  // below 1 the structure is see-through (and no longer pickable)
   bool sliced = true;    // cut by the slice plane when it is on
   bool draggable = true; // Ctrl+LMB can grab it (when the viewer's drag is enabled)
+
+  // Placement of the structure's coordinates in the world (polyscope's
+  // structure transform). Once set, the geometry setters take LOCAL
+  // coordinates and every accessor (positions, bounds, picking) returns
+  // placed ones; moving a structure is then one call, whatever its size.
+  const glm::mat4& transform() const { return transform_; }
+  void set_transform(const glm::mat4& world_from_local);
+
+ protected:
+  // Re-derives the world coordinates from local_ (and bumps the versions).
+  virtual void place() = 0;
+  // Copies the world coordinates into local_ the first time a transform is set.
+  virtual void capture_local() = 0;
+  // dst = T * src over points of `stride` floats (xyz first; the rest copied).
+  static void transform_points(const glm::mat4& T, const std::vector<float>& src, std::vector<float>& dst,
+                               size_t stride);
+
+  glm::mat4 transform_{1.0f};
+  bool placed_ = false;          // a transform was set: local_ is the source of truth
+  std::vector<float> local_;     // local coordinates, laid out like the world array
 
  private:
   friend class Scene;
@@ -128,6 +151,10 @@ class SurfaceMesh : public QuantityStructure {
   void set_geometry(const float* xyz, size_t num_vertices, const uint32_t* tris,
                     size_t num_triangles);
   void set_positions(const float* xyz);  // same vertex count, e.g. once per sim step
+  // Texture coordinates (2 per vertex, origin at the image's top-left) for
+  // ColorSource::Texture.
+  void set_uvs(const float* uv, size_t num_vertices);
+  const std::vector<float>& uvs() const { return uvs_; }
   // Segments as CSR offsets over triangles (size S+1). Default: one segment.
   void set_segments(std::vector<uint32_t> triangle_offsets,
                     std::vector<std::string> names = {});
@@ -163,6 +190,8 @@ class SurfaceMesh : public QuantityStructure {
   std::string segment_name(uint32_t s) const;
 
   bool smooth_shading = false;  // interpolate vertex normals (cloth); flat faces otherwise
+  std::string texture;          // Scene image sampled with ColorSource::Texture
+  bool unlit = false;           // show the base color as is (images, markers): no lighting
   // Set when every segment only moves rigidly (e.g. rigid bodies): angles
   // between faces never change, so flat-edge masks are computed once.
   bool rigid_segments = false;
@@ -182,8 +211,11 @@ class SurfaceMesh : public QuantityStructure {
 
  private:
   void build_edges() const;
+  void place() override;
+  void capture_local() override { local_ = positions_; }
 
   std::vector<float> positions_;
+  std::vector<float> uvs_;
   std::vector<uint32_t> triangles_;
   std::vector<uint32_t> segment_offsets_{0, 0};
   std::vector<std::string> segment_names_;
@@ -217,6 +249,8 @@ class PointCloud : public QuantityStructure {
   float radius = 0.05f;  // used when no per-point radii are given
 
  private:
+  void place() override;
+  void capture_local() override { local_ = points_; }
   std::vector<float> points_;
 };
 
@@ -243,6 +277,8 @@ class CurveNetwork : public QuantityStructure {
   float radius = 0.01f;
 
  private:
+  void place() override;
+  void capture_local() override { local_ = nodes_; }
   std::vector<float> nodes_;
   std::vector<uint32_t> edges_;
 };
@@ -292,6 +328,8 @@ class VolumeMesh : public QuantityStructure {
   const Section& last_section() const { return section_; }
 
  private:
+  void place() override;
+  void capture_local() override { local_ = positions_; }
   std::vector<float> positions_;
   std::vector<uint32_t> tets_;
   mutable std::vector<uint32_t> boundary_faces_, boundary_cells_;
@@ -319,7 +357,12 @@ class VectorSet : public Structure {
   void touch() { ++version_; }
 
  private:
-  std::vector<float> origins_, vectors_;
+  void place() override;
+  void capture_local() override {
+    local_ = origins_;
+    local_vectors_ = vectors_;
+  }
+  std::vector<float> origins_, vectors_, local_vectors_;
   uint64_t version_ = 1;
 };
 
@@ -344,11 +387,26 @@ class Scene {
   // Axis-aligned bounds of everything visible. Returns false when empty.
   bool bounds(glm::vec3& lo, glm::vec3& hi) const;
 
+  // Named RGBA8 images: textures of surface meshes (ColorSource::Texture)
+  // and ImGui images (Viewer::image_texture). Setting an existing name
+  // replaces its pixels (any size), e.g. a camera stream every frame.
+  struct Image {
+    uint32_t width = 0, height = 0;
+    std::vector<uint8_t> rgba;  // row-major, top row first, sRGB
+    uint64_t version = 0;
+  };
+  void set_image(const std::string& name, uint32_t width, uint32_t height, std::vector<uint8_t> rgba);
+  void remove_image(const std::string& name) { images_.erase(name); }
+  const Image* image(const std::string& name) const;
+  const std::map<std::string, Image>& images() const { return images_; }
+
  private:
   template <class T>
   T& add(const std::string& name);
 
   std::vector<std::unique_ptr<Structure>> structures_;
+  std::map<std::string, Image> images_;
+  uint64_t image_version_ = 0;
   uint32_t next_id_ = 1;
 };
 

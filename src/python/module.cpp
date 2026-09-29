@@ -80,6 +80,48 @@ py::array_t<float> to_numpy(const std::vector<float>& v, size_t cols) {
   return out;
 }
 
+glm::mat4 mat4_from(py::handle h) {
+  auto a = as_array<double>(h);
+  if (!a || a.size() != 16) throw py::value_error("expected a 4x4 matrix");
+  glm::mat4 T;
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) T[c][r] = float(a.data()[4 * r + c]);  // row-major in, column-major glm
+  return T;
+}
+
+py::array_t<double> mat4_to_numpy(const glm::mat4& T) {
+  py::array_t<double> out(std::vector<size_t>{4, 4});
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) out.mutable_data()[4 * r + c] = T[c][r];
+  return out;
+}
+
+// [H, W, 3|4] image -> RGBA8. uint8 is taken as is; floats are 0..1.
+std::vector<uint8_t> image_rgba8(py::handle h, uint32_t& width, uint32_t& height) {
+  py::object o = py::reinterpret_borrow<py::object>(h);
+  if (py::hasattr(o, "detach") && py::hasattr(o, "cpu")) o = o.attr("detach")().attr("cpu")().attr("numpy")();
+  py::array arr = py::array::ensure(o);
+  if (!arr || arr.ndim() != 3 || (arr.shape(2) != 3 && arr.shape(2) != 4))
+    throw py::value_error("expected an [H, W, 3] or [H, W, 4] image");
+  height = uint32_t(arr.shape(0));
+  width = uint32_t(arr.shape(1));
+  const size_t n = size_t(width) * height, ch = size_t(arr.shape(2));
+  std::vector<uint8_t> rgba(4 * n, 255);
+  if (py::isinstance<py::array_t<uint8_t>>(arr)) {
+    auto a = py::array_t<uint8_t, py::array::c_style | py::array::forcecast>::ensure(arr);
+    const uint8_t* src = a.data();
+    for (size_t i = 0; i < n; ++i)
+      for (size_t k = 0; k < ch; ++k) rgba[4 * i + k] = src[ch * i + k];
+  } else {
+    auto a = py::array_t<float, py::array::c_style | py::array::forcecast>::ensure(arr);
+    const float* src = a.data();
+    for (size_t i = 0; i < n; ++i)
+      for (size_t k = 0; k < ch; ++k)
+        rgba[4 * i + k] = uint8_t(std::lround(std::clamp(src[ch * i + k], 0.0f, 1.0f) * 255.0f));
+  }
+  return rgba;
+}
+
 int colormap_index(py::handle h) {
   if (py::isinstance<py::str>(h)) {
     std::string name = h.cast<std::string>();
@@ -123,7 +165,8 @@ PYBIND11_MODULE(_avbd_viz, m) {
   py::enum_<ColorSource>(m, "ColorSource")
       .value("Uniform", ColorSource::Uniform)
       .value("SegmentPalette", ColorSource::SegmentPalette)
-      .value("Quantity", ColorSource::Quantity);
+      .value("Quantity", ColorSource::Quantity)
+      .value("Texture", ColorSource::Texture);
   py::enum_<Style>(m, "Style")
       .value("Studio", Style::Studio)
       .value("MatCap", Style::MatCap)
@@ -182,6 +225,9 @@ PYBIND11_MODULE(_avbd_viz, m) {
       .def_readwrite("opacity", &Structure::opacity)
       .def_readwrite("sliced", &Structure::sliced)
       .def_readwrite("draggable", &Structure::draggable, "Ctrl+LMB can grab it (when the viewer's drag is enabled).")
+      .def_property("transform", [](const Structure& s) { return mat4_to_numpy(s.transform()); },
+                    [](Structure& s, py::handle T) { s.set_transform(mat4_from(T)); },
+                    "4x4 world-from-local placement. Once set, geometry setters take local coordinates.")
       .def("bounds", [](const Structure& s) -> py::object {
         glm::vec3 lo, hi;
         if (!s.bounds(lo, hi)) return py::none();
@@ -270,6 +316,13 @@ PYBIND11_MODULE(_avbd_viz, m) {
         std::copy(e.begin(), e.end(), out.mutable_data());
         return out;
       }, "Unique edges [E, 2], the order of Edge quantities.")
+      .def("set_uvs", [](SurfaceMesh& s, py::handle uv) {
+        auto a = as_vector<float>(uv);
+        if (a.size() != 2 * s.num_vertices()) throw py::value_error("need 2 texture coordinates per vertex");
+        s.set_uvs(a.data(), s.num_vertices());
+      }, py::arg("uv"), "Texture coordinates [V, 2] (origin at the image's top-left) for ColorSource.Texture.")
+      .def_readwrite("texture", &SurfaceMesh::texture, "Scene image sampled with ColorSource.Texture.")
+      .def_readwrite("unlit", &SurfaceMesh::unlit, "Show the base color as is, without lighting.")
       .def_readwrite("smooth_shading", &SurfaceMesh::smooth_shading)
       .def_readwrite("rigid_segments", &SurfaceMesh::rigid_segments);
 
@@ -345,7 +398,20 @@ PYBIND11_MODULE(_avbd_viz, m) {
         glm::vec3 lo, hi;
         if (!s.bounds(lo, hi)) return py::none();
         return py::make_tuple(lo, hi);
-      });
+      })
+      .def("set_image", [](Scene& s, const std::string& name, py::handle image) {
+        uint32_t w = 0, h = 0;
+        auto rgba = image_rgba8(image, w, h);
+        s.set_image(name, w, h, std::move(rgba));
+      }, py::arg("name"), py::arg("image"),
+         "Named [H, W, 3|4] image (uint8, or floats in 0..1), top row first; replaces any previous one.")
+      .def("remove_image", &Scene::remove_image)
+      .def("has_image", [](const Scene& s, const std::string& name) { return s.image(name) != nullptr; })
+      .def("image_size", [](const Scene& s, const std::string& name) -> py::object {
+        const Scene::Image* im = s.image(name);
+        if (!im) return py::none();
+        return py::make_tuple(im->height, im->width);
+      }, "(height, width) of an image, or None.");
 
   // ---- Settings, camera, selection, overlay ----
   py::class_<SlicePlane>(m, "SlicePlane")
@@ -483,7 +549,8 @@ PYBIND11_MODULE(_avbd_viz, m) {
       .def("dot", &Overlay::dot, py::arg("p"), py::arg("color") = glm::vec4(1.0f), py::arg("diameter_px") = 8.0f,
            py::arg("hidden_alpha") = 0.35f, py::arg("border") = glm::vec4(0.0f, 0.0f, 0.0f, 1.5f))
       .def("text", [](Overlay& o, const std::string& text, glm::vec3 anchor, float size_px, glm::vec4 color,
-                      glm::vec2 align, glm::vec2 offset, float hidden_alpha, glm::vec4 halo) {
+                      glm::vec2 align, glm::vec2 offset, float hidden_alpha, glm::vec4 halo, float halo_px,
+                      bool ignore_depth, float world_height, float min_px) {
              TextLabel l;
              l.text = text;
              l.anchor = anchor;
@@ -493,25 +560,35 @@ PYBIND11_MODULE(_avbd_viz, m) {
              l.offset = offset;
              l.hidden_alpha = hidden_alpha;
              l.halo = halo;
+             l.halo_px = halo_px;
+             l.ignore_depth = ignore_depth;
+             l.world_height = world_height;
+             l.min_px = min_px;
              o.text(l);
            }, py::arg("text"), py::arg("anchor"), py::arg("size_px") = 14.0f, py::arg("color") = glm::vec4(1.0f),
            py::arg("align") = glm::vec2(0.0f), py::arg("offset") = glm::vec2(0.0f), py::arg("hidden_alpha") = 0.3f,
-           py::arg("halo") = glm::vec4(0.0f, 0.0f, 0.0f, 0.75f));
+           py::arg("halo") = glm::vec4(0.0f, 0.0f, 0.0f, 0.75f), py::arg("halo_px") = 2.0f,
+           py::arg("ignore_depth") = false, py::arg("world_height") = 0.0f, py::arg("min_px") = 4.0f,
+           "Text label at a world anchor, facing the screen. With world_height > 0 it is that tall in world\n"
+           "units (shrinks with distance; skipped below min_px); otherwise size_px pixels tall.");
 
   // ---- Viewer ----
   py::class_<Viewer>(m, "Viewer")
-      .def(py::init([](const std::string& title, int width, int height, bool headless) {
+      .def(py::init([](const std::string& title, int width, int height, bool headless, bool vsync,
+                       float max_fps) {
              ViewerOptions o;
              o.title = title;
              o.width = width;
              o.height = height;
              o.headless = headless;
+             o.vsync = vsync;
+             o.max_fps = max_fps;
              auto v = std::make_unique<Viewer>(o);
              if (!v->ok()) throw std::runtime_error("avbd_viz: could not create the viewer (GPU or display missing?)");
              return v;
            }),
            py::arg("title") = "avbd-viz", py::arg("width") = 1600, py::arg("height") = 960,
-           py::arg("headless") = false)
+           py::arg("headless") = false, py::arg("vsync") = true, py::arg("max_fps") = 0.0f)
       .def_property_readonly("scene", &Viewer::scene, ref)
       .def_property_readonly("camera", &Viewer::camera, ref)
       .def_property_readonly("settings", &Viewer::settings, ref)
@@ -523,28 +600,57 @@ PYBIND11_MODULE(_avbd_viz, m) {
           v.set_callback(nullptr);
           return;
         }
-        py::function f = fn.cast<py::function>();
+        // The callback holds a Python function: it is released with the GIL.
+        auto f = std::shared_ptr<py::function>(new py::function(fn.cast<py::function>()), [](py::function* p) {
+          py::gil_scoped_acquire gil;
+          delete p;
+        });
         v.set_callback([f]() {
+          // frame() runs without the GIL (see below); the callback takes it.
+          py::gil_scoped_acquire gil;
           if (g_callback_error) return;
           try {
-            f();
+            (*f)();
           } catch (py::error_already_set& e) {
             g_callback_error = std::make_unique<py::error_already_set>(std::move(e));
           }
         });
       })
+      // The frame runs with the GIL RELEASED, except inside the callback:
+      // rendering, the vsync wait and event polling never block other Python
+      // threads (stock polyscope held the GIL for the whole frame, starving
+      // every worker thread to one GIL grant per frame). Structures may only
+      // be changed from the callback or the thread that calls frame().
       .def("frame", [](Viewer& v) {
-        bool alive = v.frame();
+        bool alive;
+        {
+          py::gil_scoped_release nogil;
+          alive = v.frame();
+        }
         rethrow_callback_error();
         return alive;
       }, "Render one frame; False once the window is closed.")
       .def("run", [](Viewer& v) {
-        while (v.frame()) {
+        for (;;) {
+          bool alive;
+          {
+            py::gil_scoped_release nogil;
+            alive = v.frame();
+          }
           rethrow_callback_error();
+          if (!alive) break;
           if (PyErr_CheckSignals() != 0) throw py::error_already_set();
         }
-        rethrow_callback_error();
       }, "Render frames until the window is closed.")
+      .def("request_close", &Viewer::request_close,
+           "Close after the current frame: the next frame() returns False (ends run()).")
+      .def_property("vsync", &Viewer::vsync, &Viewer::set_vsync,
+                    "Wait for the display between frames (default). False presents at once: a waiting\n"
+                    "present blocks while the display is off or locked (1 s per frame on X11).")
+      .def_property("max_fps", &Viewer::max_fps, &Viewer::set_max_fps,
+                    "> 0: frame() sleeps (GIL released) to stay under this rate; 0 = no cap.")
+      .def("image_texture", &Viewer::image_texture, py::arg("name"),
+           "ImGui texture id of a scene image for imgui.Image (0 when there is none).")
       .def("screenshot", &Viewer::screenshot)
       .def("request_screenshot", &Viewer::request_screenshot, py::arg("path"), py::arg("with_ui") = false)
       .def("start_recording", &Viewer::start_recording, py::arg("path"), py::arg("fps") = 30,
@@ -616,18 +722,21 @@ static void bind_imgui(py::module_ im) {
     bool c = ImGui::SliderFloat3(l.c_str(), &v.x, lo, hi);
     return py::make_tuple(c, std::vector<float>{v.x, v.y, v.z});
   }, py::arg("label"), py::arg("v"), py::arg("v_min"), py::arg("v_max"));
-  im.def("DragFloat", [](const std::string& l, float v, float speed, float lo, float hi) {
-    bool c = ImGui::DragFloat(l.c_str(), &v, speed, lo, hi);
+  im.def("DragFloat", [](const std::string& l, float v, float speed, float lo, float hi, const std::string& fmt) {
+    bool c = ImGui::DragFloat(l.c_str(), &v, speed, lo, hi, fmt.c_str());
     return py::make_tuple(c, v);
-  }, py::arg("label"), py::arg("v"), py::arg("speed") = 1.0f, py::arg("v_min") = 0.0f, py::arg("v_max") = 0.0f);
-  im.def("InputFloat", [](const std::string& l, float v) {
-    bool c = ImGui::InputFloat(l.c_str(), &v);
+  }, py::arg("label"), py::arg("v"), py::arg("speed") = 1.0f, py::arg("v_min") = 0.0f, py::arg("v_max") = 0.0f,
+     py::arg("format") = "%.3f");
+  im.def("InputFloat", [](const std::string& l, float v, float step, float step_fast, const std::string& fmt,
+                          int flags) {
+    bool c = ImGui::InputFloat(l.c_str(), &v, step, step_fast, fmt.c_str(), flags);
     return py::make_tuple(c, v);
-  });
-  im.def("InputInt", [](const std::string& l, int v) {
-    bool c = ImGui::InputInt(l.c_str(), &v);
+  }, py::arg("label"), py::arg("v"), py::arg("step") = 0.0f, py::arg("step_fast") = 0.0f,
+     py::arg("format") = "%.3f", py::arg("flags") = 0);
+  im.def("InputInt", [](const std::string& l, int v, int step, int step_fast, int flags) {
+    bool c = ImGui::InputInt(l.c_str(), &v, step, step_fast, flags);
     return py::make_tuple(c, v);
-  });
+  }, py::arg("label"), py::arg("v"), py::arg("step") = 1, py::arg("step_fast") = 100, py::arg("flags") = 0);
   im.def("InputText", [](const std::string& l, const std::string& text, size_t buffer_size) {
     std::vector<char> buf(std::max(buffer_size, text.size() + 1), 0);
     std::copy(text.begin(), text.end(), buf.begin());
@@ -664,6 +773,10 @@ static void bind_imgui(py::module_ im) {
   im.def("Indent", [](float w) { ImGui::Indent(w); }, py::arg("width") = 0.0f);
   im.def("Unindent", [](float w) { ImGui::Unindent(w); }, py::arg("width") = 0.0f);
   im.def("TreeNode", [](const std::string& l) { return ImGui::TreeNode(l.c_str()); });
+  im.def("TreeNodeEx", [](const std::string& l, int flags) { return ImGui::TreeNodeEx(l.c_str(), flags); },
+         py::arg("label"), py::arg("flags") = 0);
+  im.def("SetNextItemOpen", [](bool open, int cond) { ImGui::SetNextItemOpen(open, cond); }, py::arg("is_open"),
+         py::arg("cond") = 0);
   im.def("TreePop", &ImGui::TreePop);
   im.def("CollapsingHeader", [](const std::string& l, int flags) { return ImGui::CollapsingHeader(l.c_str(), flags); },
          py::arg("label"), py::arg("flags") = 0);
@@ -679,7 +792,66 @@ static void bind_imgui(py::module_ im) {
   im.def("PushID", [](const std::string& s) { ImGui::PushID(s.c_str()); });
   im.def("PushID", [](int i) { ImGui::PushID(i); });
   im.def("PopID", &ImGui::PopID);
-  im.def("IsItemHovered", []() { return ImGui::IsItemHovered(); });
+  im.def("IsItemHovered", [](int flags) { return ImGui::IsItemHovered(flags); }, py::arg("flags") = 0);
+  im.def("IsItemActive", []() { return ImGui::IsItemActive(); });
+  im.def("IsItemEdited", []() { return ImGui::IsItemEdited(); });
+  im.def("IsItemClicked", [](int b) { return ImGui::IsItemClicked(b); }, py::arg("mouse_button") = 0);
+  im.def("IsItemDeactivatedAfterEdit", []() { return ImGui::IsItemDeactivatedAfterEdit(); });
+  im.def("TextWrapped", [](const std::string& s) { ImGui::TextWrapped("%s", s.c_str()); });
+  im.def("PushTextWrapPos", [](float x) { ImGui::PushTextWrapPos(x); }, py::arg("wrap_local_pos_x") = 0.0f);
+  im.def("PopTextWrapPos", &ImGui::PopTextWrapPos);
+  im.def("Dummy", [](glm::vec2 size) { ImGui::Dummy(v2(size)); });
+  im.def("CalcTextSize", [](const std::string& s) {
+    ImVec2 v = ImGui::CalcTextSize(s.c_str());
+    return glm::vec2(v.x, v.y);
+  });
+  im.def("GetFrameHeight", &ImGui::GetFrameHeight);
+  im.def("GetFrameHeightWithSpacing", &ImGui::GetFrameHeightWithSpacing);
+  im.def("GetTextLineHeight", &ImGui::GetTextLineHeight);
+  im.def("GetTextLineHeightWithSpacing", &ImGui::GetTextLineHeightWithSpacing);
+  im.def("GetCursorPosX", &ImGui::GetCursorPosX);
+  im.def("SetCursorPosX", &ImGui::SetCursorPosX);
+  im.def("GetContentRegionAvail", []() {
+    ImVec2 v = ImGui::GetContentRegionAvail();
+    return glm::vec2(v.x, v.y);
+  });
+  im.def("GetWindowWidth", &ImGui::GetWindowWidth);
+  im.def("SetClipboardText", [](const std::string& s) { ImGui::SetClipboardText(s.c_str()); });
+  im.def("GetClipboardText", []() {
+    const char* t = ImGui::GetClipboardText();
+    return std::string(t ? t : "");
+  });
+  im.def("PushStyleVar", [](int idx, float v) { ImGui::PushStyleVar(idx, v); });
+  im.def("PushStyleVar", [](int idx, glm::vec2 v) { ImGui::PushStyleVar(idx, v2(v)); });
+  im.def("PushStyleVarX", [](int idx, float v) { ImGui::PushStyleVarX(idx, v); });
+  im.def("PushStyleVarY", [](int idx, float v) { ImGui::PushStyleVarY(idx, v); });
+  im.def("PopStyleVar", [](int n) { ImGui::PopStyleVar(n); }, py::arg("count") = 1);
+  im.def("PushStyleColor", [](int idx, glm::vec4 c) { ImGui::PushStyleColor(idx, ImVec4(c.x, c.y, c.z, c.w)); });
+  im.def("PopStyleColor", [](int n) { ImGui::PopStyleColor(n); }, py::arg("count") = 1);
+  im.def("BeginTable", [](const std::string& id, int columns, int flags, glm::vec2 outer) {
+    return ImGui::BeginTable(id.c_str(), columns, flags, v2(outer));
+  }, py::arg("str_id"), py::arg("columns"), py::arg("flags") = 0, py::arg("outer_size") = glm::vec2(0.0f));
+  im.def("EndTable", &ImGui::EndTable);
+  im.def("TableNextRow", []() { ImGui::TableNextRow(); });
+  im.def("TableNextColumn", &ImGui::TableNextColumn);
+  im.def("TableSetColumnIndex", &ImGui::TableSetColumnIndex);
+  im.def("TableSetupColumn", [](const std::string& l, int flags, float w) {
+    ImGui::TableSetupColumn(l.c_str(), flags, w);
+  }, py::arg("label"), py::arg("flags") = 0, py::arg("init_width_or_weight") = 0.0f);
+  im.def("TableHeadersRow", &ImGui::TableHeadersRow);
+  im.def("BeginTabBar", [](const std::string& id) { return ImGui::BeginTabBar(id.c_str()); });
+  im.def("EndTabBar", &ImGui::EndTabBar);
+  im.def("BeginTabItem", [](const std::string& l) { return ImGui::BeginTabItem(l.c_str()); });
+  im.def("EndTabItem", &ImGui::EndTabItem);
+  im.def("BeginChild", [](const std::string& id, glm::vec2 size, int child_flags, int window_flags) {
+    return ImGui::BeginChild(id.c_str(), v2(size), child_flags, window_flags);
+  }, py::arg("str_id"), py::arg("size") = glm::vec2(0.0f), py::arg("child_flags") = 0, py::arg("window_flags") = 0);
+  im.def("EndChild", &ImGui::EndChild);
+  // An image by texture id (Viewer.image_texture); uv (0,0) is the top-left.
+  im.def("Image", [](uint64_t tex, glm::vec2 size, glm::vec2 uv0, glm::vec2 uv1) {
+    if (tex) ImGui::Image(ImTextureRef(ImTextureID(tex)), v2(size), v2(uv0), v2(uv1));
+    else ImGui::Dummy(v2(size));
+  }, py::arg("texture_id"), py::arg("size"), py::arg("uv0") = glm::vec2(0.0f), py::arg("uv1") = glm::vec2(1.0f));
   im.def("SetTooltip", [](const std::string& s) { ImGui::SetTooltip("%s", s.c_str()); });
   im.def("PlotLines", [](const std::string& l, const std::vector<float>& v, const std::string& overlay, glm::vec2 size) {
     ImGui::PlotLines(l.c_str(), v.data(), int(v.size()), 0, overlay.empty() ? nullptr : overlay.c_str(), FLT_MAX,
@@ -754,6 +926,45 @@ static void bind_imgui(py::module_ im) {
   im.attr("ImGuiWindowFlags_NoBackground") = int(ImGuiWindowFlags_NoBackground);
   im.attr("ImGuiSliderFlags_Logarithmic") = int(ImGuiSliderFlags_Logarithmic);
   im.attr("ImGuiTreeNodeFlags_DefaultOpen") = int(ImGuiTreeNodeFlags_DefaultOpen);
+  im.attr("ImGuiTreeNodeFlags_Framed") = int(ImGuiTreeNodeFlags_Framed);
+  im.attr("ImGuiTreeNodeFlags_Leaf") = int(ImGuiTreeNodeFlags_Leaf);
+  im.attr("ImGuiWindowFlags_NoScrollbar") = int(ImGuiWindowFlags_NoScrollbar);
+  im.attr("ImGuiWindowFlags_NoCollapse") = int(ImGuiWindowFlags_NoCollapse);
+  im.attr("ImGuiWindowFlags_NoSavedSettings") = int(ImGuiWindowFlags_NoSavedSettings);
+  im.attr("ImGuiWindowFlags_NoInputs") = int(ImGuiWindowFlags_NoInputs);
+  im.attr("ImGuiWindowFlags_NoFocusOnAppearing") = int(ImGuiWindowFlags_NoFocusOnAppearing);
+  im.attr("ImGuiChildFlags_None") = int(ImGuiChildFlags_None);
+  im.attr("ImGuiChildFlags_Borders") = int(ImGuiChildFlags_Borders);
+  im.attr("ImGuiChildFlags_AutoResizeY") = int(ImGuiChildFlags_AutoResizeY);
+  im.attr("ImGuiInputTextFlags_EnterReturnsTrue") = int(ImGuiInputTextFlags_EnterReturnsTrue);
+  im.attr("ImGuiHoveredFlags_None") = int(ImGuiHoveredFlags_None);
+  im.attr("ImGuiHoveredFlags_AllowWhenDisabled") = int(ImGuiHoveredFlags_AllowWhenDisabled);
+  im.attr("ImGuiTableFlags_None") = int(ImGuiTableFlags_None);
+  im.attr("ImGuiTableFlags_Borders") = int(ImGuiTableFlags_Borders);
+  im.attr("ImGuiTableFlags_RowBg") = int(ImGuiTableFlags_RowBg);
+  im.attr("ImGuiTableFlags_Resizable") = int(ImGuiTableFlags_Resizable);
+  im.attr("ImGuiTableFlags_SizingFixedFit") = int(ImGuiTableFlags_SizingFixedFit);
+  im.attr("ImGuiTableFlags_SizingStretchProp") = int(ImGuiTableFlags_SizingStretchProp);
+  im.attr("ImGuiTableFlags_SizingStretchSame") = int(ImGuiTableFlags_SizingStretchSame);
+  im.attr("ImGuiTableColumnFlags_None") = int(ImGuiTableColumnFlags_None);
+  im.attr("ImGuiTableColumnFlags_WidthFixed") = int(ImGuiTableColumnFlags_WidthFixed);
+  im.attr("ImGuiTableColumnFlags_WidthStretch") = int(ImGuiTableColumnFlags_WidthStretch);
+  im.attr("ImGuiStyleVar_Alpha") = int(ImGuiStyleVar_Alpha);
+  im.attr("ImGuiStyleVar_WindowPadding") = int(ImGuiStyleVar_WindowPadding);
+  im.attr("ImGuiStyleVar_FramePadding") = int(ImGuiStyleVar_FramePadding);
+  im.attr("ImGuiStyleVar_FrameRounding") = int(ImGuiStyleVar_FrameRounding);
+  im.attr("ImGuiStyleVar_ItemSpacing") = int(ImGuiStyleVar_ItemSpacing);
+  im.attr("ImGuiStyleVar_ItemInnerSpacing") = int(ImGuiStyleVar_ItemInnerSpacing);
+  im.attr("ImGuiStyleVar_IndentSpacing") = int(ImGuiStyleVar_IndentSpacing);
+  im.attr("ImGuiCol_Text") = int(ImGuiCol_Text);
+  im.attr("ImGuiCol_TextDisabled") = int(ImGuiCol_TextDisabled);
+  im.attr("ImGuiCol_WindowBg") = int(ImGuiCol_WindowBg);
+  im.attr("ImGuiCol_FrameBg") = int(ImGuiCol_FrameBg);
+  im.attr("ImGuiCol_Button") = int(ImGuiCol_Button);
+  im.attr("ImGuiCol_ButtonHovered") = int(ImGuiCol_ButtonHovered);
+  im.attr("ImGuiCol_ButtonActive") = int(ImGuiCol_ButtonActive);
+  im.attr("ImGuiCol_Header") = int(ImGuiCol_Header);
+  im.attr("ImGuiCol_PlotHistogram") = int(ImGuiCol_PlotHistogram);
 
   // A line plot (ImPlot) for time series.
   im.def("PlotSeries", [](const std::string& title, const std::vector<std::string>& labels,

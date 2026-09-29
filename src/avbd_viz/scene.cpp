@@ -128,11 +128,40 @@ glm::vec2 QuantityStructure::color_range() const {
   return q && auto_range && q->type != QuantityType::Color ? quantity_range(*q) : range;
 }
 
+// ---- Structure transform ----------------------------------------------------
+
+void Structure::set_transform(const glm::mat4& T) {
+  if (!placed_) {
+    capture_local();
+    placed_ = true;
+  }
+  transform_ = T;
+  place();
+}
+
+void Structure::transform_points(const glm::mat4& T, const std::vector<float>& src, std::vector<float>& dst,
+                                 size_t stride) {
+  dst.resize(src.size());
+  for (size_t i = 0; i + 2 < src.size(); i += stride) {
+    glm::vec3 p = glm::vec3(T * glm::vec4(src[i], src[i + 1], src[i + 2], 1.0f));
+    dst[i] = p.x;
+    dst[i + 1] = p.y;
+    dst[i + 2] = p.z;
+    for (size_t k = 3; k < stride; ++k) dst[i + k] = src[i + k];
+  }
+}
+
 // ---- SurfaceMesh ------------------------------------------------------------
 
 void SurfaceMesh::set_geometry(const float* xyz, size_t num_vertices, const uint32_t* tris,
                                size_t num_triangles) {
-  positions_.assign(xyz, xyz + 3 * num_vertices);
+  if (placed_) {
+    local_.assign(xyz, xyz + 3 * num_vertices);
+    transform_points(transform_, local_, positions_, 3);
+  } else {
+    positions_.assign(xyz, xyz + 3 * num_vertices);
+  }
+  if (uvs_.size() != 2 * num_vertices) uvs_.clear();
   triangles_.assign(tris, tris + 3 * num_triangles);
   if (segment_offsets_.back() != num_triangles) segment_offsets_ = {0, uint32_t(num_triangles)};
   edges_valid_ = face_segment_valid_ = false;
@@ -142,8 +171,23 @@ void SurfaceMesh::set_geometry(const float* xyz, size_t num_vertices, const uint
 }
 
 void SurfaceMesh::set_positions(const float* xyz) {
-  std::copy(xyz, xyz + positions_.size(), positions_.begin());
+  if (placed_) {
+    std::copy(xyz, xyz + local_.size(), local_.begin());
+    transform_points(transform_, local_, positions_, 3);
+  } else {
+    std::copy(xyz, xyz + positions_.size(), positions_.begin());
+  }
   ++positions_version_;
+}
+
+void SurfaceMesh::place() {
+  transform_points(transform_, local_, positions_, 3);
+  ++positions_version_;
+}
+
+void SurfaceMesh::set_uvs(const float* uv, size_t n) {
+  uvs_.assign(uv, uv + 2 * n);
+  ++attributes_version_;
 }
 
 void SurfaceMesh::set_segments(std::vector<uint32_t> offsets, std::vector<std::string> names) {
@@ -370,6 +414,15 @@ void PointCloud::set_points(const float* xyz, size_t n, const float* radii) {
     points_[4 * i + 2] = xyz[3 * i + 2];
     points_[4 * i + 3] = radii ? radii[i] : -1.0f;  // negative: use `radius`
   }
+  if (placed_) {
+    local_ = points_;
+    transform_points(transform_, local_, points_, 4);
+  }
+  ++positions_version_;
+}
+
+void PointCloud::place() {
+  transform_points(transform_, local_, points_, 4);
   ++positions_version_;
 }
 
@@ -379,7 +432,17 @@ bool PointCloud::bounds(glm::vec3& lo, glm::vec3& hi) const { return packed_boun
 
 void CurveNetwork::set_nodes(const float* xyz, size_t n) {
   if (n != num_nodes()) ++topology_version_;
-  nodes_.assign(xyz, xyz + 3 * n);
+  if (placed_) {
+    local_.assign(xyz, xyz + 3 * n);
+    transform_points(transform_, local_, nodes_, 3);
+  } else {
+    nodes_.assign(xyz, xyz + 3 * n);
+  }
+  ++positions_version_;
+}
+
+void CurveNetwork::place() {
+  transform_points(transform_, local_, nodes_, 3);
   ++positions_version_;
 }
 
@@ -417,7 +480,12 @@ glm::vec3 CurveNetwork::element_position(ElementKind kind, uint32_t i) const {
 // ---- VolumeMesh -----------------------------------------------------------------
 
 void VolumeMesh::set_geometry(const float* xyz, size_t num_vertices, const uint32_t* tets, size_t num_tets) {
-  positions_.assign(xyz, xyz + 3 * num_vertices);
+  if (placed_) {
+    local_.assign(xyz, xyz + 3 * num_vertices);
+    transform_points(transform_, local_, positions_, 3);
+  } else {
+    positions_.assign(xyz, xyz + 3 * num_vertices);
+  }
   tets_.assign(tets, tets + 4 * num_tets);
   ++positions_version_;
   ++topology_version_;
@@ -425,7 +493,17 @@ void VolumeMesh::set_geometry(const float* xyz, size_t num_vertices, const uint3
 }
 
 void VolumeMesh::set_positions(const float* xyz) {
-  std::copy(xyz, xyz + positions_.size(), positions_.begin());
+  if (placed_) {
+    std::copy(xyz, xyz + local_.size(), local_.begin());
+    transform_points(transform_, local_, positions_, 3);
+  } else {
+    std::copy(xyz, xyz + positions_.size(), positions_.begin());
+  }
+  ++positions_version_;
+}
+
+void VolumeMesh::place() {
+  transform_points(transform_, local_, positions_, 3);
   ++positions_version_;
 }
 
@@ -547,6 +625,19 @@ const VolumeMesh::Section& VolumeMesh::slice(const glm::vec3& n, float offset) c
 void VectorSet::set_vectors(const float* origins, const float* vectors, size_t n) {
   origins_.assign(origins, origins + 3 * n);
   vectors_.assign(vectors, vectors + 3 * n);
+  if (placed_) {
+    capture_local();
+    place();
+  }
+  ++version_;
+}
+
+void VectorSet::place() {
+  transform_points(transform_, local_, origins_, 3);
+  // Directions: the linear part only.
+  glm::mat4 L = transform_;
+  L[3] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+  transform_points(L, local_vectors_, vectors_, 3);
   ++version_;
 }
 
@@ -587,6 +678,19 @@ Structure* Scene::find(uint32_t id) const {
   for (const auto& s : structures_)
     if (s->id() == id) return s.get();
   return nullptr;
+}
+
+void Scene::set_image(const std::string& name, uint32_t width, uint32_t height, std::vector<uint8_t> rgba) {
+  Image& im = images_[name];
+  im.width = width;
+  im.height = height;
+  im.rgba = std::move(rgba);
+  im.version = ++image_version_;
+}
+
+const Scene::Image* Scene::image(const std::string& name) const {
+  auto it = images_.find(name);
+  return it == images_.end() ? nullptr : &it->second;
 }
 
 bool Scene::bounds(glm::vec3& lo, glm::vec3& hi) const {

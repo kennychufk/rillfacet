@@ -40,6 +40,11 @@ struct ViewerOptions {
   int width = 1600;
   int height = 960;
   bool headless = false;
+  // false: present without waiting for the display (mailbox, else immediate).
+  // A FIFO present blocks while the display is off or locked (1 s per frame
+  // on X11), so loops that pump frames from other work turn vsync off.
+  bool vsync = true;
+  float max_fps = 0.0f;  // > 0: frame() sleeps to stay under this rate (0 = no cap)
 };
 
 class Viewer {
@@ -60,6 +65,9 @@ class Viewer {
 
   bool frame();  // renders one frame; false once the window is closed
   void run();    // frame() until closed
+  // Closes the window after the current frame (e.g. from the callback):
+  // the next frame() returns false, headless too.
+  void request_close() { close_requested_ = true; }
   // PNG of the last frame, including the UI.
   bool screenshot(const std::string& png_path);
   // PNG taken at the end of the next frame, with or without the UI.
@@ -70,6 +78,13 @@ class Viewer {
   void stop_recording();
   bool recording() const { return video_ != nullptr || video_png_; }
   void set_ui_visible(bool v) { ui_visible_ = v; }
+  void set_vsync(bool on);
+  bool vsync() const { return options_.vsync; }
+  void set_max_fps(float fps) { options_.max_fps = fps; }
+  float max_fps() const { return options_.max_fps; }
+  // ImGui texture id (ImTextureID) of a scene image, for ImGui::Image.
+  // Uploads the image if it changed; 0 when the scene has no such image.
+  uint64_t image_texture(const std::string& name);
 
   void frame_all(bool animate = true);
   void frame_selection();
@@ -127,13 +142,13 @@ class Viewer {
   bool xray_select_ = false;
   std::function<void()> callback_;
   Drag drag_;
-  bool drag_enabled_ = false, drag_by_mouse_ = false, in_frame_ = false;
+  bool drag_enabled_ = false, drag_by_mouse_ = false, in_frame_ = false, close_requested_ = false;
   uint64_t frame_index_ = 0, drag_phase_frame_ = 0;
 
   // Mouse gesture state.
   bool lmb_down_ = false, box_active_ = false, nav_drag_ = false;
   glm::vec2 press_pos_{0}, last_mouse_{0};
-  double last_time_ = 0;
+  double last_time_ = 0, frame_start_ = 0;
   float dt_ = 1.0f / 60.0f;
   int applied_theme_ = -1;
   ImFont* ui_font_ = nullptr;

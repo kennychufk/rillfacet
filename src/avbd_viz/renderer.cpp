@@ -3,6 +3,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <set>
@@ -165,6 +166,7 @@ struct Renderer::MeshGpu {
   wgpu::Buffer ubo;
   DynamicBuffer positions, triangles, face_segment, segments, vertex_attr, face_info, vertex_faces;
   wgpu::BindGroup group;
+  wgpu::TextureView texture;
   MeshUniforms u;
   uint32_t faces = 0;
   bool transparent = false;
@@ -302,7 +304,8 @@ bool Renderer::init(std::string* error) {
                                {7, BK::Texture}, {8, BK::Sampler}});
   mesh_layout_ = make_layout(gpu_, "mesh",
                              {{0, BK::Uniform}, {1, BK::Storage}, {2, BK::Storage}, {3, BK::Storage},
-                              {4, BK::Storage}, {5, BK::Storage}, {6, BK::Storage}, {7, BK::Storage}});
+                              {4, BK::Storage}, {5, BK::Storage}, {6, BK::Storage}, {7, BK::Storage},
+                              {8, BK::Texture}, {9, BK::Sampler}});
   item_layout_ = make_layout(gpu_, "item", {{0, BK::Uniform}, {1, BK::Storage}});
   points_layout_ = make_layout(gpu_, "points", {{0, BK::Uniform}, {1, BK::Storage}, {2, BK::Storage}});
   curves_layout_ = make_layout(gpu_, "curves",
@@ -359,6 +362,21 @@ bool Renderer::init(std::string* error) {
   shadow_map_ = gpu_.create_texture(2048, 2048, TF::Depth32Float,
                                     TU::RenderAttachment | TU::TextureBinding, "shadow map");
   shadow_view_ = shadow_map_.CreateView();
+
+  // Stand-in for textured meshes whose image is missing.
+  {
+    wgpu::Texture white = gpu_.create_texture(1, 1, TF::RGBA8UnormSrgb, TU::TextureBinding | TU::CopyDst,
+                                              "white");
+    const uint8_t px[4] = {255, 255, 255, 255};
+    wgpu::TexelCopyTextureInfo dst{};
+    dst.texture = white;
+    wgpu::TexelCopyBufferLayout l{};
+    l.bytesPerRow = 4;
+    l.rowsPerImage = 1;
+    wgpu::Extent3D e{1, 1, 1};
+    gpu_.queue.WriteTexture(&dst, px, 4, &l, &e);
+    white_view_ = white.CreateView();
+  }
 
   // Font atlas for 3D labels.
   std::string font_path = std::string(AVBD_VIZ_ASSET_DIR) + "/fonts/Inter-SemiBold.ttf";
@@ -576,6 +594,39 @@ void Renderer::update_environment(const RenderSettings& s) {
 
 // ---- Per-frame sync -------------------------------------------------------------
 
+wgpu::TextureView Renderer::image_view(const Scene& scene, const std::string& name) {
+  const Scene::Image* im = scene.image(name);
+  if (!im || !im->width || !im->height || im->rgba.size() < size_t(im->width) * im->height * 4) {
+    if (auto it = images_.find(name); it != images_.end()) {
+      retired_images_.push_back(it->second.texture);
+      images_.erase(it);
+    }
+    return white_view_;
+  }
+  ImageGpu& g = images_[name];
+  if (g.width != im->width || g.height != im->height || !g.texture) {
+    if (g.texture) retired_images_.push_back(g.texture);
+    g.texture = gpu_.create_texture(im->width, im->height, wgpu::TextureFormat::RGBA8UnormSrgb,
+                                    wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+                                    name.c_str());
+    g.view = g.texture.CreateView();
+    g.width = im->width;
+    g.height = im->height;
+    g.version = 0;
+  }
+  if (g.version != im->version) {
+    wgpu::TexelCopyTextureInfo dst{};
+    dst.texture = g.texture;
+    wgpu::TexelCopyBufferLayout l{};
+    l.bytesPerRow = 4 * im->width;
+    l.rowsPerImage = im->height;
+    wgpu::Extent3D e{im->width, im->height, 1};
+    gpu_.queue.WriteTexture(&dst, im->rgba.data(), size_t(im->width) * im->height * 4, &l, &e);
+    g.version = im->version;
+  }
+  return g.view;
+}
+
 void Renderer::sync_mesh(MeshGpu& g, const SurfaceMesh& m, uint32_t object_id, const MeshSelection& sel,
                          bool clip, float edge_angle, float edge_band) {
   const BU storage = BU::Storage;
@@ -598,7 +649,16 @@ void Renderer::sync_mesh(MeshGpu& g, const SurfaceMesh& m, uint32_t object_id, c
   // What colors the mesh (modes as in base_color() of mesh.wgsl).
   const Quantity* q = m.coloring_quantity();
   uint32_t mode = m.color_source == ColorSource::SegmentPalette ? 1 : 0;
-  if (q) {
+  const bool textured = m.color_source == ColorSource::Texture && !m.texture.empty() &&
+                        m.uvs().size() == 2 * m.num_vertices() && sync_scene_;
+  wgpu::TextureView tex = textured ? image_view(*sync_scene_, m.texture) : white_view_;
+  if (g.texture.Get() != tex.Get()) {
+    g.texture = tex;
+    rebind = true;
+  }
+  if (textured) {
+    mode = 9;
+  } else if (q) {
     bool rgb = q->type == QuantityType::Color;
     switch (q->on) {
       case ElementKind::Vertex: mode = rgb ? 5 : 2; break;
@@ -608,7 +668,7 @@ void Renderer::sync_mesh(MeshGpu& g, const SurfaceMesh& m, uint32_t object_id, c
       default: mode = 0; break;
     }
   }
-  std::string key = std::to_string(mode) + (q ? q->name : "");
+  std::string key = std::to_string(mode) + (textured ? m.texture : q ? q->name : "");
   bool mask_stale = g.edge_angle != edge_angle || (edge_angle > 0 && !m.rigid_segments && g.mask_ver != m.positions_version());
   if (g.attr_ver != m.attributes_version() || g.sel_ver != sel.version || g.color_key != key || mask_stale) {
     size_t nf = m.num_faces(), ns = m.num_segments();
@@ -638,6 +698,15 @@ void Renderer::sync_mesh(MeshGpu& g, const SurfaceMesh& m, uint32_t object_id, c
     if (mode == 2 || mode == 5) {
       attr.resize(std::max<size_t>(m.num_vertices(), 1));
       for (size_t i = 0; i < m.num_vertices(); ++i) attr[i] = attr_value(*q, i);
+    } else if (mode == 9) {
+      // Texture coordinates packed as two unorm16 (bitcast in the shader).
+      const auto& uv = m.uvs();
+      attr.resize(std::max<size_t>(m.num_vertices(), 1));
+      for (size_t i = 0; i < m.num_vertices(); ++i) {
+        glm::vec2 t = glm::clamp(glm::vec2(uv[2 * i], uv[2 * i + 1]), 0.0f, 1.0f);
+        uint32_t packed = uint32_t(std::lround(t.x * 65535.0f)) | (uint32_t(std::lround(t.y * 65535.0f)) << 16);
+        attr[i] = std::bit_cast<float>(packed);
+      }
     } else if (mode == 7 || mode == 8) {
       const auto& fe = m.face_edges();
       attr.resize(std::max<size_t>(3 * nf, 1));
@@ -656,7 +725,7 @@ void Renderer::sync_mesh(MeshGpu& g, const SurfaceMesh& m, uint32_t object_id, c
   g.u.base_color = glm::vec4(srgb_to_linear(m.color), std::clamp(m.opacity, 0.0f, 1.0f));
   g.u.color_mode = mode;
   g.u.cmap_row = uint32_t(std::clamp(m.colormap, 0, kColormapCount - 1));
-  g.u.flags = (m.isolines ? 1u : 0u) | (clip ? 2u : 0u) | (m.smooth_shading ? 4u : 0u);
+  g.u.flags = (m.isolines ? 1u : 0u) | (clip ? 2u : 0u) | (m.smooth_shading ? 4u : 0u) | (m.unlit ? 8u : 0u);
   g.u.object_id = object_id;
   if (!m.auto_range) g.u.scalar_range = m.range;
   g.u.iso_spacing = m.isoline_spacing;
@@ -668,7 +737,7 @@ void Renderer::sync_mesh(MeshGpu& g, const SurfaceMesh& m, uint32_t object_id, c
     g.group = make_group(gpu_, mesh_layout_,
                          {{0, g.ubo}, {1, g.positions.buffer}, {2, g.triangles.buffer}, {3, g.face_segment.buffer},
                           {4, g.segments.buffer}, {5, g.vertex_attr.buffer}, {6, g.face_info.buffer},
-                          {7, g.vertex_faces.buffer}});
+                          {7, g.vertex_faces.buffer}, {8, g.texture}, {9, clamp_sampler_}});
 }
 
 void Renderer::sync_volume(VolumeGpu& g, const VolumeMesh& v, const RenderSettings& s, const Selection& sel) {
@@ -798,6 +867,12 @@ void Renderer::sync_arrows(const QuantityStructure& s, bool clip) {
 }
 
 void Renderer::sync(const Scene& scene, const RenderSettings& settings, const Selection& sel) {
+  sync_scene_ = &scene;
+  std::erase_if(images_, [&](auto& kv) {
+    if (scene.image(kv.first)) return false;
+    retired_images_.push_back(kv.second.texture);
+    return true;
+  });
   // Drop GPU copies of removed structures (and arrows no longer shown).
   std::unordered_set<uint32_t> alive;
   std::set<std::pair<uint32_t, std::string>> arrows_alive;
@@ -1057,9 +1132,16 @@ void Renderer::render(const Scene& scene, const Camera& camera, const RenderSett
 
   // Overlay geometry.
   std::vector<GlyphInstance> glyphs;
-  for (const TextLabel& l : overlay.labels)
-    font_.layout(l.text, l.anchor, l.size_px, l.align, l.offset, l.color, l.halo, l.halo_px, l.hidden_alpha,
+  for (const TextLabel& l : overlay.labels) {
+    float size_px = l.size_px;
+    if (l.world_height > 0.0f) {
+      if (!camera.ortho && glm::dot(l.anchor - camera.eye(), camera.forward()) <= camera.near_plane()) continue;
+      size_px = l.world_height / std::max(camera.pixel_size_at(l.anchor, float(height_)), 1e-12f);
+      if (size_px < l.min_px) continue;
+    }
+    font_.layout(l.text, l.anchor, size_px, l.align, l.offset, l.color, l.halo, l.halo_px, l.hidden_alpha,
                  l.ignore_depth, glyphs);
+  }
   if (lines_buffer_.upload(gpu_, overlay.lines.data(), std::max<size_t>(overlay.lines.size() * sizeof(OverlayLine), 256),
                            BU::Storage, "overlay lines") || !lines_storage_group_)
     lines_storage_group_ = make_group(gpu_, storage_layout_, {{0, lines_buffer_.buffer}});
@@ -1282,6 +1364,7 @@ void Renderer::render(const Scene& scene, const Camera& camera, const RenderSett
   pass.End();
   wgpu::CommandBuffer cmd = enc.Finish();
   gpu_.queue.Submit(1, &cmd);
+  retired_images_.clear();  // WebGPU keeps them alive for the submitted work
 }
 
 void Renderer::blit(const wgpu::TextureView& target, wgpu::TextureFormat format) {

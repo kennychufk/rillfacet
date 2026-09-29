@@ -29,6 +29,11 @@ struct TextLabel {
   float halo_px = 2.0f;
   float hidden_alpha = 0.3f;     // opacity when the anchor is behind geometry
   bool ignore_depth = false;
+  // When > 0, the text is this tall in world units at the anchor (it shrinks
+  // with distance like a sign in the scene) and size_px is ignored; labels
+  // that would come out smaller than min_px are skipped.
+  float world_height = 0.0f;
+  float min_px = 4.0f;
 };
 
 class Overlay {

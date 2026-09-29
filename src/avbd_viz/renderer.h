@@ -139,6 +139,9 @@ class Renderer {
 
   static constexpr wgpu::TextureFormat kFinalFormat = wgpu::TextureFormat::RGBA8Unorm;
   const Font& font() const { return font_; }
+  // GPU copy of a scene image (uploaded on first use and whenever it
+  // changed); a 1x1 white texture when the scene has no such image.
+  wgpu::TextureView image_view(const Scene& scene, const std::string& name);
   const std::string& shader_error() const { return shader_error_; }
   glm::vec3 environment_sun() const { return env_.sun_dir; }
 
@@ -149,6 +152,12 @@ class Renderer {
   struct VectorsGpu;
   struct VolumeGpu;
   struct MeshSelection;
+  struct ImageGpu {
+    wgpu::Texture texture;
+    wgpu::TextureView view;
+    uint32_t width = 0, height = 0;
+    uint64_t version = 0;
+  };
 
   bool build_pipelines(std::string* error);
   void create_targets();
@@ -197,6 +206,12 @@ class Renderer {
   std::string env_file_;
   MatcapPreset matcap_built_ = MatcapPreset::Count;
   Font font_;
+  wgpu::TextureView white_view_;
+  std::unordered_map<std::string, ImageGpu> images_;
+  // Replaced image textures, kept until the frame that may still draw them
+  // (an ImGui image taken before the replacement) has been submitted.
+  std::vector<wgpu::Texture> retired_images_;
+  const Scene* sync_scene_ = nullptr;  // during sync()
 
   wgpu::BindGroup frame_group_, scene_group_, ssao_group_, blur_group_, composite_group_,
       lines_group_, text_group_, blit_group_;

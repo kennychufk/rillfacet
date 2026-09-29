@@ -63,9 +63,36 @@ v.set_callback(callback)
 v.run()
 ```
 
+Placement: every structure has a `transform` (4x4, world from local, like
+polyscope's structure transform). Once one is set, the geometry setters take
+local coordinates and positions, bounds and picking report placed ones, so
+moving a rigid part is one assignment.
+
+Images: `v.scene.set_image(name, img)` stores an `[H, W, 3|4]` image (uint8,
+or floats in 0..1, top row first; replace it every frame for a stream). A
+surface mesh shows it with `set_uvs(uv)`, `texture = name` and
+`color_source = ColorSource.Texture` (`unlit = True` shows it without
+lighting, e.g. a camera frame on a billboard); ImGui shows it with
+`imgui.Image(v.image_texture(name), (w, h))`.
+
+Text: `v.overlay.text(text, anchor, ...)` draws a screen-facing SDF label at a
+world point, `size_px` tall, or `world_height` tall in world units (it then
+shrinks with distance like a sign in the scene, and is skipped below
+`min_px`). The overlay is rebuilt every frame: add labels from the callback.
+
+Threads and pacing: `frame()` / `run()` release the Python GIL for the whole
+frame except the callback, so worker threads are never paced by the render
+loop (touch structures only from the callback or the thread calling
+`frame()`). `Viewer(vsync=False, max_fps=60)` presents without waiting for the
+display — a vsynced present blocks while the display is off or locked, about
+1 s per frame on X11 — and sleeps to hold the cap (0 = uncapped).
+`request_close()` ends `run()` after the current frame.
+
 ImGui has no out-parameters in Python, so widgets that write through a pointer
 in C++ return the new value instead: `changed, value = imgui.SliderFloat(...)`,
-`changed, on = imgui.Checkbox(...)`. `avbd_viz.implot` wraps the line-plot
+`changed, on = imgui.Checkbox(...)`. Beyond widgets the subset covers tables,
+tab bars, child windows, style vars/colors, text wrapping, the clipboard and
+images. `avbd_viz.implot` wraps the line-plot
 subset (`BeginPlot`/`SetupAxis`/`PlotLine`/`SetAxes`), and `imgui.GetIO()` can
 inject input (`AddKeyEvent`, `AddMousePosEvent`, `AddMouseButtonEvent`) so a
 viewer app can be driven headlessly from a test.

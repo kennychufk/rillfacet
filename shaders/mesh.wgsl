@@ -19,7 +19,7 @@ struct MeshObject {
   base_color: vec4f,     // linear rgb, a = opacity
   color_mode: u32,       // see base_color()
   cmap_row: u32,
-  flags: u32,            // bit 0 isolines, bit 1 cut by the slice plane, bit 2 smooth normals
+  flags: u32,            // bit 0 isolines, bit 1 cut by the slice plane, bit 2 smooth normals, bit 3 unlit
   object_id: u32,
   scalar_range: vec2f,
   iso_spacing: f32,
@@ -47,6 +47,9 @@ struct SegmentInfo {
 @group(1) @binding(6) var<storage, read> face_info: array<vec2u>;
 // Faces around each vertex (CSR: V+1 offsets into this array, then face ids).
 @group(1) @binding(7) var<storage, read> vertex_faces: array<u32>;
+// Image sampled by color mode 9 (texture coordinates packed in vertex_attr).
+@group(1) @binding(8) var image_tex: texture_2d<f32>;
+@group(1) @binding(9) var image_sampler: sampler;
 
 struct VsOut {
   @builtin(position) clip: vec4f,
@@ -56,6 +59,7 @@ struct VsOut {
   @location(3) scalar: f32,
   @location(4) @interpolate(flat) face: u32,
   @location(5) color: vec3f,
+  @location(6) uv: vec2f,
 };
 
 fn load_position(i: u32) -> vec3f {
@@ -117,6 +121,7 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
   let a = vertex_attr[min(vi, arrayLength(&vertex_attr) - 1u)];
   out.scalar = a;
   out.color = unpack_srgb(bitcast<u32>(a));
+  out.uv = unpack2x16unorm(bitcast<u32>(a));
   out.face = face;
   return out;
 }
@@ -134,7 +139,7 @@ fn scalar_color(value: f32, value_width: f32, iso: bool) -> vec3f {
 
 // Base color from the active color source. Modes:
 // 0 uniform, 1 segment colors, 2 vertex scalar, 3 face scalar, 4 segment scalar,
-// 5 vertex color, 6 face color, 7 edge scalar, 8 edge color.
+// 5 vertex color, 6 face color, 7 edge scalar, 8 edge color, 9 texture.
 fn base_color(in: VsOut, value_width: f32, bary_width: vec3f) -> vec3f {
   let seg = segments[face_segment[in.face]];
   switch obj.color_mode {
@@ -144,6 +149,7 @@ fn base_color(in: VsOut, value_width: f32, bary_width: vec3f) -> vec3f {
     case 4u: { return scalar_color(seg.scalar, 0.0, false); }
     case 5u: { return in.color; }
     case 6u: { return unpack_srgb(face_info[in.face].x); }
+    case 9u: { return textureSampleLevel(image_tex, image_sampler, in.uv, 0.0).rgb; }
     case 7u, 8u: {
       // Bands along the edges, each in its edge's color; the rest stays uniform.
       let d = in.bary / max(bary_width, vec3f(1e-6));
@@ -198,6 +204,9 @@ fn surface_color(in: VsOut, front: bool, value_width: f32, bary_width: vec3f) ->
   s.metallic = obj.material.x;
   s.roughness = obj.material.y;
   var color = shade(s) * frame.style.y;
+  if ((obj.flags & 8u) != 0u) {
+    color = s.albedo;
+  }
 
   let seg_flags = segments[face_segment[in.face]].flags;
   if ((face_info[in.face].y & 1u) != 0u) {

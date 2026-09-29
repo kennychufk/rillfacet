@@ -19,6 +19,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <limits>
+#include <thread>
 
 namespace avbd_viz {
 
@@ -120,7 +121,12 @@ void Viewer::apply_theme() {
 // ---- Frame loop ---------------------------------------------------------------
 
 bool Viewer::frame() {
-  if (!ok_) return false;
+  if (!ok_ || close_requested_) return false;
+  if (options_.max_fps > 0.0f) {
+    double wait = frame_start_ + 1.0 / options_.max_fps - now_seconds();
+    if (wait > 0.0) std::this_thread::sleep_for(std::chrono::duration<double>(wait));
+  }
+  frame_start_ = now_seconds();
   if (window_) {
     glfwPollEvents();
     if (glfwWindowShouldClose(window_)) return false;
@@ -136,7 +142,19 @@ bool Viewer::frame() {
       cfg.format = surface_format_;
       cfg.width = surface_w_ = uint32_t(fw);
       cfg.height = surface_h_ = uint32_t(fh);
-      cfg.presentMode = wgpu::PresentMode::Fifo;
+      cfg.presentMode = options_.vsync ? wgpu::PresentMode::Fifo : wgpu::PresentMode::Immediate;
+      if (!options_.vsync) {
+        wgpu::SurfaceCapabilities caps{};
+        surface_.GetCapabilities(gpu_->adapter, &caps);
+        bool immediate = false, mailbox = false;
+        for (size_t i = 0; i < caps.presentModeCount; ++i) {
+          immediate |= caps.presentModes[i] == wgpu::PresentMode::Immediate;
+          mailbox |= caps.presentModes[i] == wgpu::PresentMode::Mailbox;
+        }
+        cfg.presentMode = mailbox     ? wgpu::PresentMode::Mailbox
+                          : immediate ? wgpu::PresentMode::Immediate
+                                      : wgpu::PresentMode::Fifo;
+      }
       surface_.Configure(&cfg);
       renderer_->resize(surface_w_, surface_h_);
     }
@@ -185,6 +203,18 @@ bool Viewer::frame() {
   }
   gpu_->instance.ProcessEvents();
   return true;
+}
+
+void Viewer::set_vsync(bool on) {
+  if (on == options_.vsync) return;
+  options_.vsync = on;
+  surface_w_ = surface_h_ = 0;  // reconfigure the surface next frame
+}
+
+uint64_t Viewer::image_texture(const std::string& name) {
+  if (!ok_ || !scene_.image(name)) return 0;
+  wgpu::TextureView view = renderer_->image_view(scene_, name);
+  return uint64_t(reinterpret_cast<uintptr_t>(view.Get()));
 }
 
 void Viewer::run() {

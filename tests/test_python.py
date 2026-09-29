@@ -364,3 +364,173 @@ def test_drag_with_mouse(v):
         v.frame()
         v.set_ui_visible(True)
     assert v.drag.phase == viz.Drag.Phase.Idle
+
+
+def test_structure_transform(v):
+    verts, tris = grid(n=3, z=0.0)
+    m = v.scene.add_mesh("placed")
+    m.set_geometry(verts, tris)
+    assert np.allclose(m.transform, np.eye(4))
+    T = np.eye(4)
+    T[:3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]  # 90 deg about z
+    T[:3, 3] = [5.0, 0.0, 2.0]
+    m.transform = T
+    assert np.allclose(m.transform, T)
+    local = verts.astype(np.float64)
+    assert np.allclose(m.positions, local @ T[:3, :3].T + T[:3, 3], atol=1e-6)
+    # Setters take local coordinates once placed.
+    m.set_positions(verts * 2.0)
+    assert np.allclose(m.positions, 2.0 * local @ T[:3, :3].T + T[:3, 3], atol=1e-5)
+    lo, hi = m.bounds()
+    assert np.allclose(lo[2], 2.0) and np.allclose(hi[2], 2.0)
+
+    c = v.scene.add_curves("triad")
+    c.set_nodes(np.array([[0, 0, 0], [1, 0, 0]], np.float32))
+    c.set_edges(np.array([[0, 1]]))
+    c.transform = T
+    lo, hi = c.bounds()
+    r = c.radius  # bounds include the tube
+    assert np.allclose(lo, [5 - r, -r, 2 - r], atol=1e-6) and np.allclose(hi, [5 + r, 1 + r, 2 + r], atol=1e-6)
+
+    p = v.scene.add_points("pts")
+    p.transform = T
+    p.set_points(np.array([[1, 0, 0]], np.float32))
+    assert np.allclose(p.bounds()[0], [5, 1, 2], atol=1e-6)
+    assert v.frame()
+
+
+def test_textured_unlit_quad(v, tmp_path):
+    img = np.zeros((4, 4, 3), np.uint8)
+    img[:2] = (255, 0, 0)       # top half red
+    img[2:] = (0, 0, 255)       # bottom half blue
+    v.scene.set_image("cam", img)
+    assert v.scene.has_image("cam") and v.scene.image_size("cam") == (4, 4)
+    quad = v.scene.add_mesh("billboard")
+    quad.set_geometry(np.array([[-1, 0, -1], [1, 0, -1], [1, 0, 1], [-1, 0, 1]], np.float32),
+                      np.array([[0, 1, 2], [0, 2, 3]]))
+    quad.set_uvs(np.array([[0, 1], [1, 1], [1, 0], [0, 0]], np.float32))
+    quad.texture = "cam"
+    quad.unlit = True
+    quad.color_source = viz.ColorSource.Texture
+    v.camera.look_at((0, -3, 0), (0, 0, 0))
+    v.camera.ortho = False
+    assert v.frame()
+    tex = v.image_texture("cam")
+    assert tex != 0 and v.image_texture("missing") == 0
+
+    def panel():
+        viz.imgui.Begin("img")
+        viz.imgui.Image(tex, (64, 64))
+        viz.imgui.End()
+    v.set_callback(panel)
+    assert v.frame()
+    v.set_callback(None)
+    # Replace with a different size mid-stream.
+    v.scene.set_image("cam", np.full((8, 2, 4), 0.5, np.float32))
+    assert v.scene.image_size("cam") == (8, 2)
+    assert v.frame()
+    v.scene.remove_image("cam")
+    assert v.frame()
+
+
+def test_world_height_text(v):
+    v.overlay.text("far", (0, 0, 0), world_height=0.05, min_px=6.0)
+
+    def cb():
+        v.overlay.text("sign", (0, 0, 0), world_height=0.1, color=(1, 1, 1, 1))
+    v.set_callback(cb)
+    assert v.frame()
+    v.set_callback(None)
+
+
+def test_frame_releases_the_gil(v):
+    """A Python worker sleeping 1 ms at a time must keep its pace while the
+    main thread renders back to back. Were the GIL held through frame(), each
+    wake-up would wait for the interpreter's 5 ms switch interval (polyscope's
+    starvation, deskonica docs/traps.md): ~100 wake-ups in 0.5 s, not ~470."""
+    import threading
+    import time
+    count = [0]
+    stop = threading.Event()
+
+    def worker():
+        while not stop.is_set():
+            time.sleep(0.001)
+            count[0] += 1
+
+    v.set_callback(lambda: None)
+    t = threading.Thread(target=worker)
+    t.start()
+    try:
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < 0.5:
+            v.frame()
+    finally:
+        stop.set()
+        t.join()
+        v.set_callback(None)
+    assert count[0] > 300, count[0]
+
+
+def test_vsync_and_imgui_extras(v):
+    assert v.vsync
+    v.vsync = False
+    assert not v.vsync
+    im = viz.imgui
+    seen = {}
+
+    def cb():
+        im.Begin("extras")
+        if im.BeginTable("t", 2, im.ImGuiTableFlags_Borders | im.ImGuiTableFlags_RowBg):
+            im.TableSetupColumn("a")
+            im.TableSetupColumn("b")
+            im.TableHeadersRow()
+            im.TableNextRow()
+            im.TableNextColumn()
+            im.TextUnformatted("1")
+            im.TableNextColumn()
+            im.TextWrapped("2")
+            im.EndTable()
+        im.PushStyleVar(im.ImGuiStyleVar_FramePadding, (2.0, 2.0))
+        im.PushStyleVarX(im.ImGuiStyleVar_ItemSpacing, 3.0)
+        seen["size"] = im.CalcTextSize("hello")
+        im.Dummy((1.0, im.GetFrameHeight()))
+        im.PopStyleVar(2)
+        seen["f"] = im.InputFloat("f", 1.5, 0.0, 0.0, "%.1f")
+        seen["i"] = im.InputInt("i", 3)
+        seen["d"] = im.DragFloat("d", 0.5, 0.05, 0.0, 1.0, "%.2f")
+        seen["deact"] = im.IsItemDeactivatedAfterEdit()
+        im.PushTextWrapPos(0.0)
+        im.TextUnformatted("wrapped")
+        im.PopTextWrapPos()
+        im.SetNextItemOpen(True, im.ImGuiCond_Once)
+        if im.TreeNodeEx("node", im.ImGuiTreeNodeFlags_DefaultOpen):
+            im.TreePop()
+        seen["x"] = im.GetCursorPosX()
+        im.End()
+    v.set_callback(cb)
+    assert v.frame()
+    v.set_callback(None)
+    v.vsync = True
+    assert seen["size"][0] > 0 and seen["f"] == (False, 1.5) and seen["i"] == (False, 3)
+    assert seen["deact"] is False
+
+
+def test_max_fps_paces_and_request_close_ends():
+    import time
+    w = viz.Viewer(headless=True, width=160, height=120, max_fps=50.0)
+    assert w.max_fps == 50.0
+    w.frame()
+    t0 = time.perf_counter()
+    for _ in range(5):
+        assert w.frame()
+    assert time.perf_counter() - t0 >= 5 * 0.02 * 0.9
+    calls = []
+
+    def cb():
+        calls.append(1)
+        w.request_close()          # from inside the callback, as a tool does
+    w.set_callback(cb)
+    w.max_fps = 0.0
+    w.run()                        # returns after the frame that asked
+    assert len(calls) == 1 and not w.frame()

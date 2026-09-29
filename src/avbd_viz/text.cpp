@@ -41,8 +41,9 @@ bool Font::load(const std::string& path, float base_px, int padding) {
 
   std::vector<uint32_t> codepoints;
   for (uint32_t c = 32; c < 127; ++c) codepoints.push_back(c);
-  for (uint32_t c : {0xB0u, 0xB1u, 0xB5u, 0xB7u, 0xD7u, 0x394u, 0x3B8u, 0x3C9u, 0x2013u, 0x2192u})
-    codepoints.push_back(c);  // ° ± µ · × Δ θ ω – →
+  for (uint32_t c : {0xB0u, 0xB1u, 0xB5u, 0xB7u, 0xD7u, 0x394u, 0x3B8u, 0x3C3u, 0x3C9u, 0x2013u, 0x2014u,
+                     0x2192u, 0x2264u, 0x2265u})
+    codepoints.push_back(c);  // ° ± µ · × Δ θ σ ω – — → ≤ ≥
 
   // Shelf-pack all glyph bitmaps into one atlas.
   atlas_w_ = 1024;
