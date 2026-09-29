@@ -113,6 +113,16 @@ bodies = sc.rigid_mesh("bodies", local_verts, vertex_body, tris, body_tri_offset
 bodies.set_poses(poses)                 # [4, B, 7] translation + xyzw quaternion
 ```
 
+Records: `avbd_viz.web.record.Recorder` is a scene backend that logs every
+update between `start(scene)` and `finish()` against a caller-driven clock
+(`tick(t)`), as tracks `(object, field) -> (t, values)`; CUDA tensors are
+copied to pinned memory without blocking. `RecordWriter(root)` writes records
+on a background thread (`<root>/<id>/meta.json, tracks.npz, summary.json`,
+the static scene once per content hash under `<root>/scenes/`, an
+`index.json`); pose tracks store never-moving bodies once and the rest as
+time-delta-coded int16. `read_record(path)` returns `(meta, record,
+summary)`. avbd-rl's side eval records every training checkpoint this way.
+
 Dragging: with `v.drag_enabled = True`, Ctrl+LMB grabs the element under the
 cursor (mesh face, tet, curve edge or point) of any structure whose
 `draggable` is true, and `v.drag` reports it every frame: `phase`

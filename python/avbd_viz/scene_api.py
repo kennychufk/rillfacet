@@ -95,6 +95,12 @@ class _Object:
     def _changed(self, what: str) -> None:
         self.scene._update(self, what)
 
+    def state(self) -> tuple:
+        """``(attrs, arrays)``: everything needed to rebuild this object,
+        as JSON-able attributes and numpy arrays (see
+        :meth:`Scene.snapshot`)."""
+        raise NotImplementedError
+
 
 class RigidMesh(_Object):
     """Rigid bodies of one simulator, drawn for ``instances`` copies (envs).
@@ -153,7 +159,8 @@ class RigidMesh(_Object):
         """Body poses ``[instances, B, 7]``. ``world_vertices``
         ``[instances * V, 3]`` (un-offset), when the caller already has them
         (a simulator's own vertex buffer), lets a backend that draws
-        vertices use them as is instead of skinning."""
+        vertices use them as is instead of skinning. It may be a
+        zero-argument callable, evaluated only by a backend that uses it."""
         self.poses = poses
         self.world_vertices = world_vertices
         self._changed("poses")
@@ -165,6 +172,21 @@ class RigidMesh(_Object):
     def set_segment_visible(self, segment: int, on: bool) -> None:
         self.segment_visible[int(segment)] = bool(on)
         self._changed("visibility")
+
+    def state(self):
+        arrays = dict(local_vertices=self.local_vertices,
+                      vertex_body=self.vertex_body.astype(np.int32),
+                      triangles=self.triangles,
+                      body_triangle_offsets=self.body_triangle_offsets
+                      .astype(np.int32),
+                      offsets=self.offsets,
+                      segment_colors=self.segment_colors,
+                      segment_visible=self.segment_visible)
+        if self.poses is not None:
+            arrays["poses"] = _host(self.poses)
+        return (dict(instances=self.instances, body_names=self.body_names,
+                     instance_names=self.instance_names, smooth=self.smooth),
+                arrays)
 
 
 class Boxes(_Object):
@@ -188,6 +210,12 @@ class Boxes(_Object):
         self._set(lo, hi, colors)
         self._changed("boxes")
 
+    def state(self):
+        arrays = dict(lo=self.lo, hi=self.hi)
+        if self.colors is not None:
+            arrays["colors"] = self.colors
+        return dict(color=self.color), arrays
+
 
 class Points(_Object):
     """Spheres at ``points`` ``[n, 3]``."""
@@ -204,6 +232,12 @@ class Points(_Object):
         self.radii = None if radii is None else _host(radii).reshape(-1)
         self._changed("points")
 
+    def state(self):
+        arrays = dict(points=self.points)
+        if self.radii is not None:
+            arrays["radii"] = self.radii
+        return dict(color=self.color, radius=self.radius), arrays
+
 
 class Polyline(_Object):
     """A tube through ``points`` ``[n, 3]``."""
@@ -218,6 +252,10 @@ class Polyline(_Object):
     def set_points(self, points) -> None:
         self.points = _host(points).reshape(-1, 3)
         self._changed("points")
+
+    def state(self):
+        return (dict(color=self.color, radius=self.radius,
+                     closed=self.closed), dict(points=self.points))
 
 
 class Labels(_Object):
@@ -254,6 +292,15 @@ class Labels(_Object):
         self.texts = [str(t) for t in texts]
         self._changed("texts")
 
+    def state(self):
+        attrs = dict(texts=self.texts, fmt=self.fmt, color=self.color,
+                     align=self.align, world_height=self.world_height,
+                     size_px=self.size_px)
+        arrays = dict(anchors=self.anchors)
+        if self.values is not None:
+            arrays["values"] = self.values
+        return attrs, arrays
+
     def strings(self) -> list:
         if self.texts is not None:
             return self.texts
@@ -274,7 +321,7 @@ class Backend:
     def create(self, obj) -> None: ...
     def update(self, obj, what: str) -> None: ...
     def remove(self, name: str) -> None: ...
-    def set_channels(self, channels: dict) -> None: ...
+    def set_channels(self, channels: dict) -> None: ...   # the changed ones
     def look_at(self, eye, target) -> None: ...
     def draw_overlay(self, labels) -> None: ...
 
@@ -299,6 +346,20 @@ class Scene:
             backend.look_at(*self.camera)
         if self.channels:
             backend.set_channels(self.channels)
+
+    def snapshot(self) -> dict:
+        """The whole scene as data: ``{"objects": [{"kind", "name",
+        "attrs", "arrays"}], "camera": (eye, target) | None, "channels":
+        {name: array}}`` (host numpy arrays, JSON-able attrs). What a
+        backend attached late, a record or a web client starts from."""
+        objs = []
+        for o in self.objects.values():
+            attrs, arrays = o.state()
+            objs.append(dict(kind=o.kind, name=o.name, attrs=attrs,
+                             arrays=arrays))
+        return dict(objects=objs, camera=self.camera,
+                    channels={k: (v if np.isscalar(v) else _host(v))
+                              for k, v in self.channels.items()})
 
     def backend(self, cls):
         """The first attached backend of type ``cls``, or None."""
@@ -345,11 +406,14 @@ class Scene:
     # -- per frame ----------------------------------------------------------
 
     def set_channels(self, **channels) -> None:
-        """Named values (per-env arrays or scalars) for panels and plots."""
-        for k, v in channels.items():
-            self.channels[k] = v if np.isscalar(v) else _host(v)
+        """Named values (per-env arrays or scalars) for panels and plots.
+        Backends are sent the channels passed here; :attr:`channels` keeps
+        the latest value of every channel."""
+        changed = {k: (v if np.isscalar(v) else _host(v))
+                   for k, v in channels.items()}
+        self.channels.update(changed)
         for b in self.backends:
-            b.set_channels(self.channels)
+            b.set_channels(changed)
 
     def look_at(self, eye, target) -> None:
         self.camera = (tuple(map(float, eye)), tuple(map(float, target)))
@@ -476,7 +540,8 @@ class NativeBackend(Backend):
         """``[instances * V, 3]`` world vertices, grid offsets applied."""
         V = len(obj.local_vertices)
         if obj.world_vertices is not None:
-            w = _host(obj.world_vertices).reshape(obj.instances, V, 3)
+            wv = obj.world_vertices
+            w = _host(wv() if callable(wv) else wv).reshape(obj.instances, V, 3)
         elif obj.poses is not None:
             poses = obj.poses
             if hasattr(poses, "detach"):          # skin on the pose device
