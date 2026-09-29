@@ -123,6 +123,22 @@ the static scene once per content hash under `<root>/scenes/`, an
 time-delta-coded int16. `read_record(path)` returns `(meta, record,
 summary)`. avbd-rl's side eval records every training checkpoint this way.
 
+Web viewer: `avbd_viz.web.server.VizServer(host, port)` serves the browser
+client (WebGPU, `web/`) and streams scenes over a WebSocket from inside a
+running process, on one port. A `StreamBackend(server.stream("live"))` scene
+backend commits frames when `wanted()` — a browser is connected and ready —
+so an unwatched process pays one flag check per step; frames are best
+effort (newest wins, acked by the client) and CUDA pose tensors are copied
+without blocking. The client shades with the native WGSL (shared
+`shaders/common`, `styles/studio.wgsl`) and draws rigid meshes from body-local
+vertices plus per-body poses. The built client is committed under
+`python/avbd_viz/web/static/`; rebuild it after editing `web/`:
+
+```bash
+cd web && npm install && npm run build     # typecheck + bundle into the package
+npm run dev                                # dev server, proxies /ws to :8080
+```
+
 Dragging: with `v.drag_enabled = True`, Ctrl+LMB grabs the element under the
 cursor (mesh face, tet, curve edge or point) of any structure whose
 `draggable` is true, and `v.drag` reports it every frame: `phase`
