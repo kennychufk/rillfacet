@@ -97,6 +97,22 @@ subset (`BeginPlot`/`SetupAxis`/`PlotLine`/`SetAxes`), and `imgui.GetIO()` can
 inject input (`AddKeyEvent`, `AddMousePosEvent`, `AddMouseButtonEvent`) so a
 viewer app can be driven headlessly from a test.
 
+Backend-neutral scenes: `avbd_viz.scene_api.Scene` describes what to show,
+split by how often it changes: rigid meshes (body-local vertices once, one
+pose per instance and body per frame), boxes, points, polylines, labels
+(fixed texts, or values a backend formats with `fmt`) and named channels.
+`NativeBackend(viewer)` mirrors it into a viewer (`scene.draw_overlay()` from
+the callback for the labels); the web viewer's stream and recorder backends
+take the same calls, and a backend added later is sent the whole scene.
+
+```python
+from avbd_viz.scene_api import NativeBackend, Scene
+sc = Scene(NativeBackend(v))
+bodies = sc.rigid_mesh("bodies", local_verts, vertex_body, tris, body_tri_offsets,
+                       instances=4, offsets=grid)
+bodies.set_poses(poses)                 # [4, B, 7] translation + xyzw quaternion
+```
+
 Dragging: with `v.drag_enabled = True`, Ctrl+LMB grabs the element under the
 cursor (mesh face, tet, curve edge or point) of any structure whose
 `draggable` is true, and `v.drag` reports it every frame: `phase`
