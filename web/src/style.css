@@ -16,17 +16,38 @@
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
   font: 12px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
 #view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
-#panel { position: fixed; top: 12px; left: 12px; width: min(420px, calc(100vw - 24px));
-  max-height: calc(100vh - 24px); overflow: auto; background: var(--panel);
-  border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+#panel { position: fixed; top: calc(12px + var(--top-h, 44px)); right: 12px; width: min(400px, calc(100vw - 24px));
+  max-height: calc(100vh - 36px - var(--top-h, 44px) - var(--bar-h, 0px)); overflow: auto; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px 10px; }
 #panel h3 { margin: 10px 0 4px; font-size: 11px; font-weight: 600; color: var(--muted);
   text-transform: uppercase; letter-spacing: 0.04em; }
-.head { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
-.head.ok .dot { background: var(--ok); }
-.head.wait .dot { background: var(--wait); }
-.head.bad .dot { background: var(--bad); }
-.clock { color: var(--muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
+/* top bar: status, live controls, commands */
+#top { position: fixed; top: 12px; left: 12px; right: 12px; display: flex; align-items: center; gap: 12px;
+  flex-wrap: wrap; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+#top .status { display: flex; align-items: baseline; gap: 8px; min-width: 0; flex: 1; }
+#top .title { font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#top .clock { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#top .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+#top label { color: var(--muted); display: flex; align-items: center; gap: 4px; }
+#top button, #top select { font: inherit; color: var(--text); background: #2a2c31;
+  border: 1px solid var(--line); border-radius: 5px; padding: 2px 8px; cursor: pointer; }
+#top button:disabled, #top select:disabled { opacity: 0.35; cursor: default; }
+#top button:focus-visible, #top select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); align-self: center; flex: none; }
+#top.ok .dot { background: var(--ok); }
+#top.wait .dot { background: var(--wait); }
+#top.bad .dot { background: var(--bad); }
+.focus-head .oc { font-weight: 600; text-transform: none; letter-spacing: 0; margin-left: 6px; }
+.spark-row { display: grid; grid-template-columns: minmax(0, 1fr) 5.5em 96px; align-items: center; gap: 8px;
+  padding: 1px 0; }
+.spark-row .k { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.spark-row .v { text-align: right; font-variant-numeric: tabular-nums; }
+.spark { width: 96px; height: 18px; display: block; }
+#toasts { position: fixed; top: calc(20px + var(--top-h, 44px)); left: 50%; transform: translateX(-50%);
+  display: flex; flex-direction: column; gap: 6px; align-items: center; pointer-events: none; z-index: 10; }
+.toast { background: #25303d; border: 1px solid var(--accent); border-radius: 6px; padding: 6px 12px;
+  max-width: min(560px, calc(100vw - 32px)); }
+.toast.error { background: #3a1f1d; border-color: var(--bad); }
 table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
 td, th { padding: 2px 6px; text-align: left; white-space: nowrap; }
 th { color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); }
@@ -38,7 +59,6 @@ tr.focus { background: rgba(77, 143, 214, 0.25); }
 .empty { color: var(--muted); }
 #error { display: none; position: fixed; inset: auto 12px 12px 12px; padding: 10px 12px;
   background: #3a1f1d; border: 1px solid var(--bad); border-radius: 8px; }
-#panel { max-height: calc(100vh - 24px - var(--bar-h, 0px)); }
 
 /* bottom bar: mode switch, eval timeline, episode scrubber */
 #bar { position: fixed; left: 12px; right: 12px; bottom: 12px; background: var(--panel);
@@ -65,3 +85,28 @@ tr.focus { background: rgba(77, 143, 214, 0.25); }
 .plot { width: 100%; height: 56px; display: block; cursor: col-resize; touch-action: none;
   background: rgba(0, 0, 0, 0.2); border-radius: 4px; }
 td.oc { font-weight: 500; }
+
+/* golden-image captures (tools/golden.py): the 3D view alone */
+body.bare #panel, body.bare #display, body.bare #bar, body.bare #top, body.bare #toasts, body.bare #error { display: none !important; }
+
+/* Display popover (style, shadows, slice plane, per-object opacity) */
+#display { position: fixed; top: calc(12px + var(--top-h, 44px)); left: 12px; width: min(330px, calc(100vw - 24px));
+  max-height: calc(100vh - 36px - var(--top-h, 44px) - var(--bar-h, 0px)); overflow: auto; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px 10px; z-index: 5; }
+#display[hidden] { display: none; }
+#display h3 { margin: 10px 0 4px; font-size: 11px; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.04em; }
+.d-row { display: grid; grid-template-columns: 7.5em minmax(0, 1fr) 4.8em; align-items: center; gap: 6px; padding: 2px 0; }
+.d-row select { grid-column: 2 / 4; }
+.d-row output { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+.d-row input[type=range] { width: 100%; accent-color: var(--accent); }
+.d-check { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
+.d-check input, .d-axes input { accent-color: var(--accent); }
+.d-axes { display: flex; gap: 14px; padding: 2px 0 2px 7.5em; }
+.d-object { border-top: 1px solid var(--line); padding: 4px 0; }
+.d-name { font-weight: 600; padding: 2px 0; }
+#display select, #display button { font: inherit; color: var(--text); background: #2a2c31;
+  border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px; }
+#display :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.d-reset { margin-top: 8px; cursor: pointer; }
+#top button[aria-expanded=true] { background: var(--accent); border-color: var(--accent); color: #fff; }

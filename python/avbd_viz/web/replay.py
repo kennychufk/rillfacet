@@ -34,7 +34,7 @@ import numpy as np
 from .record import encode_poses, read_index, read_record
 
 __all__ = ["ReplayData", "EvalLibrary", "RingMailbox", "CHUNK_TICKS",
-           "decode_chunk", "main"]
+           "decode_chunk", "build_scene", "set_state", "main"]
 
 #: Pose samples per ``replay_chunk``.
 CHUNK_TICKS = 256
@@ -128,6 +128,62 @@ def decode_chunk(msg: dict) -> np.ndarray:
     d = np.frombuffer(zlib.decompress(msg["data"].tobytes()), "<i2")
     d = d.reshape([msg["count"], *msg["shape"]])
     return np.cumsum(d, axis=0, dtype=np.int16)
+
+
+def build_scene(scene, snapshot: dict) -> None:
+    """Recreate a record's start ``snapshot`` (``Scene.snapshot()``) in
+    ``scene`` (any backends). Dynamic state comes from :func:`set_state`."""
+    for o in snapshot["objects"]:
+        k, n, at, ar = o["kind"], o["name"], o["attrs"], o["arrays"]
+        if k == "rigid_mesh":
+            m = scene.rigid_mesh(n, ar["local_vertices"], ar["vertex_body"],
+                                 ar["triangles"], ar["body_triangle_offsets"],
+                                 instances=at["instances"],
+                                 offsets=ar["offsets"],
+                                 body_names=at["body_names"],
+                                 instance_names=at["instance_names"],
+                                 smooth=at["smooth"])
+            m.segment_colors[:] = ar["segment_colors"]
+            m.segment_visible[:] = ar["segment_visible"]
+            m._changed("colors")
+            m._changed("visibility")
+        elif k == "boxes":
+            scene.boxes(n, ar["lo"], ar["hi"], color=at["color"],
+                        colors=ar.get("colors"))
+        elif k == "points":
+            scene.points(n, ar["points"], at["color"], at["radius"])
+        elif k == "polyline":
+            scene.polyline(n, ar["points"], at["color"], at["radius"],
+                           at["closed"])
+        elif k == "labels":
+            scene.labels(n, ar["anchors"], texts=at["texts"], fmt=at["fmt"],
+                         color=at["color"], align=at["align"],
+                         world_height=at["world_height"],
+                         size_px=at["size_px"])
+    if snapshot.get("camera"):
+        scene.look_at(*snapshot["camera"])
+
+
+def set_state(scene, record, t: int) -> None:
+    """Set every tracked field of ``scene`` (built by :func:`build_scene`) to
+    its value at tick ``t``: the latest sample at or before ``t``."""
+    at = {}
+    for (obj, field), (tt, v) in record.tracks.items():
+        i = max(int(np.searchsorted(tt, t, side="right")) - 1, 0)
+        at[(obj, field)] = v[i]
+    for name, o in scene.objects.items():
+        if o.kind == "rigid_mesh" and (name, "poses") in at:
+            o.set_poses(at[(name, "poses")])
+        elif o.kind == "boxes" and (name, "lo") in at:
+            o.set_boxes(at[(name, "lo")], at[(name, "hi")],
+                        colors=at.get((name, "colors")))
+        elif o.kind == "labels" and (name, "values") in at:
+            o.set_values(at[(name, "values")])
+        elif o.kind in ("points", "polyline") and (name, "points") in at:
+            o.set_points(at[(name, "points")])
+    ch = {f: v for (obj, f), v in at.items() if obj == "channels"}
+    if ch:
+        scene.set_channels(**ch)
 
 
 class EvalLibrary:

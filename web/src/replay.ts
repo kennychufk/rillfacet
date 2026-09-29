@@ -5,6 +5,7 @@
 // {object: {field: Arr}} shape as a live frame, so the renderer and panel
 // take it as is.
 import { type Arr, type TypedArray } from "./protocol";
+import type { Series, SeriesSource } from "./panel";
 import { type SceneObject } from "./renderer";
 import { type Vec3 } from "./math";
 
@@ -284,4 +285,34 @@ export class Replay {
   }
 
   resetCache() { this.cache.clear(); }
+
+  // Sparklines: each channel over the episode (per env: up to its end),
+  // the cursor at tick t.
+  series(t: number): SeriesSource {
+    const find = (name: string) =>
+      this.msg.tracks.find((tr) => tr.object === "channels" && tr.field === name && tr.values);
+    return {
+      scalar: (name) => {
+        const tr = find(name);
+        if (!tr || tr.values!.shape.length !== 1) return null;
+        return { data: tr.values!.data, cursor: lastAtOrBefore(tr.t.data, t) };
+      },
+      perEnv: (name, env) => {
+        const tr = find(name);
+        const n = this.numEnvs;
+        if (!tr || tr.values!.shape.length !== 2 || tr.values!.shape[1] !== n) return null;
+        const key = `${name}/${env}`;
+        let s = this.columns.get(key);
+        if (!s) {
+          const K = lastAtOrBefore(tr.t.data, this.endStep[env]) + 1;
+          const d = new Float32Array(K);
+          for (let k = 0; k < K; k++) d[k] = tr.values!.data[k * n + env];
+          this.columns.set(key, (s = { data: d, cursor: null }));
+        }
+        return { data: s.data, cursor: lastAtOrBefore(tr.t.data, Math.min(t, this.endStep[env])) };
+      },
+    };
+  }
+
+  private columns = new Map<string, Series>();
 }

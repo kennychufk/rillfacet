@@ -26,6 +26,12 @@ is False while nobody is connected, so an unwatched run pays nothing.
 Frames carry the whole dynamic state (not deltas), so a dropped frame
 loses nothing. A client connecting mid-run gets the latest scene first.
 
+Requests: :meth:`VizServer.accept` names the browser requests the
+producer handles (e.g. "save_checkpoint", "run_eval", "select_envs");
+they queue up until it calls :meth:`VizServer.take_requests` from its own
+thread (between training steps), and it can answer with
+:meth:`VizServer.event` toasts.
+
 Replay (:mod:`avbd_viz.web.replay`): with ``evals=`` (a records directory)
 clients are sent the eval index, again whenever it changes, and can open
 any eval; with :attr:`VizServer.ring` (a :class:`~.replay.RingMailbox`)
@@ -130,6 +136,9 @@ class Stream:
         self._last_commit = 0.0
         self.scene_requested = False
         self.commits = 0
+        #: JSON-able facts about the stream sent with its scene (e.g.
+        #: ``envs`` shown and ``env_total``); set before the next commit.
+        self.info: dict = {}
 
     # -- producer (the caller's thread) ---------------------------------------
 
@@ -152,7 +161,8 @@ class Stream:
         with self._lock:
             if scene is not None:
                 self.scene_version += 1
-                self._scene_msg = dict(scene, type="scene", stream=self.name,
+                self._scene_msg = dict(scene, info=dict(self.info),
+                                       type="scene", stream=self.name,
                                        version=self.scene_version)
                 self._scene_bytes = None
                 self.scene_requested = False
@@ -208,6 +218,9 @@ class VizServer:
         self.evals = EvalLibrary(evals) if evals else None
         self._evals_dirty = False
         self.ring = None
+        self.accepted: set = set()
+        self._requests: list = []
+        self._req_lock = threading.Lock()
         self.streams: dict = {}
         self._loop = None
         self._server = None
@@ -236,6 +249,38 @@ class VizServer:
     def url(self) -> str:
         host = socket.gethostname() if self.host in ("0.0.0.0", "") else self.host
         return f"http://{host}:{self.port}/"
+
+    def accept(self, *kinds: str) -> None:
+        """Queue browser requests of these types for :meth:`take_requests`
+        (clients connecting later are told which are available)."""
+        self.accepted.update(kinds)
+
+    def take_requests(self) -> list:
+        """Pending browser requests (``{"type", ...}`` dicts), oldest first.
+        Cheap when there are none; call from the producing thread."""
+        if not self._requests:
+            return []
+        with self._req_lock:
+            out, self._requests = self._requests, []
+        return out
+
+    def event(self, text: str, level: str = "info") -> None:
+        """Show ``text`` as a toast in every connected client (any thread)."""
+        loop = self._loop
+        if loop is None:
+            return
+        data = encode(dict(type="event", level=level, text=str(text)))
+
+        async def send():
+            for c in list(self._clients):
+                try:
+                    await c.conn.send(data)
+                except Exception:                  # noqa: BLE001 (closed)
+                    pass
+        try:
+            asyncio.run_coroutine_threadsafe(send(), loop)
+        except RuntimeError:                       # loop closed
+            pass
 
     def offer_evals(self, root: str) -> None:
         """Offer the records under ``root`` for replay (it may not exist
@@ -337,7 +382,8 @@ class VizServer:
             streams=[dict(name=s.name, kind=s.kind)
                      for s in self.streams.values()],
             replay=dict(evals=self.evals is not None,
-                        ring=self.ring is not None))))
+                        ring=self.ring is not None),
+            accepts=sorted(self.accepted))))
         if self.evals is not None:
             await conn.send(self._evals_msg(self.evals.entries))
         sender = asyncio.create_task(self._send_loop(client, subs))
@@ -350,6 +396,10 @@ class VizServer:
                 except ValueError:
                     continue
                 kind = m.get("type")
+                if kind in self.accepted:
+                    with self._req_lock:
+                        self._requests.append(m)
+                    continue
                 if kind == "open_replay":
                     if client.replay_task is not None:
                         client.replay_task.cancel()

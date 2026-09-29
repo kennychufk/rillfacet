@@ -39,13 +39,21 @@ class Font {
   int atlas_height() const { return atlas_h_; }
   const std::vector<uint8_t>& atlas() const { return atlas_; }
 
- private:
+  // Metrics, for clients that lay out text themselves (the web viewer).
+  float base_px() const { return base_px_; }
+  float ascent() const { return ascent_; }
+  float line_height() const { return line_height_; }
+  float sdf_per_px() const { return sdf_per_px_; }
+
   struct Glyph {
     glm::vec4 uv;        // atlas rect
     glm::vec2 offset;    // top-left relative to the pen (base px, y down)
     glm::vec2 size;      // base px
     float advance = 0;   // base px
   };
+  const std::unordered_map<uint32_t, Glyph>& glyphs() const { return glyphs_; }
+
+ private:
   const Glyph* find(uint32_t codepoint) const;
 
   std::unordered_map<uint32_t, Glyph> glyphs_;

@@ -2,40 +2,55 @@
 // training process, or a replay server). Modes: Live (the "live" stream),
 // Training ring (the trainer's last episode per streamed env) and Evals
 // (saved evals, picked on the outer timeline); the replay modes play a
-// Replay under the episode scrubber.
+// Replay under the episode scrubber. Click an env to focus it, double-click
+// to show it alone (Esc: back to all).
 import "./style.css";
-import { Panel, type StreamStats } from "./panel";
+import { LiveHistory, Panel, type SeriesSource, type StreamStats } from "./panel";
 import { type Arr, decode } from "./protocol";
-import { Renderer, type SceneObject } from "./renderer";
+import { applyStyleDefaults, defaultSettings, Renderer, type SceneObject } from "./renderer";
 import { type Vec3 } from "./math";
 import { envOutcome, OUTCOMES, Replay, type ChunkMsg, type ReplayMsg } from "./replay";
 import { type EvalEntry, type Mode, Timeline } from "./timeline";
+import { DisplayPanel } from "./display";
 
 const STREAM = "live";
-const RATE = 20;
 
-const canvas = document.getElementById("view") as HTMLCanvasElement;
-const panel = new Panel(document.getElementById("panel")!);
-const bar = document.getElementById("bar")!;
+const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+const canvas = $<HTMLCanvasElement>("view");
+const top = $("top");
+const panel = new Panel($("panel"));
+const bar = $("bar");
 const timeline = new Timeline(bar);
-const errorEl = document.getElementById("error")!;
+const errorEl = $("error");
+const envSel = $<HTMLSelectElement>("envs");
+const rateSel = $<HTMLSelectElement>("rate");
+const saveBtn = $<HTMLButtonElement>("save");
+const evalBtn = $<HTMLButtonElement>("eval");
 
-const stats: StreamStats & { mode: Mode; replay: unknown } = {
+const stats: StreamStats & { mode: Mode; replay: unknown; focus: number; isolated: number } = {
   status: "connecting", name: "", time: null, frames: 0, dropped: 0, fps: 0, lastFrameAt: 0,
-  mode: "live", replay: null,
+  mode: "live", replay: null, focus: -1, isolated: -1,
 };
-// For automated checks (e.g. a CDP screenshot harness).
+// For automated checks (e.g. a CDP screenshot harness), with console errors.
 (window as unknown as { __avbd: unknown }).__avbd = stats;
 (window as unknown as { __timeline: unknown }).__timeline = timeline;
+const errors: string[] = [];
+(stats as unknown as { errors: string[] }).errors = errors;
+const consoleError = console.error.bind(console);
+console.error = (...a: unknown[]) => {
+  if (errors.length < 20) errors.push(a.map(String).join(" "));
+  consoleError(...a);
+};
 
-type SceneMsg = { objects: SceneObject[]; camera: [Vec3, Vec3] | null };
+type SceneMsg = { objects: SceneObject[]; camera: [Vec3, Vec3] | null; info?: { envs?: number[]; env_total?: number } };
 
 let renderer: Renderer | null = null;
+let display: DisplayPanel | null = null;
 let dirty = true;
 let pendingAck: number | null = null;
 let lastSeq = 0;
 let numEnvs = 0;
-let offsets: Float32Array | null = null;
+let envNames: number[] | undefined;
 let sceneCamera: [Vec3, Vec3] | null = null;
 let cameraSet = false;
 let ws: WebSocket | null = null;
@@ -43,23 +58,27 @@ let ws: WebSocket | null = null;
 let hasLive = false;
 let hasRing = false;
 let hasEvals = false;
+let accepts: string[] = [];
 let subscribed = false;
+let rate = Number(rateSel.value);
 let liveScene: SceneMsg | null = null;
+let liveChannels: Record<string, number | Arr> = {};
+const history = new LiveHistory();
 let replay: Replay | null = null;
 let replayRequests = 0; // the server numbers replays per connection, in order
 let lastPanel = 0;
-let toastTimer = 0;
 
 function fail(msg: string) {
   errorEl.textContent = msg;
   errorEl.style.display = "block";
 }
 
-function toast(msg: string) {
-  errorEl.textContent = msg;
-  errorEl.style.display = "block";
-  clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => (errorEl.style.display = "none"), 6000);
+function toast(msg: string, level = "info") {
+  const el = document.createElement("div");
+  el.className = `toast ${level}`;
+  el.textContent = msg;
+  $("toasts").append(el);
+  setTimeout(() => el.remove(), level === "error" ? 9000 : 5000);
 }
 
 function send(m: object) {
@@ -70,20 +89,24 @@ function send(m: object) {
 
 function showScene(msg: SceneMsg) {
   renderer!.setScene(msg.objects);
-  const rigid = msg.objects.find((o) => o.kind === "rigid_mesh");
-  numEnvs = rigid ? rigid.attrs.instances : 0;
-  offsets = rigid ? (rigid.arrays.offsets.data as Float32Array) : null;
+  const rigid = renderer!.rigidInfo();
+  numEnvs = rigid ? rigid.instances : 0;
   if (msg.camera) sceneCamera = msg.camera;
   if (msg.camera && !cameraSet) {
     renderer!.camera.lookAt(msg.camera[0], msg.camera[1]);
     cameraSet = true;
   }
+  if (stats.focus >= numEnvs) stats.focus = -1;
+  stats.isolated = -1;
+  applyEnvState();
+  display?.sceneChanged();
   dirty = true;
 }
 
 // A scene without a camera: frame the body origins of the first poses.
 function frameOnce(objects: Record<string, Record<string, Arr>>) {
   if (cameraSet) return;
+  const off = renderer!.rigidInfo()?.offsets;
   const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
   for (const f of Object.values(objects)) {
     const p = f.poses;
@@ -92,7 +115,7 @@ function frameOnce(objects: Record<string, Record<string, Arr>>) {
     for (let e = 0; e < n; e++)
       for (let b = 0; b < B; b++)
         for (let k = 0; k < 3; k++) {
-          const x = p.data[(e * B + b) * 7 + k] + (offsets ? offsets[3 * e + k] : 0);
+          const x = p.data[(e * B + b) * 7 + k] + (off ? off[4 * e + k] : 0);
           lo[k] = Math.min(lo[k], x);
           hi[k] = Math.max(hi[k], x);
         }
@@ -106,19 +129,136 @@ function frameOnce(objects: Record<string, Record<string, Arr>>) {
   cameraSet = true;
 }
 
+// -- focus / isolate ----------------------------------------------------------
+
+let fly: { from: Vec3; to: Vec3; d0: number; d1: number; t0: number } | null = null;
+
+function envCenter(env: number): Vec3 | null {
+  const r = renderer?.rigidInfo();
+  if (!r || env < 0 || env >= r.instances) return null;
+  const c: Vec3 = sceneCamera ? sceneCamera[1] : [0, 0, 1];
+  return [r.offsets[4 * env] + c[0], r.offsets[4 * env + 1] + c[1], r.offsets[4 * env + 2] + c[2]];
+}
+
+function flyTo(target: Vec3, distance: number) {
+  const c = renderer!.camera;
+  fly = { from: [...c.target], to: target, d0: c.distance, d1: distance, t0: performance.now() };
+}
+
+function applyEnvState() {
+  renderer?.setEnvState(stats.isolated, stats.focus);
+  panel.focus = stats.focus;
+  timeline.focus = stats.focus;
+  timeline.drawPlot();
+  refreshPanel(true);
+  dirty = true;
+}
+
+function focusEnv(env: number, move = true) {
+  stats.focus = env;
+  applyEnvState();
+  if (!renderer || !move) return;
+  const c = envCenter(env);
+  if (c) flyTo(c, Math.min(renderer.camera.distance, 2.5));
+  else if (sceneCamera && stats.isolated < 0) {
+    const [eye, t] = sceneCamera;
+    flyTo([...t], Math.hypot(eye[0] - t[0], eye[1] - t[1], eye[2] - t[2]));
+  }
+}
+
+function isolateEnv(env: number) {
+  stats.isolated = stats.isolated === env ? -1 : env;
+  if (env >= 0) stats.focus = env;
+  applyEnvState();
+  const c = envCenter(stats.isolated >= 0 ? stats.isolated : stats.focus);
+  if (c && renderer) flyTo(c, Math.min(renderer.camera.distance, 2.5));
+}
+
+panel.onFocus = (env) => focusEnv(env);
+
+// Click (no drag) picks an env; double-click shows it alone.
+{
+  let down: [number, number] | null = null;
+  let clickTimer = 0;
+  canvas.addEventListener("pointerdown", (e) => (down = [e.clientX, e.clientY]));
+  canvas.addEventListener("pointerup", async (e) => {
+    if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 4 || e.button !== 0) return;
+    down = null;
+    const r = canvas.getBoundingClientRect();
+    const hit = await renderer?.pick(e.clientX - r.left, e.clientY - r.top);
+    const rigid = renderer?.rigidInfo();
+    const env = hit && rigid && hit.object === rigid.name ? Math.floor(hit.segment / rigid.bodies) : -1;
+    if (e.detail >= 2) {
+      clearTimeout(clickTimer);
+      if (env >= 0) isolateEnv(env);
+    } else {
+      clickTimer = window.setTimeout(() => focusEnv(env, env >= 0 || stats.focus >= 0), 220);
+    }
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    stats.isolated = -1;
+    focusEnv(-1);
+  });
+}
+
+// -- top bar ------------------------------------------------------------------
+
+function renderTop() {
+  const live = stats.mode === "live";
+  for (const el of top.querySelectorAll<HTMLElement>(".live-only")) el.style.display = live && hasLive ? "" : "none";
+  envSel.disabled = !accepts.includes("select_envs");
+  saveBtn.style.display = accepts.includes("save_checkpoint") ? "" : "none";
+  evalBtn.style.display = accepts.includes("run_eval") ? "" : "none";
+}
+
+function setEnvOptions(info: SceneMsg["info"]) {
+  const envs = info?.envs, total = info?.env_total;
+  if (!envs?.length || !total) {
+    envSel.innerHTML = "";
+    return;
+  }
+  const n = envs.length;
+  const opts: string[] = [];
+  for (let first = 0; first < total; first += n) {
+    const f = Math.min(first, total - n);
+    opts.push(`<option value="${f}">${f}–${f + n - 1} of ${total}</option>`);
+    if (f + n >= total) break;
+  }
+  envSel.innerHTML = opts.join("");
+  envSel.value = String(envs[0]);
+}
+
+envSel.addEventListener("change", () => send({ type: "select_envs", first: Number(envSel.value) }));
+rateSel.addEventListener("change", () => {
+  rate = Number(rateSel.value);
+  if (subscribed) send({ type: "subscribe", stream: STREAM, rate });
+});
+for (const [btn, type] of [[saveBtn, "save_checkpoint"], [evalBtn, "run_eval"]] as const) {
+  btn.addEventListener("click", () => {
+    send({ type });
+    btn.disabled = true;
+    setTimeout(() => (btn.disabled = false), 2000);
+  });
+}
+
 // -- modes ------------------------------------------------------------------
 
 function setMode(m: Mode) {
   stats.mode = m;
   timeline.setMode(m);
+  renderTop();
   if (m === "live") {
     replay = null;
     timeline.setReplay(null);
     if (!subscribed && hasLive) {
-      send({ type: "subscribe", stream: STREAM, rate: RATE });
+      send({ type: "subscribe", stream: STREAM, rate });
       subscribed = true;
     }
-    if (liveScene) showScene(liveScene);
+    if (liveScene) {
+      envNames = liveScene.info?.envs;
+      showScene(liveScene);
+    }
     return;
   }
   // Replay modes: no live frames needed (the trainer then pays nothing).
@@ -159,6 +299,7 @@ function onReplay(msg: ReplayMsg) {
   const r = new Replay(msg);
   replay = r;
   stats.replay = { id: msg.id, source: msg.source, name: msg.name, duration: msg.duration, chunks: r.chunksTotal };
+  envNames = msg.meta.envs;
   showScene(msg.scene);
   timeline.setReplay(r);
   r.onChunk = () => {
@@ -172,7 +313,7 @@ function onReplay(msg: ReplayMsg) {
   applyReplay(true);
 }
 
-function outcomeText(): string {
+function replayText(): string {
   const r = replay;
   if (!r) return stats.mode === "ring" ? "asking the trainer for its latest episodes…" : "loading…";
   const b = r.msg.summary.batch ?? {};
@@ -187,6 +328,8 @@ function outcomeText(): string {
   return `${ck ? ck + " · " : ""}seed ${r.msg.meta.seed ?? "?"}${mix ? " · " + mix : ""}`;
 }
 
+let replaySample: { channels: Record<string, number | Arr> } | null = null;
+
 function applyReplay(all = false) {
   const r = replay;
   if (!r || !renderer) return;
@@ -194,17 +337,30 @@ function applyReplay(all = false) {
   const s = r.sample(timeline.t, all);
   frameOnce(s.objects);
   renderer.applyFrame(s.objects);
-  const now = performance.now();
-  if (all || now - lastPanel > 100) {
-    lastPanel = now;
-    const outcomes = r.msg.summary.envs?.map((e) => envOutcome(e)) ?? [];
-    const ended = r.endStep.map((e) => timeline.t >= e);
-    // The episode's summary rates and means as the batch numbers.
-    for (const [k, v] of Object.entries(r.msg.summary.batch ?? {}))
-      if (typeof v === "number") s.channels[`episode ${k}`] = v;
-    panel.setChannels(s.channels, r.numEnvs, outcomes, ended);
-  }
+  // The episode's summary rates and means as the batch numbers.
+  for (const [k, v] of Object.entries(r.msg.summary.batch ?? {}))
+    if (typeof v === "number") s.channels[`episode ${k}`] = v;
+  replaySample = s;
+  refreshPanel(all);
   dirty = true;
+}
+
+function refreshPanel(force = false) {
+  const now = performance.now();
+  if (!force && now - lastPanel < 100) return;
+  lastPanel = now;
+  if (stats.mode === "live") {
+    panel.update({ channels: liveChannels, numEnvs, envNames, series: history });
+    return;
+  }
+  const r = replay;
+  if (!r || !replaySample) return;
+  const series: SeriesSource = r.series(timeline.t);
+  panel.update({
+    channels: replaySample.channels, numEnvs: r.numEnvs, envNames,
+    outcomes: r.msg.summary.envs?.map((e) => envOutcome(e)) ?? [],
+    ended: r.endStep.map((e) => timeline.t >= e), series,
+  });
 }
 
 timeline.onMode = setMode;
@@ -228,7 +384,9 @@ function onFrame(msg: {
   stats.time = msg.time;
   frameOnce(msg.objects);
   renderer!.applyFrame(msg.objects);
-  panel.setChannels(msg.channels, numEnvs);
+  liveChannels = msg.channels;
+  history.push(msg.channels, numEnvs);
+  refreshPanel();
   dirty = true;
 }
 
@@ -246,6 +404,7 @@ function connect() {
       hasLive = msg.streams.some((s: { name: string }) => s.name === STREAM);
       hasRing = !!msg.replay?.ring;
       hasEvals = !!msg.replay?.evals;
+      accepts = msg.accepts ?? [];
       subscribed = false;
       replayRequests = 0;
       timeline.setAvailable(hasLive, hasRing, hasEvals);
@@ -254,8 +413,14 @@ function connect() {
       setMode(m);
     } else if (msg.type === "scene") {
       stats.status = "live";
+      const changed = liveScene?.info?.envs?.[0] !== msg.info?.envs?.[0];
       liveScene = msg;
-      if (stats.mode === "live") showScene(msg);
+      setEnvOptions(msg.info);
+      if (changed) history.clear();
+      if (stats.mode === "live") {
+        envNames = msg.info?.envs;
+        showScene(msg);
+      }
     } else if (msg.type === "frame") {
       onFrame(msg);
     } else if (msg.type === "evals") {
@@ -270,7 +435,7 @@ function connect() {
       const c = msg as ChunkMsg;
       if (replay && c.id === replay.id) replay.addChunk(c);
     } else if (msg.type === "event") {
-      toast(msg.text);
+      toast(msg.text, msg.level);
     }
   };
   ws.onclose = () => {
@@ -281,31 +446,83 @@ function connect() {
   };
 }
 
-panel.onFocus = (env) => {
-  timeline.focus = env;
-  timeline.drawPlot();
-  if (!renderer) return;
-  if (env < 0 || !offsets) {
-    if (sceneCamera) renderer.camera.lookAt(sceneCamera[0], sceneCamera[1]);
-  } else {
-    // Keep the view direction, move onto the env's grid cell.
-    const c = renderer.camera;
-    const center: Vec3 = sceneCamera ? sceneCamera[1] : [0, 0, 1];
-    c.target = [offsets[3 * env] + center[0], offsets[3 * env + 1] + center[1], offsets[3 * env + 2] + center[2]];
-    c.distance = Math.min(c.distance, 2.5);
+// Golden-image hook (tools/golden.py): eval `id` at tick `t` seen from
+// eye -> target, UI hidden, display settings reset to the defaults plus
+// `disp` ({style, ...settings, slice, objects: {name: ObjectDisplay}});
+// resolves once that frame is on screen.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+(window as unknown as { __golden: unknown }).__golden = async (id: string, t: number, eye: Vec3, target: Vec3, disp: any = {}) => {
+  document.body.classList.add("bare");
+  const r0 = renderer!;
+  const { style, slice, objects, ...rest } = disp;
+  r0.settings = defaultSettings();
+  if (style) applyStyleDefaults(r0.settings, style);
+  Object.assign(r0.settings, rest);
+  Object.assign(r0.settings.slice, slice ?? {});
+  r0.display.clear();
+  for (const [name, d] of Object.entries(objects ?? {})) Object.assign(r0.displayOf(name), d);
+  pickEval(id);
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  for (let k = 0; k < 600; k++) {
+    const r = replay;
+    if (r && r.msg.meta.id === id && r.chunksDone === r.chunksTotal) break;
+    await sleep(50);
   }
+  timeline.seek(t);
+  renderer!.camera.lookAt(eye, target);
+  cameraSet = true;
   dirty = true;
+  for (let k = 0; k < 3; k++) await new Promise((r) => requestAnimationFrame(r));
+  return replay ? "ok" : "no replay";
 };
 
-// Keep the panel clear of the bottom bar.
-new ResizeObserver(() =>
-  document.documentElement.style.setProperty("--bar-h", `${bar.offsetHeight + 12}px`)).observe(bar);
+// Keep the panel clear of the top and bottom bars.
+{
+  const ro = new ResizeObserver(() => {
+    const s = document.documentElement.style;
+    s.setProperty("--bar-h", `${bar.offsetHeight + 12}px`);
+    s.setProperty("--top-h", `${top.offsetHeight + 12}px`);
+  });
+  for (const el of [bar, top, document.body]) ro.observe(el);
+}
+
+function renderStatus() {
+  let state: string, title: string, clock: string;
+  const name = stats.name || "avbd-viz";
+  if (stats.mode === "live") {
+    const live = stats.status === "live";
+    state = live ? "ok" : stats.status === "connecting" ? "wait" : "bad";
+    title = `${name} — ${stats.status}`;
+    const age = stats.lastFrameAt ? (performance.now() - stats.lastFrameAt) / 1000 : NaN;
+    clock = `step ${stats.time ?? "–"} · ${stats.frames} frames (${stats.dropped} dropped) · ` +
+      `${stats.fps.toFixed(1)} fps · last ${Number.isFinite(age) ? age.toFixed(1) + " s" : "–"} ago`;
+  } else {
+    state = replay ? "ok" : "wait";
+    title = `${name} — ${replay ? replay.msg.name : stats.mode === "ring" ? "training ring" : "evals"}`;
+    clock = replayText();
+  }
+  top.className = state;
+  top.querySelector(".title")!.textContent = title;
+  top.querySelector(".clock")!.textContent = clock;
+}
 
 let lastT = performance.now();
 function loop(now: number) {
   const dt = Math.min(0.1, (now - lastT) / 1000);
   lastT = now;
   if (stats.mode !== "live" && timeline.advance(dt)) applyReplay();
+  if (fly && renderer) {
+    const k = Math.min(1, (now - fly.t0) / 350);
+    const e = k * k * (3 - 2 * k);
+    const c = renderer.camera;
+    for (let i = 0; i < 3; i++) c.target[i] = fly.from[i] + (fly.to[i] - fly.from[i]) * e;
+    c.distance = fly.d0 + (fly.d1 - fly.d0) * e;
+    if (k >= 1) fly = null;
+    dirty = true;
+  }
+  // Golden captures keep presenting frames, so a screenshot never finds
+  // the canvas without one.
+  if (document.body.classList.contains("bare")) dirty = true;
   if (renderer && dirty) {
     renderer.render();
     dirty = false;
@@ -314,19 +531,26 @@ function loop(now: number) {
     ws.send(JSON.stringify({ type: "ack", stream: STREAM, seq: pendingAck }));
     pendingAck = null;
   }
-  if (stats.mode === "live") panel.setStatus(stats);
-  else {
-    const title = replay ? replay.msg.name : stats.mode === "ring" ? "training ring" : "evals";
-    panel.setHeader(replay ? "ok" : "wait", `${stats.name || "avbd-viz"} — ${title}`, outcomeText());
-  }
+  renderStatus();
   requestAnimationFrame(loop);
 }
 
 Renderer.create(canvas)
   .then((r) => {
     renderer = r;
-    r.camera.attach(canvas, () => (dirty = true));
+    display = new DisplayPanel($("display"), r);
+    display.onChange = () => (dirty = true);
+    const btn = $("display-btn");
+    btn.addEventListener("click", () => {
+      display!.toggle();
+      btn.setAttribute("aria-expanded", String(display!.open));
+    });
+    r.camera.attach(canvas, () => {
+      fly = null;
+      dirty = true;
+    });
     new ResizeObserver(() => (dirty = true)).observe(canvas);
+    renderTop();
     connect();
     requestAnimationFrame(loop);
   })

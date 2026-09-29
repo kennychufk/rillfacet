@@ -15,9 +15,12 @@ uint16, uint8 (float64 goes out as float32, int64 as int32, bool as uint8).
 Messages (``type``):
 
 - ``hello``: ``version``, ``name`` (the run), ``streams`` [{"name", "kind"}],
-  ``replay`` {"evals": bool, "ring": bool} (what can be replayed).
+  ``replay`` {"evals": bool, "ring": bool} (what can be replayed),
+  ``accepts`` [request types the producer handles, e.g. "save_checkpoint",
+  "run_eval", "select_envs"].
 - ``scene``: ``stream``, ``version``, ``objects`` [{"kind", "name",
-  "attrs", "arrays"}], ``camera``, ``channels`` — a ``Scene.snapshot()``.
+  "attrs", "arrays"}], ``camera``, ``channels`` — a ``Scene.snapshot()`` —
+  and ``info`` (``Stream.info``, e.g. ``envs`` shown and ``env_total``).
 - ``frame``: ``stream``, ``seq``, ``time``, ``scene_version``, ``objects``
   {name: {field: array}} (the whole dynamic state: rigid ``poses``, box
   ``lo``/``hi``/``colors``, label ``values``, ``points``), ``channels``.
@@ -41,7 +44,10 @@ Browser -> server messages are JSON text: ``{"type": "subscribe", "stream",
 "stream", "seq"}`` (flow control: the server sends a stream's next frame
 once the previous one is acked), ``{"type": "open_replay", "source":
 "eval", "id"}`` or ``{"source": "ring"}``, and ``{"type": "replay_ack",
-"id", "n"}`` (chunks received so far).
+"id", "n"}`` (chunks received so far). Requests the producer accepts
+(``hello.accepts``) are queued for it as sent: ``{"type":
+"save_checkpoint"}``, ``{"type": "run_eval"}``, ``{"type": "select_envs",
+"first": k}``.
 """
 from __future__ import annotations
 

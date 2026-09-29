@@ -277,3 +277,32 @@ def test_ring_replay_is_built_by_the_producer(tmp_path):
             assert np.abs(pos[:, :, 0] - truth[:, :, 0, :3]).max() < 1e-4
     finally:
         srv.close()
+
+
+def test_requests_events_and_stream_info(server):
+    stream = server.stream("live")
+    backend = StreamBackend(stream)
+    sc, _ = make_scene(backend)
+    stream.info = dict(envs=[4, 5], env_total=8)
+    server.accept("run_eval", "select_envs")
+    assert server.take_requests() == []
+    with connect(f"ws://127.0.0.1:{server.port}/ws") as ws:
+        hello = recv(ws)
+        assert hello["accepts"] == ["run_eval", "select_envs"]
+        ws.send(json.dumps(dict(type="subscribe", stream="live", rate=1000)))
+        ws.send(json.dumps(dict(type="select_envs", first=4)))
+        ws.send(json.dumps(dict(type="run_eval")))
+        ws.send(json.dumps(dict(type="format_disk")))      # not accepted
+        got = []
+        for _ in range(200):
+            got += server.take_requests()
+            if len(got) == 2:
+                break
+            time.sleep(0.01)
+        assert got == [dict(type="select_envs", first=4), dict(type="run_eval")]
+        backend.commit(sc, time=0)
+        scene = recv(ws)
+        assert scene["info"] == {"envs": [4, 5], "env_total": 8}
+        recv(ws)                                     # frame
+        server.event("eval done", "info")
+        assert recv(ws) == {"type": "event", "level": "info", "text": "eval done"}

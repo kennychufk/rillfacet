@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
 #include <memory>
 
 namespace py = pybind11;
@@ -205,6 +206,29 @@ PYBIND11_MODULE(_avbd_viz, m) {
     for (int i = 0; i < colormap_count(); ++i) names.push_back(colormap_name(i));
     return names;
   });
+
+  m.def("font_atlas", [](const std::string& path) {
+    // The 3D-label font exactly as the renderer builds it (SDF atlas + glyph
+    // metrics), for clients that draw text themselves (the web viewer).
+    Font f;
+    if (!f.load(path.empty() ? std::string(AVBD_VIZ_ASSET_DIR) + "/fonts/Inter-SemiBold.ttf" : path))
+      throw std::runtime_error("cannot load font " + path);
+    py::array_t<uint8_t> atlas({f.atlas_height(), f.atlas_width()});
+    std::memcpy(atlas.mutable_data(), f.atlas().data(), f.atlas().size());
+    py::dict glyphs;
+    for (const auto& [cp, g] : f.glyphs())
+      glyphs[py::int_(cp)] = py::make_tuple(g.advance, py::make_tuple(g.uv.x, g.uv.y, g.uv.z, g.uv.w),
+                                            py::make_tuple(g.offset.x, g.offset.y),
+                                            py::make_tuple(g.size.x, g.size.y));
+    py::dict out;
+    out["atlas"] = atlas;
+    out["base_px"] = f.base_px();
+    out["ascent"] = f.ascent();
+    out["line_height"] = f.line_height();
+    out["sdf_per_px"] = f.sdf_per_px();
+    out["glyphs"] = glyphs;
+    return out;
+  }, py::arg("path") = "", "SDF atlas [H, W] uint8 and glyph metrics (advance, uv, offset, size) of the label font.");
 
   // ---- Quantities and structures ----
   py::class_<Quantity>(m, "Quantity")
