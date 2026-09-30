@@ -6,7 +6,8 @@
 //   MMB drag orbit | Shift+MMB pan | Ctrl+MMB / wheel zoom | Alt+LMB orbit
 //   (Shift / Ctrl + Alt+LMB pan / zoom), Numpad 1/3/7 front/right/top
 //   (Ctrl = opposite), 5 persp/ortho, 2/4/6/8 orbit steps, . or F frame
-//   the selection, Home frame all.
+//   the selection, Home frame all (Shift+Home while replaying, where Home
+//   seeks to the start).
 // Selection:
 //   LMB click select, Shift+click add/remove, LMB drag box select (Shift
 //   extends), 1/2/3/4 vertex/edge/face/body mode, Alt+Z x-ray select,
@@ -54,6 +55,7 @@ export class Interaction {
   onIsolate: (env: number) => void = () => {};
   onStatus: (msg: string) => void = () => {};
   onEscape: () => boolean = () => false; // true: the page handled it
+  homeTaken: () => boolean = () => false; // true: plain Home belongs to the page
   version = 1; // bumps on any inspector-visible change (tools, measurements, hiding)
 
   readonly scene: GeoLookup;
@@ -365,7 +367,10 @@ export class Interaction {
       case "Numpad8": cam.animateTo(cam.target, cam.distance, cam.yaw, Math.min(cam.pitch + step, Math.PI / 2)); break;
       case "Numpad2": cam.animateTo(cam.target, cam.distance, cam.yaw, Math.max(cam.pitch - step, -Math.PI / 2)); break;
       case "NumpadDecimal": case "KeyF": if (ctrl || alt) handled = false; else this.frameSelection(); break;
-      case "Home": this.frameAll(); break;
+      case "Home": // while replaying, plain Home is the timeline's (seek to the start)
+        if (!shift && this.homeTaken()) handled = false;
+        else this.frameAll();
+        break;
       case "Digit1": case "Digit2": case "Digit3": case "Digit4":
         if (ctrl || alt) handled = false;
         else this.setMode(Number(e.code.slice(5)) - 1);

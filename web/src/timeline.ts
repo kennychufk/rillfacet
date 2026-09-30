@@ -113,7 +113,7 @@ export class Timeline {
       if (e.key === " ") this.togglePlay();
       else if (e.key === "ArrowLeft") this.step(-1, e.shiftKey);
       else if (e.key === "ArrowRight") this.step(1, e.shiftKey);
-      else if (e.key === "Home") this.seek(0);
+      else if (e.key === "Home" && !e.shiftKey) this.seek(0);
       else if (e.key === "End") this.seek(this.replay.duration);
       else if (e.key === "[" || e.key === "]") this.pickNeighbor(e.key === "]" ? 1 : -1);
       else return;

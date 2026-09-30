@@ -125,19 +125,62 @@ summary)`. avbd-rl's side eval records every training checkpoint this way.
 
 Web viewer: `avbd_viz.web.server.VizServer(host, port)` serves the browser
 client (WebGPU, `web/`) and streams scenes over a WebSocket from inside a
-running process, on one port. A `StreamBackend(server.stream("live"))` scene
-backend commits frames when `wanted()` — a browser is connected and ready —
-so an unwatched process pays one flag check per step; frames are best
-effort (newest wins, acked by the client) and CUDA pose tensors are copied
-without blocking. The client shades with the native WGSL (shared
-`shaders/common`, `styles/studio.wgsl`) and draws rigid meshes from body-local
-vertices plus per-body poses. The built client is committed under
-`python/avbd_viz/web/static/`; rebuild it after editing `web/`:
+running process, on one port (the next free one if taken). A
+`StreamBackend(server.stream("live"))` scene backend commits frames when
+`wanted()` — a browser is connected and ready — so an unwatched process pays
+one flag check per step; frames are best effort (newest wins, acked by the
+client) and CUDA pose tensors are copied without blocking.
+
+```python
+from avbd_viz.scene_api import Scene
+from avbd_viz.web.server import StreamBackend, VizServer
+server = VizServer("0.0.0.0", 8080, name="my run")     # http://<host>:8080/
+backend = StreamBackend(server.stream("live"))
+scene = Scene(backend)                                  # fill it as any scene
+if backend.wanted():                                    # once per step
+    bodies.set_poses(poses)
+    backend.commit(scene, time=step)
+```
+
+The client has three modes (bottom bar): **Live** (the stream), **Training
+ring** (the producer's latest episodes, built on request through
+`server.ring = RingMailbox()`), and **Evals** (saved records:
+`VizServer(evals=dir)` or `server.offer_evals(dir)`, picked on the outer
+timeline, played under the scrubber with Space, ←/→, Home/End, [ ]; there Home
+seeks to the start and Shift+Home frames the scene).
+`server.accept("save_checkpoint", ...)` names the browser requests the
+producer handles; it collects them with `take_requests()` between steps and
+answers with `event(text)` toasts. A finished run's records replay without
+the producer:
+
+```bash
+python -m avbd_viz.web.replay RUN_DIR      # RUN_DIR or its evals/ directory
+```
+
+The browser renders like the native viewer: the same WGSL (the shared
+`shaders/common`, all four styles, SSAO, grid, composite, overlays, SDF
+text) and the same viewport, so everything under Controls below applies,
+except video, screenshots and the application drag: navigation, vertex /
+edge / face / body selection with the same element numbering, box and x-ray
+select, hiding, measuring, wireframe shading, axis views and the gizmo, and
+the Display and Inspect panels. Web only: double-click shows one env alone
+(Esc: all), and the right panel lists the focused env's channels.
+
+The built client is committed under `python/avbd_viz/web/static/`; rebuild it
+after editing `web/`:
 
 ```bash
 cd web && npm install && npm run build     # typecheck + bundle into the package
 npm run dev                                # dev server, proxies /ws to :8080
 ```
+
+Checks: `web/tools/golden.py EVALS_DIR RECORD_ID TICK OUT [--display JSON]`
+renders one record frame in a headless native viewer and in Chromium at the
+same camera and settings (style, wireframe, ortho, a selection, ...) and
+diffs them; `web/tools/screenshot.mjs URL WAIT_MS EXPR [OUT.png]` opens the
+client in a real Chromium window over CDP (headless Chromium may have no
+WebGPU adapter) and evaluates `EXPR` (`window.__avbd` holds the stream
+stats).
 
 Dragging: with `v.drag_enabled = True`, Ctrl+LMB grabs the element under the
 cursor (mesh face, tet, curve edge or point) of any structure whose

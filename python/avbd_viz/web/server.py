@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import mimetypes
 import os
 import socket
@@ -309,13 +310,20 @@ class VizServer:
     def _run(self, port, started):
         from websockets.asyncio.server import serve
 
+        # A browser's speculative connection closes without a request; the
+        # library logs each as an error with a traceback. Not a fault.
+        log = logging.getLogger("avbd_viz.web")
+        if not log.filters:
+            log.addFilter(lambda r: "opening handshake failed"
+                          not in r.getMessage())
+
         async def main():
             self._loop = asyncio.get_running_loop()
             try:
                 self._server = await serve(
                     self._handler, self.host, port,
                     process_request=self._http, compression=None,
-                    max_size=1 << 20)
+                    max_size=1 << 20, logger=log)
             except OSError as e:
                 self._error = e
                 started.set()

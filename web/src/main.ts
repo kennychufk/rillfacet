@@ -550,6 +550,7 @@ Renderer.create(canvas)
       applyEnvState();
     };
     ix.onIsolate = isolateEnv;
+    ix.homeTaken = () => stats.mode !== "live" && replay !== null;
     ix.onStatus = (m) => toast(m);
     ix.onEscape = () => {
       if (stats.isolated < 0) return false;
