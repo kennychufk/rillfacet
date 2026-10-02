@@ -1,6 +1,6 @@
 # rillfacet
 
-Real-time scientific viewer for simulators (AVBD, deskonica, ...), replacing
+Real-time scientific viewer for simulators (quiddel, deskonica, ...), replacing
 polyscope. WebGPU (Dawn, Vulkan backend on Linux) + WGSL shaders + Dear ImGui.
 No dependency on any simulator: they feed it plain arrays. The name: a rill is
 a small stream (the streaming of 3D assets and poses); a facet is a mesh's
@@ -157,7 +157,7 @@ on a background thread (`<root>/<id>/meta.json, tracks.npz, summary.json`,
 the static scene once per content hash under `<root>/scenes/`, an
 `index.json`); pose tracks store never-moving bodies once and the rest as
 time-delta-coded int16. `read_record(path)` returns `(meta, record,
-summary)`. avbd-rl's side eval records every training checkpoint this way.
+summary)`. quiddel-rl's side eval records every training checkpoint this way.
 
 Web viewer: `rillfacet.web.server.VizServer(host, port)` serves the browser
 client (WebGPU, `web/`) and streams scenes over a WebSocket from inside a
@@ -230,8 +230,8 @@ vertices, pull a rigid body with a spring). `cancel_drag()` drops a drag
 silently (e.g. after rebuilding the scene); `begin_drag(x, y)`, `drag_to(x, y)`
 and `end_drag()` script one without the mouse.
 
-Simulator demos (live in avbd-cuda, listed in its docs/VISUALIZATION.md).
-Python, on the avbd `Simulator` (cloth, tet bodies as volume meshes, ropes)
+Simulator demos (live in quiddel (the `../avbd-cuda` checkout), listed in its docs/VISUALIZATION.md).
+Python, on the quiddel `Simulator` (cloth, tet bodies as volume meshes, ropes)
 and on the rigid simulators (`mixed_convex_demo.py` has the scenes of the C++
 demo below):
 
@@ -245,8 +245,8 @@ C++, on `RigidCompoundSimulator`:
 
 ```bash
 cd ../avbd-cuda && conda activate avbd
-cmake -S . -B build-viewer -G Ninja -DCMAKE_BUILD_TYPE=Release -DAVBD_BUILD_VIEWER=ON \
-      -DBUILD_TESTS=OFF -DAVBD_BUILD_PYTHON_MODULE=OFF
+cmake -S . -B build-viewer -G Ninja -DCMAKE_BUILD_TYPE=Release -DQUIDDEL_BUILD_VIEWER=ON \
+      -DBUILD_TESTS=OFF -DQUIDDEL_BUILD_PYTHON_MODULE=OFF
 cmake --build build-viewer --target mixed_convex_viewer
 ./build-viewer/mixed_convex_viewer                     # --num-envs 16 for the env grid
 ./build-viewer/mixed_convex_viewer --headless --scene "Chaos Drop" --steps 260 --style 3 --out s.png
