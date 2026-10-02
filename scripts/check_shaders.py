@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate every WGSL entry shader (x every style) with Dawn's `tint` CLI.
 
-Expands `#include` exactly like src/avbd_viz/shader_library.cpp.
+Expands `#include` exactly like src/rillfacet/shader_library.cpp.
 Usage: python3 scripts/check_shaders.py [shader.wgsl ...]
 """
 import os

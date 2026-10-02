@@ -1,11 +1,11 @@
-// Python bindings: `import avbd_viz`.
+// Python bindings: `import rillfacet`.
 //
 // Arrays can be numpy arrays, nested lists, or torch tensors (moved to the
 // CPU first). Structures are owned by the scene: a Python handle to a removed
-// structure must not be used. `avbd_viz.imgui` is a Dear ImGui subset named
+// structure must not be used. `rillfacet.imgui` is a Dear ImGui subset named
 // like polyscope.imgui, for per-frame UI in the viewer callback.
 
-#include "avbd_viz/viewer.h"
+#include "rillfacet/viewer.h"
 
 #include <imgui.h>
 #include <implot.h>
@@ -22,7 +22,7 @@
 #include <memory>
 
 namespace py = pybind11;
-using namespace avbd_viz;
+using namespace rillfacet;
 
 PYBIND11_MAKE_OPAQUE(std::vector<Measurement>);
 
@@ -149,8 +149,8 @@ void rethrow_callback_error() {
 static void bind_imgui(py::module_ m);
 static void bind_implot(py::module_ m);
 
-PYBIND11_MODULE(_avbd_viz, m) {
-  m.doc() = "avbd-viz: real-time scientific viewer (WebGPU)";
+PYBIND11_MODULE(_rillfacet, m) {
+  m.doc() = "rillfacet: real-time scientific viewer (WebGPU)";
 
   // ---- Enums ----
   py::enum_<ElementKind>(m, "ElementKind")
@@ -211,7 +211,7 @@ PYBIND11_MODULE(_avbd_viz, m) {
     // The 3D-label font exactly as the renderer builds it (SDF atlas + glyph
     // metrics), for clients that draw text themselves (the web viewer).
     Font f;
-    if (!f.load(path.empty() ? std::string(AVBD_VIZ_ASSET_DIR) + "/fonts/Inter-SemiBold.ttf" : path))
+    if (!f.load(path.empty() ? std::string(RILLFACET_ASSET_DIR) + "/fonts/Inter-SemiBold.ttf" : path))
       throw std::runtime_error("cannot load font " + path);
     py::array_t<uint8_t> atlas({f.atlas_height(), f.atlas_width()});
     std::memcpy(atlas.mutable_data(), f.atlas().data(), f.atlas().size());
@@ -608,10 +608,10 @@ PYBIND11_MODULE(_avbd_viz, m) {
              o.vsync = vsync;
              o.max_fps = max_fps;
              auto v = std::make_unique<Viewer>(o);
-             if (!v->ok()) throw std::runtime_error("avbd_viz: could not create the viewer (GPU or display missing?)");
+             if (!v->ok()) throw std::runtime_error("rillfacet: could not create the viewer (GPU or display missing?)");
              return v;
            }),
-           py::arg("title") = "avbd-viz", py::arg("width") = 1600, py::arg("height") = 960,
+           py::arg("title") = "rillfacet", py::arg("width") = 1600, py::arg("height") = 960,
            py::arg("headless") = false, py::arg("vsync") = true, py::arg("max_fps") = 0.0f)
       .def_property_readonly("scene", &Viewer::scene, ref)
       .def_property_readonly("camera", &Viewer::camera, ref)

@@ -1,4 +1,4 @@
-"""avbd_viz.web: wire protocol and the stream server, end to end with a
+"""rillfacet.web: wire protocol and the stream server, end to end with a
 Python WebSocket client.
 
     PYTHONPATH=python python -m pytest tests -q
@@ -11,9 +11,9 @@ import urllib.request
 import numpy as np
 import pytest
 
-from avbd_viz.scene_api import Scene, box_mesh
-from avbd_viz.web.protocol import decode, encode
-from avbd_viz.web.server import StreamBackend, VizServer
+from rillfacet.scene_api import Scene, box_mesh
+from rillfacet.web.protocol import decode, encode
+from rillfacet.web.server import StreamBackend, VizServer
 
 websockets = pytest.importorskip("websockets")
 from websockets.sync.client import connect  # noqa: E402
@@ -155,7 +155,7 @@ def test_port_in_use_moves_on(server):
 def make_record(K=600, n=2):
     """A recorded session: one moving and one static body per env, a box
     set and a channel, clock 0..K-1."""
-    from avbd_viz.web.record import Recorder
+    from rillfacet.web.record import Recorder
     rec = Recorder()
     sc = Scene(rec)
     v, t = box_mesh([[0, 0, 0], [2, 0, 0]], [[1, 1, 1], [3, 1, 1]])
@@ -184,7 +184,7 @@ def make_record(K=600, n=2):
 def read_replay(ws):
     """The ``replay`` header and its pose tracks, reassembled from the
     chunks (acking each)."""
-    from avbd_viz.web.replay import decode_chunk
+    from rillfacet.web.replay import decode_chunk
     head = recv(ws)
     assert head["type"] == "replay", head
     poses = {}
@@ -205,7 +205,7 @@ def read_replay(ws):
 
 
 def test_eval_index_push_and_replay(tmp_path):
-    from avbd_viz.web.record import write_record
+    from rillfacet.web.record import write_record
     root = tmp_path / "evals"
     rec, truth = make_record()
     srv = VizServer("127.0.0.1", 18780, name="r", static_dir=str(tmp_path),
@@ -254,7 +254,7 @@ def test_eval_index_push_and_replay(tmp_path):
 
 
 def test_ring_replay_is_built_by_the_producer(tmp_path):
-    from avbd_viz.web.replay import RingMailbox
+    from rillfacet.web.replay import RingMailbox
     srv = VizServer("127.0.0.1", 18790, static_dir=str(tmp_path),
                     verbose=False)
     srv.ring = box = RingMailbox()

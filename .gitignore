@@ -11,4 +11,4 @@ __pycache__/
 *.mp4
 # The web client's label font atlas (web/tools/export_font.py) is a source asset.
 !web/public/font/label.png
-!python/avbd_viz/web/static/font/label.png
+!python/rillfacet/web/static/font/label.png

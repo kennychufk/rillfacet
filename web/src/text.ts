@@ -1,5 +1,5 @@
 // 3D text labels as the native viewer draws them: the same SDF font atlas
-// (exported from src/avbd_viz/text.cpp by tools/export_font.py) and a port
+// (exported from src/rillfacet/text.cpp by tools/export_font.py) and a port
 // of Font::layout / the label culling in Renderer::render, producing the
 // GlyphInstance records shaders/overlay_text.wgsl reads.
 import { type Vec3 } from "./math";

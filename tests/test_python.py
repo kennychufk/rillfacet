@@ -1,4 +1,4 @@
-"""Headless checks of the avbd_viz Python module (needs a Vulkan GPU).
+"""Headless checks of the rillfacet Python module (needs a Vulkan GPU).
 
     PYTHONPATH=python python -m pytest tests -q
 """
@@ -6,7 +6,7 @@
 import numpy as np
 import pytest
 
-import avbd_viz as viz
+import rillfacet as viz
 
 
 @pytest.fixture(scope="module")

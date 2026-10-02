@@ -5,21 +5,21 @@ the same code as the renderer's) for the web client:
 
 writes web/public/font/label.png (the atlas, 8-bit grayscale) and
 web/public/font/label.json (metrics). Re-run after changing the font code in
-src/avbd_viz/text.cpp; the outputs are committed.
+src/rillfacet/text.cpp; the outputs are committed.
 """
 import json
 import os
 
 from PIL import Image
 
-from avbd_viz import _avbd_viz
+from rillfacet import _rillfacet
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "public",
                    "font")
 
 
 def main():
-    f = _avbd_viz.font_atlas()
+    f = _rillfacet.font_atlas()
     os.makedirs(OUT, exist_ok=True)
     atlas = f["atlas"]
     Image.fromarray(atlas, "L").save(os.path.join(OUT, "label.png"),

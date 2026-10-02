@@ -1,5 +1,5 @@
 // Lighting inputs of the MatCap and Environment PBR styles, ported from
-// src/avbd_viz/environment.cpp: the procedural matcaps and environment maps
+// src/rillfacet/environment.cpp: the procedural matcaps and environment maps
 // (same formulas), and the GPU environment (spherical-harmonic irradiance on
 // the CPU, a box-filtered mip chain, then the native env_prefilter.wgsl GGX
 // prefilter, unchanged).

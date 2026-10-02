@@ -1,5 +1,5 @@
 // WebGPU renderer of the web client, a port of the native viewer's
-// src/avbd_viz/renderer.cpp for the scenes the web streams (rigid meshes,
+// src/rillfacet/renderer.cpp for the scenes the web streams (rigid meshes,
 // boxes, labels), dark theme, solid shading in any of its four styles or
 // wireframe shading (see-through wires, X-ray):
 //

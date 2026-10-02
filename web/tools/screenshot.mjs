@@ -2,8 +2,8 @@
 // Headless snap Chromium gets no WebGPU adapter on this machine; a normal
 // window (DISPLAY=:0, placed off-screen) does. Usage:
 //   node screenshot.mjs URL WAIT_MS JS_EXPR [OUT.png] [W H]
-// e.g. node screenshot.mjs http://127.0.0.1:8080/ 5000 "JSON.stringify(window.__avbd)" shot.png
-// (window.__avbd = the client's connection/stream stats). Profile dir:
+// e.g. node screenshot.mjs http://127.0.0.1:8080/ 5000 "JSON.stringify(window.__rillfacet)" shot.png
+// (window.__rillfacet = the client's connection/stream stats). Profile dir:
 // $HOME/snap_tmp_webgpu/profile (snap Chromium can only write under $HOME).
 import { spawn } from "node:child_process";
 import { writeFileSync, mkdirSync } from "node:fs";

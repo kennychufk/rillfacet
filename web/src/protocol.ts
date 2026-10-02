@@ -1,4 +1,4 @@
-// Wire format of the avbd-viz web viewer: see python/avbd_viz/web/protocol.py.
+// Wire format of the rillfacet web viewer: see python/rillfacet/web/protocol.py.
 // A message is "AVZ1" | u32 header length | JSON header | pad | buffers; the
 // header's {"$b": i} entries are replaced by typed-array views (no copies).
 

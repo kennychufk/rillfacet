@@ -1,5 +1,5 @@
 // A replay held in the browser: the `replay` message's tracks plus the pose
-// chunks as they arrive (see python/avbd_viz/web/replay.py). sample(t)
+// chunks as they arrive (see python/rillfacet/web/replay.py). sample(t)
 // rebuilds the scene state at tick t — each track's latest sample at or
 // before t, poses interpolated (lerp + slerp) between samples — in the same
 // {object: {field: Arr}} shape as a live frame, so the renderer and panel

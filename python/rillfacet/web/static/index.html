@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rillfacet</title>
+    <script type="module" crossorigin src="./assets/index-BKG_7lhw.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-iHMRj5OW.css">
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <header id="top">
+      <div class="status"><span class="dot"></span><span class="title">rillfacet</span><span class="clock"></span></div>
+      <div class="actions">
+        <label class="live-only">envs <select id="envs" title="Training envs streamed (and kept in the training ring)"></select></label>
+        <label class="live-only">rate <select id="rate" title="Live frames per second at most">
+          <option value="1">1 Hz</option><option value="5">5 Hz</option><option value="10">10 Hz</option>
+          <option value="20" selected>20 Hz</option><option value="30">30 Hz</option></select></label>
+        <button id="display-btn" aria-expanded="false" aria-controls="display" title="Style, shadows, slice plane, see-through objects">Display</button>
+        <button id="save" title="Write a checkpoint of the current policy">Save checkpoint</button>
+        <button id="eval" title="Write a checkpoint and run the side eval on it">Run eval now</button>
+      </div>
+    </header>
+    <aside id="panel">
+      <details id="inspect-wrap" open><summary>Inspect</summary><div id="inspect"></div></details>
+      <div id="stats"></div>
+    </aside>
+    <div id="hud"></div>
+    <div id="scalebar"></div>
+    <div id="gizmo"></div>
+    <div id="selbox" hidden></div>
+    <aside id="display" hidden aria-label="Display"></aside>
+    <footer id="bar"></footer>
+    <div id="toasts" aria-live="polite"></div>
+    <div id="error"></div>
+  </body>
+</html>

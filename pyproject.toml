@@ -1,12 +1,12 @@
-# The extension is built by CMake (-DAVBD_VIZ_BUILD_PYTHON=ON) into
-# python/avbd_viz/; this only makes the package importable:
+# The extension is built by CMake (-DRILLFACET_BUILD_PYTHON=ON) into
+# python/rillfacet/; this only makes the package importable:
 #   pip install -e . --no-build-isolation
 [build-system]
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "avbd-viz"
+name = "rillfacet"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = ["numpy"]
@@ -15,4 +15,4 @@ dependencies = ["numpy"]
 where = ["python"]
 
 [tool.setuptools.package-data]
-avbd_viz = ["*.so"]
+rillfacet = ["*.so"]

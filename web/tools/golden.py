@@ -5,7 +5,7 @@ of a saved record, rendered by both at the same size and camera.
         [--size 1280 800] [--eye X Y Z --target X Y Z] [--display JSON]
 
 The native side rebuilds the record's scene at TICK in a headless
-``avbd_viz.Viewer`` (NativeBackend, labels through the overlay); the web
+``rillfacet.Viewer`` (NativeBackend, labels through the overlay); the web
 side is the built client served by a replay server over EVALS_DIR, driven in
 a real Chromium window by screenshot.mjs (``window.__golden``). Writes
 native.png, web.png, diff.png (|web - native|, x4) and side.png, and prints
@@ -50,19 +50,19 @@ SETTINGS = dict(shadows="shadows", shadowStrength="shadow_strength", ssao="ssao"
 
 def apply_display(v, disp):
     """The web display options ``disp`` on a native viewer."""
-    import avbd_viz
+    import rillfacet
     s = v.settings
     if "style" in disp:
-        s.style = getattr(avbd_viz.Style, STYLES[disp["style"]])
+        s.style = getattr(rillfacet.Style, STYLES[disp["style"]])
     for k, n in SETTINGS.items():
         if k in disp:
             setattr(s, n, disp[k])
     if "outline" in disp:
-        s.outline = getattr(avbd_viz.OutlineMode, OUTLINES[disp["outline"]])
+        s.outline = getattr(rillfacet.OutlineMode, OUTLINES[disp["outline"]])
     if "matcap" in disp:
-        s.matcap = getattr(avbd_viz.MatcapPreset, MATCAPS[disp["matcap"]])
+        s.matcap = getattr(rillfacet.MatcapPreset, MATCAPS[disp["matcap"]])
     if "environment" in disp:
-        s.environment = getattr(avbd_viz.EnvironmentPreset, ENVS[disp["environment"]])
+        s.environment = getattr(rillfacet.EnvironmentPreset, ENVS[disp["environment"]])
     for k, val in disp.get("slice", {}).items():
         setattr(s.slice, k, val)
     for name, d in disp.get("objects", {}).items():
@@ -70,11 +70,11 @@ def apply_display(v, disp):
         for k, val in d.items():
             setattr(st, k, val)
     if "shading" in disp:
-        s.shading = getattr(avbd_viz.Shading, disp["shading"].capitalize())
+        s.shading = getattr(rillfacet.Shading, disp["shading"].capitalize())
     v.camera.ortho = bool(disp.get("ortho", False))
     sel = disp.get("select")
     if sel:
-        v.selection.mode = list(avbd_viz.PickMode.__members__.values())[sel["mode"]]
+        v.selection.mode = list(rillfacet.PickMode.__members__.values())[sel["mode"]]
         oid = v.scene.get(sel["object"]).id
         for i, idx in enumerate(sel["indices"]):
             if i == 0:
@@ -84,11 +84,11 @@ def apply_display(v, disp):
 
 
 def native(snapshot, record, tick, size, eye, target, out, disp):
-    import avbd_viz
-    from avbd_viz.scene_api import NativeBackend, Scene
-    from avbd_viz.web.replay import build_scene, set_state
+    import rillfacet
+    from rillfacet.scene_api import NativeBackend, Scene
+    from rillfacet.web.replay import build_scene, set_state
 
-    v = avbd_viz.Viewer(headless=True, width=size[0], height=size[1])
+    v = rillfacet.Viewer(headless=True, width=size[0], height=size[1])
     scene = Scene(NativeBackend(v))
     build_scene(scene, snapshot)
     set_state(scene, record, tick)
@@ -102,7 +102,7 @@ def native(snapshot, record, tick, size, eye, target, out, disp):
 
 
 def web(root, rid, tick, size, eye, target, out, port, disp):
-    from avbd_viz.web.server import VizServer
+    from rillfacet.web.server import VizServer
     srv = VizServer("127.0.0.1", port, evals=root, verbose=False)
     try:
         expr = (f"window.__golden({json.dumps(rid)}, {tick}, {json.dumps(list(eye))}, "
@@ -133,7 +133,7 @@ def main():
     ap.add_argument("--display", type=json.loads, default={})
     args = ap.parse_args()
 
-    from avbd_viz.web.record import read_record
+    from rillfacet.web.record import read_record
     _, rec, _ = read_record(os.path.join(args.evals, args.rid))
     cam = rec.snapshot.get("camera")
     eye = args.eye or (cam and cam[0])

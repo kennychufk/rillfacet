@@ -1,4 +1,4 @@
-// avbd-viz web client: connects to the server that served this page (a
+// rillfacet web client: connects to the server that served this page (a
 // training process, or a replay server). Modes: Live (the "live" stream),
 // Training ring (the trainer's last episode per streamed env) and Evals
 // (saved evals, picked on the outer timeline); the replay modes play a
@@ -37,7 +37,7 @@ const stats: StreamStats & { mode: Mode; replay: unknown; focus: number; isolate
   mode: "live", replay: null, focus: -1, isolated: -1,
 };
 // For automated checks (e.g. a CDP screenshot harness), with console errors.
-(window as unknown as { __avbd: unknown }).__avbd = stats;
+(window as unknown as { __rillfacet: unknown }).__rillfacet = stats;
 (window as unknown as { __timeline: unknown }).__timeline = timeline;
 const errors: string[] = [];
 (stats as unknown as { errors: string[] }).errors = errors;
@@ -393,7 +393,7 @@ function connect() {
     const msg = decode(ev.data);
     if (msg.type === "hello") {
       stats.name = msg.name;
-      document.title = `${msg.name || "avbd-viz"} — avbd-viz`;
+      document.title = `${msg.name || "rillfacet"} — rillfacet`;
       hasLive = msg.streams.some((s: { name: string }) => s.name === STREAM);
       hasRing = !!msg.replay?.ring;
       hasEvals = !!msg.replay?.evals;
@@ -489,7 +489,7 @@ function connect() {
 
 function renderStatus() {
   let state: string, title: string, clock: string;
-  const name = stats.name || "avbd-viz";
+  const name = stats.name || "rillfacet";
   if (stats.mode === "live") {
     const live = stats.status === "live";
     state = live ? "ok" : stats.status === "connecting" ? "wait" : "bad";

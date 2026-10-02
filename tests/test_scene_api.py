@@ -1,4 +1,4 @@
-"""avbd_viz.scene_api: the backend-neutral scene and its native backend.
+"""rillfacet.scene_api: the backend-neutral scene and its native backend.
 
     PYTHONPATH=python python -m pytest tests -q
 """
@@ -6,8 +6,8 @@
 import numpy as np
 import pytest
 
-import avbd_viz as viz
-from avbd_viz.scene_api import Backend, NativeBackend, Scene, box_mesh, skin
+import rillfacet as viz
+from rillfacet.scene_api import Backend, NativeBackend, Scene, box_mesh, skin
 
 
 def quat(axis, angle):

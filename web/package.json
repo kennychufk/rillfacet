@@ -1,9 +1,9 @@
 {
-  "name": "avbd-viz-web",
+  "name": "rillfacet-web",
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Browser client of the avbd-viz web viewer (WebGPU).",
+  "description": "Browser client of the rillfacet web viewer (WebGPU).",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

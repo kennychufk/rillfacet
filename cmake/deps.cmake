@@ -3,7 +3,7 @@ include(FetchContent)
 set(FETCHCONTENT_QUIET ON)
 
 # Dawn (native WebGPU) is prebuilt by scripts/build_dawn.sh.
-find_package(Dawn CONFIG REQUIRED HINTS ${AVBD_VIZ_ROOT}/third_party/dawn)
+find_package(Dawn CONFIG REQUIRED HINTS ${RILLFACET_ROOT}/third_party/dawn)
 
 set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_X11 ON CACHE BOOL "" FORCE)
@@ -30,7 +30,7 @@ FetchContent_Populate(imgui)   # no CMakeLists upstream: built below
 FetchContent_Populate(implot)
 FetchContent_Populate(stb)
 
-add_library(avbd_viz_imgui STATIC
+add_library(rillfacet_imgui STATIC
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -40,11 +40,11 @@ add_library(avbd_viz_imgui STATIC
   ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
   ${implot_SOURCE_DIR}/implot.cpp
   ${implot_SOURCE_DIR}/implot_items.cpp)
-target_include_directories(avbd_viz_imgui PUBLIC
+target_include_directories(rillfacet_imgui PUBLIC
   ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends ${implot_SOURCE_DIR})
-target_compile_definitions(avbd_viz_imgui PUBLIC IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
-target_link_libraries(avbd_viz_imgui PUBLIC glfw dawn::webgpu_dawn)
-set_target_properties(avbd_viz_imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(rillfacet_imgui PUBLIC IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
+target_link_libraries(rillfacet_imgui PUBLIC glfw dawn::webgpu_dawn)
+set_target_properties(rillfacet_imgui PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_library(avbd_viz_stb INTERFACE)
-target_include_directories(avbd_viz_stb SYSTEM INTERFACE ${stb_SOURCE_DIR})
+add_library(rillfacet_stb INTERFACE)
+target_include_directories(rillfacet_stb SYSTEM INTERFACE ${stb_SOURCE_DIR})

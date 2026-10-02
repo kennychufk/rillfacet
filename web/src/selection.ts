@@ -1,5 +1,5 @@
 // Selection (vertex / edge / face / body) and measurements, a port of the
-// native src/avbd_viz/selection.cpp for the web's structures (meshes and
+// native src/rillfacet/selection.cpp for the web's structures (meshes and
 // point clouds, see geometry.ts).
 //
 // Picking reads the prepass id buffer (object id, face, segment per pixel),

@@ -1,8 +1,10 @@
-# avbd-viz
+# rillfacet
 
-Real-time scientific viewer for the AVBD simulators, replacing polyscope.
-WebGPU (Dawn, Vulkan backend on Linux) + WGSL shaders + Dear ImGui. No
-dependency on avbd: simulators feed it plain arrays.
+Real-time scientific viewer for simulators (AVBD, deskonica, ...), replacing
+polyscope. WebGPU (Dawn, Vulkan backend on Linux) + WGSL shaders + Dear ImGui.
+No dependency on any simulator: they feed it plain arrays. The name: a rill is
+a small stream (the streaming of 3D assets and poses); a facet is a mesh's
+primitive triangle, or the projection plane of a scene seen from a camera.
 
 Status: **v1.** Default look: **Studio**. MatCap, Environment PBR and
 Technical remain available under Display → Style. Shading is Solid (in the
@@ -33,18 +35,18 @@ clamping the limits the driver advertises to its own internal cap
 (`NormalizeLimits`), once per device, whatever a client asks for. Nothing here
 binds with dynamic offsets, so the warning is harmless.
 
-Python module (`avbd_viz`, pybind11):
+Python module (`rillfacet`, pybind11):
 
 ```bash
-cmake -S . -B build -G Ninja -DAVBD_VIZ_BUILD_PYTHON=ON \
+cmake -S . -B build -G Ninja -DRILLFACET_BUILD_PYTHON=ON \
       -DPython3_EXECUTABLE=$(which python) && cmake --build build
 pip install -e . --no-build-isolation        # or: PYTHONPATH=python
 PYTHONPATH=python python -m pytest tests -q   # headless checks
 ```
 
 ```python
-import avbd_viz as viz
-from avbd_viz import imgui              # polyscope.imgui-style subset
+import rillfacet as viz
+from rillfacet import imgui              # polyscope.imgui-style subset
 
 v = viz.Viewer()                        # Viewer(headless=True) renders offscreen
 cloth = v.scene.add_mesh("cloth")
@@ -92,12 +94,12 @@ ImGui has no out-parameters in Python, so widgets that write through a pointer
 in C++ return the new value instead: `changed, value = imgui.SliderFloat(...)`,
 `changed, on = imgui.Checkbox(...)`. Beyond widgets the subset covers tables,
 tab bars, child windows, style vars/colors, text wrapping, the clipboard and
-images. `avbd_viz.implot` wraps the line-plot
+images. `rillfacet.implot` wraps the line-plot
 subset (`BeginPlot`/`SetupAxis`/`PlotLine`/`SetAxes`), and `imgui.GetIO()` can
 inject input (`AddKeyEvent`, `AddMousePosEvent`, `AddMouseButtonEvent`) so a
 viewer app can be driven headlessly from a test.
 
-Backend-neutral scenes: `avbd_viz.scene_api.Scene` describes what to show,
+Backend-neutral scenes: `rillfacet.scene_api.Scene` describes what to show,
 split by how often it changes: rigid meshes (body-local vertices once, one
 pose per instance and body per frame), boxes, points, polylines, labels
 (fixed texts, or values a backend formats with `fmt`) and named channels.
@@ -106,14 +108,14 @@ the callback for the labels); the web viewer's stream and recorder backends
 take the same calls, and a backend added later is sent the whole scene.
 
 ```python
-from avbd_viz.scene_api import NativeBackend, Scene
+from rillfacet.scene_api import NativeBackend, Scene
 sc = Scene(NativeBackend(v))
 bodies = sc.rigid_mesh("bodies", local_verts, vertex_body, tris, body_tri_offsets,
                        instances=4, offsets=grid)
 bodies.set_poses(poses)                 # [4, B, 7] translation + xyzw quaternion
 ```
 
-Records: `avbd_viz.web.record.Recorder` is a scene backend that logs every
+Records: `rillfacet.web.record.Recorder` is a scene backend that logs every
 update between `start(scene)` and `finish()` against a caller-driven clock
 (`tick(t)`), as tracks `(object, field) -> (t, values)`; CUDA tensors are
 copied to pinned memory without blocking. `RecordWriter(root)` writes records
@@ -123,7 +125,7 @@ the static scene once per content hash under `<root>/scenes/`, an
 time-delta-coded int16. `read_record(path)` returns `(meta, record,
 summary)`. avbd-rl's side eval records every training checkpoint this way.
 
-Web viewer: `avbd_viz.web.server.VizServer(host, port)` serves the browser
+Web viewer: `rillfacet.web.server.VizServer(host, port)` serves the browser
 client (WebGPU, `web/`) and streams scenes over a WebSocket from inside a
 running process, on one port (the next free one if taken). A
 `StreamBackend(server.stream("live"))` scene backend commits frames when
@@ -132,8 +134,8 @@ one flag check per step; frames are best effort (newest wins, acked by the
 client) and CUDA pose tensors are copied without blocking.
 
 ```python
-from avbd_viz.scene_api import Scene
-from avbd_viz.web.server import StreamBackend, VizServer
+from rillfacet.scene_api import Scene
+from rillfacet.web.server import StreamBackend, VizServer
 server = VizServer("0.0.0.0", 8080, name="my run")     # http://<host>:8080/
 backend = StreamBackend(server.stream("live"))
 scene = Scene(backend)                                  # fill it as any scene
@@ -154,7 +156,7 @@ answers with `event(text)` toasts. A finished run's records replay without
 the producer:
 
 ```bash
-python -m avbd_viz.web.replay RUN_DIR      # RUN_DIR or its evals/ directory
+python -m rillfacet.web.replay RUN_DIR      # RUN_DIR or its evals/ directory
 ```
 
 The browser renders like the native viewer: the same WGSL (the shared
@@ -166,7 +168,7 @@ select, hiding, measuring, wireframe shading, axis views and the gizmo, and
 the Display and Inspect panels. Web only: double-click shows one env alone
 (Esc: all), and the right panel lists the focused env's channels.
 
-The built client is committed under `python/avbd_viz/web/static/`; rebuild it
+The built client is committed under `python/rillfacet/web/static/`; rebuild it
 after editing `web/`:
 
 ```bash
@@ -179,7 +181,7 @@ renders one record frame in a headless native viewer and in Chromium at the
 same camera and settings (style, wireframe, ortho, a selection, ...) and
 diffs them; `web/tools/screenshot.mjs URL WAIT_MS EXPR [OUT.png]` opens the
 client in a real Chromium window over CDP (headless Chromium may have no
-WebGPU adapter) and evaluates `EXPR` (`window.__avbd` holds the stream
+WebGPU adapter) and evaluates `EXPR` (`window.__rillfacet` holds the stream
 stats).
 
 Dragging: with `v.drag_enabled = True`, Ctrl+LMB grabs the element under the
@@ -253,7 +255,7 @@ between the full window and the 3D view alone.
 ## Layout
 
 ```
-src/avbd_viz/
+src/rillfacet/
   gpu.*             WebGPU device, buffers, bind-group shorthands
   shader_library.*  WGSL loader: `#include`, hot reload on save
   camera.*          z-up turntable, reversed-Z infinite projection, smooth views
@@ -269,8 +271,8 @@ src/avbd_viz/
 shaders/
   styles/{studio,matcap,pbr,technical}.wgsl   one `shade()` each: edit these to restyle
   mesh, points, curves, arrows, grid, ssao, composite, overlay_*, env_prefilter .wgsl
-src/python/module.cpp   pybind11 module `_avbd_viz` (+ `avbd_viz.imgui`)
-python/avbd_viz/        Python package
+src/python/module.cpp   pybind11 module `_rillfacet` (+ `rillfacet.imgui`)
+python/rillfacet/        Python package
 tests/                  headless Python tests
 ```
 

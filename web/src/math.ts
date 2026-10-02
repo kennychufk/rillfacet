@@ -1,5 +1,5 @@
 // Column-major 4x4 matrices (WGSL mat4x4f layout) and the orbit camera.
-// World is z-up, like every avbd scene. Depth is reversed-Z, infinite far.
+// World is z-up, like every rillfacet scene. Depth is reversed-Z, infinite far.
 
 export type Vec3 = [number, number, number];
 export type Mat4 = Float32Array;
@@ -83,7 +83,7 @@ export interface Ray { origin: Vec3; dir: Vec3 }
 export type ViewPreset = "front" | "back" | "right" | "left" | "top" | "bottom";
 
 // Z-up turntable camera with Blender-style navigation, a port of the native
-// Camera (src/avbd_viz/camera.cpp): perspective or orthographic, reversed-Z,
+// Camera (src/rillfacet/camera.cpp): perspective or orthographic, reversed-Z,
 // axis view presets with "auto perspective", smooth view transitions.
 // Pixel arguments are device pixels (origin top-left).
 export class Camera {

@@ -1,9 +1,9 @@
-// Vite build of the avbd-viz web client into the Python package, where the
-// training process's server (avbd_viz.web.server) serves it.
+// Vite build of the rillfacet web client into the Python package, where the
+// training process's server (rillfacet.web.server) serves it.
 //
 // WGSL: `import src from "./shaders/rigid.wgsl?style=matcap"` yields the
 // shader source with the repo's `#include "common/..."` / `#include STYLE`
-// resolved exactly like src/avbd_viz/shader_library.cpp does (STYLE =
+// resolved exactly like src/rillfacet/shader_library.cpp does (STYLE =
 // shaders/styles/<style>.wgsl, default studio), so the browser shades with
 // the same code as the native viewer.
 import { existsSync, readFileSync } from "node:fs";
@@ -31,7 +31,7 @@ function resolveIncludes(path: string, style: string, depth = 0, deps: string[] 
 
 function wgsl(): Plugin {
   return {
-    name: "avbd-wgsl",
+    name: "rillfacet-wgsl",
     enforce: "pre",
     load(id) {
       const [file, query = ""] = id.split("?");
@@ -50,7 +50,7 @@ export default defineConfig({
   base: "./",
   plugins: [wgsl()],
   build: {
-    outDir: resolve(here, "../python/avbd_viz/web/static"),
+    outDir: resolve(here, "../python/rillfacet/web/static"),
     emptyOutDir: true,
     target: "es2022",
   },

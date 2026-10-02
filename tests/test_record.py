@@ -1,4 +1,4 @@
-"""avbd_viz.web.record: recording scene sessions and reading them back.
+"""rillfacet.web.record: recording scene sessions and reading them back.
 
     PYTHONPATH=python python -m pytest tests -q
 """
@@ -8,8 +8,8 @@ import os
 import numpy as np
 import pytest
 
-from avbd_viz.scene_api import Scene, box_mesh
-from avbd_viz.web.record import (Recorder, decode_poses, encode_poses,
+from rillfacet.scene_api import Scene, box_mesh
+from rillfacet.web.record import (Recorder, decode_poses, encode_poses,
                                  pose_codec_error, read_index, read_record,
                                  RecordWriter, write_record)
 

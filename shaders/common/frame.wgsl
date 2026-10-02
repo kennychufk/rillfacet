@@ -1,5 +1,5 @@
 // Per-frame constants shared by every pass.
-// Must match `FrameUniforms` in src/avbd_viz/renderer.h field for field.
+// Must match `FrameUniforms` in src/rillfacet/renderer.h field for field.
 struct Frame {
   view: mat4x4f,
   proj: mat4x4f,

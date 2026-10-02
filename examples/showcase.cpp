@@ -1,4 +1,4 @@
-// avbd-viz showcase: no simulator needed. An animated cloth-like sheet with
+// rillfacet showcase: no simulator needed. An animated cloth-like sheet with
 // per-vertex quantities, a few rigid shapes (segments of one mesh), points
 // and vectors.
 //
@@ -6,7 +6,7 @@
 //   ./showcase --headless --out shot.png        offscreen screenshot
 //   ./showcase --headless --style 2 --theme light --out pbr.png
 
-#include "avbd_viz/viewer.h"
+#include "rillfacet/viewer.h"
 
 #include <imgui.h>
 
@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-using namespace avbd_viz;
+using namespace rillfacet;
 
 namespace {
 
@@ -122,7 +122,7 @@ struct Cloth {
 
 int main(int argc, char** argv) {
   ViewerOptions opt;
-  opt.title = "avbd-viz showcase";
+  opt.title = "rillfacet showcase";
   std::string out;
   int style = -1, frames = 3;
   bool light = false, wire = false, measure = false;

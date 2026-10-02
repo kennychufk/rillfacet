@@ -8,7 +8,7 @@ import { ENVIRONMENTS, MATCAPS, matcapDefaultTint } from "./environment";
 import { applyStyleDefaults, defaultSettings, type DisplaySettings, type ObjectDisplay, type Renderer,
   type StyleName, STYLES } from "./renderer";
 
-const KEY = "avbd-viz.display.v1";
+const KEY = "rillfacet.display.v1";
 
 type Row = HTMLElement;
 
