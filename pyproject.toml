@@ -1,6 +1,7 @@
 # The extension is built by CMake (-DRILLFACET_BUILD_PYTHON=ON) into
 # python/rillfacet/; this only makes the package importable:
-#   pip install -e . --no-build-isolation
+#   pip install -e ".[build,test]" --no-build-isolation
+# Non-Python prerequisites (compiler, Dawn, X11 headers, ...) are in README.md.
 [build-system]
 requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
@@ -9,7 +10,19 @@ build-backend = "setuptools.build_meta"
 name = "rillfacet"
 version = "0.1.0"
 requires-python = ">=3.10"
-dependencies = ["numpy"]
+# websockets >= 13 for websockets.asyncio.server (rillfacet.web.server).
+dependencies = ["numpy", "websockets>=13"]
+
+[project.optional-dependencies]
+# Needed to build the _rillfacet extension (CMake finds pybind11 through
+# `python -m pybind11 --cmakedir`); cmake/ninja only if the system's are older
+# than CMake 3.24 or missing.
+build = ["pybind11", "cmake>=3.24", "ninja"]
+test = ["pytest"]
+# web/tools/golden.py (native-vs-browser frame diff).
+tools = ["pillow", "matplotlib"]
+# Optional: set_geometry / set_poses / recorder accept torch tensors (CUDA too).
+torch = ["torch"]
 
 [tool.setuptools.packages.find]
 where = ["python"]

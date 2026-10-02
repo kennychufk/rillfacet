@@ -19,6 +19,35 @@ volumes open to show interior quantities, screenshots and video (ffmpeg).
 
 ## Build
 
+Prerequisites (Linux x86-64). Package names are for Debian/Ubuntu (apt) and
+Fedora (dnf):
+
+| For | Needs | apt | dnf |
+|---|---|---|---|
+| C++ build | GCC >= 13 or Clang (GCC 12 cannot compile Dawn), CMake >= 3.24, Ninja, git, Python 3 (Dawn's dependency fetcher) | `build-essential cmake ninja-build git ca-certificates pkg-config python3` (+ `clang`) | `gcc-c++ make cmake ninja-build git ca-certificates pkgconf-pkg-config python3` (+ `clang`) |
+| Windows (GLFW, Dawn X11 surfaces) | X11 development headers | `libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev` | `libX11-devel libxcb-devel libXrandr-devel libXinerama-devel libXcursor-devel libXi-devel` |
+| Python module | Python >= 3.10 with headers and venv | `python3-dev python3-venv` | `python3-devel` |
+| Running | a Vulkan driver (a GPU's, or Mesa's software one) | `libvulkan1 mesa-vulkan-drivers` | `vulkan-loader mesa-vulkan-drivers` |
+| Optional | `ffmpeg` (.mp4 capture), Node >= 20.19 or >= 22.12 (only to rebuild `web/`) | | |
+
+No OpenGL packages are needed. `docker/verify.sh` checks the whole list from
+bare images; it last passed (C++ part, Python module, 33 tests on Mesa's
+software Vulkan, web client) on:
+
+| Image | Compiler |
+|---|---|
+| Ubuntu 24.04 | GCC 13.3 and Clang 18.1 |
+| Debian 13 | GCC 14.2 |
+| Fedora 44 | GCC 16.2 and Clang 22.1 |
+
+Not supported: GCC 12 (Debian 12) fails inside Dawn. Other distributions,
+aarch64 and real GPUs are untested by that script.
+
+The Dawn, GLFW, GLM, Dear ImGui, ImPlot and stb sources are downloaded during
+the build (`scripts/build_dawn.sh`, `cmake/deps.cmake`), so it needs network
+access to github.com and googlesource.com. Python packages are declared in
+`pyproject.toml`.
+
 ```bash
 ./scripts/build_dawn.sh                    # once, ~10 min: Dawn -> third_party/dawn
 cmake -S . -B build -G Ninja && cmake --build build
@@ -26,8 +55,12 @@ cmake -S . -B build -G Ninja && cmake --build build
 ./build/showcase --headless --style 2 --out shot.png
 ```
 
-`build_dawn.sh` pins a Dawn commit. It needs the X11 development headers,
-including `libx11-xcb-dev`.
+`build_dawn.sh` pins a Dawn commit.
+
+`docker/verify.sh [IMAGE[+clang] ...]` builds from the tracked files only in
+fresh containers (`DOCKER="sudo docker" docker/verify.sh` if your user is not
+in the `docker` group); the install commands it uses are in
+`docker/install_deps.sh`.
 
 At startup Dawn prints `maxDynamicUniformBuffersPerPipelineLayout artificially
 reduced from 500000 to 16 ...` and the storage-buffer twin. That is Dawn
@@ -38,10 +71,11 @@ binds with dynamic offsets, so the warning is harmless.
 Python module (`rillfacet`, pybind11):
 
 ```bash
+pip install pybind11                         # CMake finds it through the interpreter
 cmake -S . -B build -G Ninja -DRILLFACET_BUILD_PYTHON=ON \
       -DPython3_EXECUTABLE=$(which python) && cmake --build build
-pip install -e . --no-build-isolation        # or: PYTHONPATH=python
-PYTHONPATH=python python -m pytest tests -q   # headless checks
+pip install -e ".[build,test]" --no-build-isolation   # or: PYTHONPATH=python (numpy, websockets)
+python -m pytest tests -q                    # headless checks
 ```
 
 ```python

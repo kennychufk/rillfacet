@@ -1,8 +1,12 @@
-# Third-party dependencies (small; each build tree fetches its own copy).
+# Third-party dependencies (small; each build tree fetches its own copy from
+# GitHub, so a first configure needs network access; see README.md for the system
+# packages: compiler, X11 headers for GLFW, ...). Python-side ones are in
+# pyproject.toml.
 include(FetchContent)
 set(FETCHCONTENT_QUIET ON)
 
-# Dawn (native WebGPU) is prebuilt by scripts/build_dawn.sh.
+# Dawn (native WebGPU) is prebuilt by scripts/build_dawn.sh (it fetches its own
+# dependencies: abseil, SPIRV-Tools, Vulkan headers, ...).
 find_package(Dawn CONFIG REQUIRED HINTS ${RILLFACET_ROOT}/third_party/dawn)
 
 set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
@@ -26,6 +30,10 @@ FetchContent_Declare(stb
 
 FetchContent_MakeAvailable(glfw glm)
 set_target_properties(glfw PROPERTIES POSITION_INDEPENDENT_CODE ON)  # linked into the Python module
+# WebGPU only: keep glfw3.h (also included by ImGui's GLFW backend) from pulling in
+# GL/gl.h, so no OpenGL development package is needed (INTERFACE: GLFW itself
+# refuses to be compiled with it).
+target_compile_definitions(glfw INTERFACE GLFW_INCLUDE_NONE)
 FetchContent_Populate(imgui)   # no CMakeLists upstream: built below
 FetchContent_Populate(implot)
 FetchContent_Populate(stb)
