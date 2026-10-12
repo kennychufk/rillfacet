@@ -520,9 +520,10 @@ def test_max_fps_paces_and_request_close_ends():
     import time
     w = viz.Viewer(headless=True, width=160, height=120, max_fps=50.0)
     assert w.max_fps == 50.0
-    w.frame()
+    # The cap spaces frame *starts*: time from the first start, not from after
+    # the first frame (a slow first frame would otherwise eat into the budget).
     t0 = time.perf_counter()
-    for _ in range(5):
+    for _ in range(6):
         assert w.frame()
     assert time.perf_counter() - t0 >= 5 * 0.02 * 0.9
     calls = []
