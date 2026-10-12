@@ -447,7 +447,7 @@ def test_frame_releases_the_gil(v):
     """A Python worker sleeping 1 ms at a time must keep its pace while the
     main thread renders back to back. Were the GIL held through frame(), each
     wake-up would wait for the interpreter's 5 ms switch interval (polyscope's
-    starvation, deskonica docs/traps.md): ~100 wake-ups in 0.5 s, not ~470."""
+    starvation): ~100 wake-ups in 0.5 s, not ~470."""
     import threading
     import time
     count = [0]
