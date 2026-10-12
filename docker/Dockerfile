@@ -62,6 +62,10 @@ RUN set -e; for v in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314
     for w in /raw/*.whl; do auditwheel repair --plat manylinux_2_28_x86_64 -w /dist $w; done; \
     ls -l /dist
 
+# `docker build --target manylinux-dist --output dist` writes just the wheels.
+FROM scratch AS manylinux-dist
+COPY --from=manylinux-wheel /dist /
+
 FROM ${WHEELS} AS wheels
 
 FROM ${BASE} AS wheel-test

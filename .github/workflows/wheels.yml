@@ -1,0 +1,52 @@
+# Builds the manylinux_2_28 wheels (CPython 3.10-3.14) in Docker, tests them in
+# clean Ubuntu / Debian / Fedora images, and publishes them to TestPyPI.
+#   - every push / PR: build + test, wheels kept as a workflow artifact
+#   - tag v*, or "Run workflow" by hand: also upload to TestPyPI
+# TestPyPI uses trusted publishing (no token): register this repository,
+# workflow file (wheels.yml) and environment (testpypi) as a pending publisher
+# at https://test.pypi.org/manage/account/publishing/ before the first upload.
+name: wheels
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # Same build context as docker/verify.sh (tracked + not-ignored files), so
+      # the export below reuses the layers the tests just built.
+      - name: Build wheels and test them in clean images
+        run: docker/verify.sh --manylinux
+      - name: Export the wheels
+        run: |
+          git ls-files -z --cached --others --exclude-standard | tar --null -T - -cf "$RUNNER_TEMP/ctx.tar"
+          docker build --target manylinux-dist --output dist -f docker/Dockerfile - < "$RUNNER_TEMP/ctx.tar"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish-testpypi:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
