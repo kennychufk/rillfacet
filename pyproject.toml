@@ -29,5 +29,5 @@ torch = ["torch"]
 [tool.scikit-build]
 cmake.version = ">=3.24"
 cmake.build-type = "Release"
-build-dir = "build/skbuild"
+build-dir = "build/skbuild/{wheel_tag}"
 wheel.packages = ["python/rillfacet"]

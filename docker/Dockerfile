@@ -4,6 +4,9 @@
 #   DOCKER="sudo docker" docker/verify.sh [BASE_IMAGE[+clang]...]
 ARG BASE=ubuntu:24.04
 ARG COMPILER=gcc
+# Which stage's /dist the wheel-test stage installs: wheel (native) or manylinux-wheel.
+ARG WHEELS=wheel
+ARG MANYLINUX=quay.io/pypa/manylinux_2_28_x86_64
 
 FROM ${BASE} AS toolchain
 ARG COMPILER
@@ -37,17 +40,43 @@ FROM dawn AS wheel
 COPY . .
 RUN python3 -m venv /venv && /venv/bin/pip wheel --no-deps -w /dist .
 
+# Distributable wheels: built in the manylinux_2_28 image (glibc 2.28, GCC 14),
+# Dawn once (it is Python-independent), the module once per CPython, then
+# auditwheel checks the policy and bundles what is needed.
+FROM ${MANYLINUX} AS manylinux-toolchain
+RUN yum install -y libXrandr-devel libXinerama-devel libXcursor-devel libXi-devel \
+    libX11-devel libxcb-devel && yum clean all
+# Dawn's dependency fetcher needs a modern python3; CMake 3 (Dawn's deps predate CMake 4).
+ENV PATH=/opt/python/cp312-cp312/bin:$PATH
+RUN pip install --no-cache-dir ninja "cmake>=3.24,<4" auditwheel
+
+FROM manylinux-toolchain AS manylinux-dawn
+WORKDIR /src
+COPY scripts/build_dawn.sh scripts/build_dawn.sh
+RUN scripts/build_dawn.sh
+
+FROM manylinux-dawn AS manylinux-wheel
+COPY . .
+RUN set -e; for v in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do \
+      /opt/python/$v/bin/pip wheel --no-deps -w /raw . ; done; \
+    for w in /raw/*.whl; do auditwheel repair --plat manylinux_2_28_x86_64 -w /dist $w; done; \
+    ls -l /dist
+
+FROM ${WHEELS} AS wheels
+
 FROM ${BASE} AS wheel-test
 COPY docker/install_deps.sh /usr/local/bin/install_deps.sh
 RUN install_deps.sh run
-COPY --from=wheel /dist /dist
+COPY --from=wheels /dist /dist
 COPY tests /work/tests
 WORKDIR /work
-RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir /dist/*.whl pytest
+# --no-index for rillfacet itself: the wheel under test, not whatever an index has.
+RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir pytest numpy websockets \
+    && /venv/bin/pip install --no-cache-dir --no-index --no-deps --find-links /dist rillfacet
 ENV PATH=/venv/bin:$PATH
 RUN python -c "import rillfacet, pathlib; p = pathlib.Path(rillfacet.__file__).parent; \
 print(sorted(x.name for x in p.iterdir())); \
-assert (p/'shaders').is_dir() and (p/'assets'/'fonts').is_dir() and list(p.glob('libwebgpu_dawn.so'))"
+assert (p/'shaders').is_dir() and (p/'assets'/'fonts').is_dir()"
 RUN python -m pytest tests -q
 
 # Only needed to change web/: rebuilds the committed client from the lockfile.

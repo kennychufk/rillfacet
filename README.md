@@ -83,6 +83,7 @@ built as above, and a Vulkan driver at run time):
 ```bash
 pip install .                                # scikit-build-core runs the CMake build
 docker/verify.sh --wheel                     # builds it in a container, installs it in a clean image, runs the tests
+docker/verify.sh --manylinux                 # manylinux_2_28 wheels for CPython 3.10-3.14 (auditwheel), tested on Ubuntu, Debian, Fedora
 ```
 
 ```python
