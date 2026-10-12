@@ -3,7 +3,7 @@
 # the fonts into the package. Dawn must already be built by
 # scripts/build_dawn.sh (third_party/dawn); docker/verify.sh --wheel does the whole
 # thing in a clean container. For development, build with plain CMake instead
-# (README.md) and use PYTHONPATH=python.
+# (docs/REFERENCE.md) and use PYTHONPATH=python.
 [build-system]
 requires = ["scikit-build-core>=0.11", "pybind11>=2.10"]
 build-backend = "scikit_build_core.build"
@@ -12,6 +12,7 @@ build-backend = "scikit_build_core.build"
 name = "rillfacet"
 version = "0.1.0"
 requires-python = ">=3.10"
+readme = "README.md"
 license = "MIT"
 # The wheel carries Dawn, GLFW, ImGui, ... and fonts: their notices ship with it.
 license-files = ["LICENSE", "THIRD_PARTY_LICENSES.txt"]

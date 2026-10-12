@@ -1,10 +1,11 @@
 // rillfacet showcase: no simulator needed. An animated cloth-like sheet with
-// per-vertex quantities, a few rigid shapes (segments of one mesh), points
-// and vectors.
+// per-vertex quantities, a twisting rope, a few rigid shapes (segments of one
+// mesh), a soft block, points and vectors.
 //
 //   ./showcase                                  interactive window
 //   ./showcase --headless --out shot.png        offscreen screenshot
 //   ./showcase --headless --style 2 --theme light --out pbr.png
+//   ./showcase --headless --slice --hide-slice-plane   cut the soft block open
 
 #include "rillfacet/viewer.h"
 
@@ -128,6 +129,7 @@ int main(int argc, char** argv) {
   bool light = false, wire = false, measure = false;
   std::string view, record;
   bool wire_shading = false, slice = false;
+  bool hide_slice_plane = false;
   float opacity = 1.0f, cam[6] = {0, 0, 0, 10, -60, 30};
   bool use_cam = false;
   bool selftest_v1 = false;
@@ -147,6 +149,7 @@ int main(int argc, char** argv) {
     else if (a == "--no-ui") no_ui = true;
     else if (a == "--wire") wire_shading = true;
     else if (a == "--slice") slice = true;
+    else if (a == "--hide-slice-plane") hide_slice_plane = true;
     else if (a == "--cam" && i + 6 < argc) {
       for (int k = 0; k < 6; ++k) cam[k] = std::stof(argv[++i]);
       use_cam = true;
@@ -172,6 +175,16 @@ int main(int argc, char** argv) {
   if (no_ssao) viewer.settings().ssao = false;
   if (no_shadows) viewer.settings().shadows = false;
 
+  // Layout: the sheet on the left, rigid shapes in two staggered rows (so none
+  // hides another from the default camera), the soft block on the right, and
+  // the rope along the back. The self-tests below are written against these.
+  const glm::vec3 box_c(0.4f, -1.0f, 0.5f);       // big box; the small box sits on it
+  const glm::vec3 cyl_c(3.0f, 0.6f, 0.6f);
+  const glm::vec3 ball_c(1.4f, 1.0f, 0.55f);
+  const glm::vec3 ico_c(2.3f, -1.5f, 0.4f);
+  const glm::vec3 block_origin(4.6f, -0.6f, 0.0f);
+  const glm::vec3 rope_c(1.2f, 3.6f, 1.1f);        // helix axis centre
+
   // Rigid shapes as segments ("bodies") of one mesh.
   MeshData shapes;
   std::vector<uint32_t> offsets = {0};
@@ -182,11 +195,11 @@ int main(int argc, char** argv) {
     offsets.push_back(uint32_t(shapes.f.size() / 3));
     names.push_back(name);
   };
-  add(box(1.0f, 1.0f, 1.0f), 1.2f, -0.6f, 0.5f, "box");
-  add(cylinder(0.5f, 1.2f, 24), 2.6f, 0.4f, 0.6f, "cylinder");
-  add(icosphere(0.55f, 2), 1.6f, 1.2f, 0.55f, "sphere");
-  add(box(0.6f, 0.6f, 0.6f), 1.4f, -0.5f, 1.3f, "small box");
-  add(icosphere(0.4f, 0), 3.1f, -1.0f, 0.4f, "icosahedron");
+  add(box(1.0f, 1.0f, 1.0f), box_c.x, box_c.y, box_c.z, "box");
+  add(cylinder(0.5f, 1.2f, 24), cyl_c.x, cyl_c.y, cyl_c.z, "cylinder");
+  add(icosphere(0.55f, 2), ball_c.x, ball_c.y, ball_c.z, "sphere");
+  add(box(0.6f, 0.6f, 0.6f), box_c.x + 0.05f, box_c.y, 1.3f, "small box");
+  add(icosphere(0.4f, 0), ico_c.x, ico_c.y, ico_c.z, "icosahedron");
   SurfaceMesh& bodies = viewer.scene().add_mesh("bodies");
   bodies.set_geometry(shapes.v.data(), shapes.v.size() / 3, shapes.f.data(), shapes.f.size() / 3);
   bodies.set_segments(offsets, names);
@@ -208,29 +221,34 @@ int main(int argc, char** argv) {
   arrows.radius = 0.012f;
   arrows.length_scale = 1.0f;
 
-  // A rope: helix curve network colored by height, with tangent arrows.
+  // A rope: a helix that twists and breathes (screw motion plus a travelling
+  // swell), colored by height, with outward normals drawn as arrows.
   CurveNetwork& rope = viewer.scene().add_curves("rope");
-  {
-    std::vector<float> nodes, height, tangent;
-    const int n = 120;
-    for (int i = 0; i < n; ++i) {
-      float u = float(i) / (n - 1), a = 6.0f * 3.14159265f * u;
-      float x = -1.0f + 2.0f * u, y = 3.4f + 0.45f * std::cos(a), z = 0.9f + 0.45f * std::sin(a);
+  const int rope_n = 160;
+  auto update_rope = [&](float time) {
+    std::vector<float> nodes, height, normal;
+    for (int i = 0; i < rope_n; ++i) {
+      float u = float(i) / (rope_n - 1), a = 8.0f * 3.14159265f * u - 2.2f * time;
+      float r = 0.5f * (1.0f + 0.3f * std::sin(4.0f * 3.14159265f * u - 2.6f * time));
+      float x = rope_c.x - 1.6f + 3.2f * u;
+      float y = rope_c.y + r * std::cos(a), z = rope_c.z + r * std::sin(a);
       nodes.insert(nodes.end(), {x, y, z});
       height.push_back(z);
-      tangent.insert(tangent.end(), {0.0f, std::cos(a), std::sin(a)});  // outward normal of the helix
+      normal.insert(normal.end(), {0.0f, std::cos(a), std::sin(a)});
     }
-    rope.set_polyline(nodes.data(), n);
-    rope.radius = 0.05f;
+    if (rope.num_nodes() == 0) rope.set_polyline(nodes.data(), rope_n);
+    else rope.set_nodes(nodes.data(), rope_n);
     rope.add_scalar("height", ElementKind::Vertex, height);
-    Quantity& tq = rope.add_vector("normal", ElementKind::Vertex, tangent);
+    Quantity& tq = rope.add_vector("normal", ElementKind::Vertex, normal);
     tq.show_arrows = true;
-    tq.arrow_scale = 0.18f;
+    tq.arrow_scale = 0.16f;
     tq.arrow_color = {0.95f, 0.75f, 0.25f};
-    rope.color_source = ColorSource::Quantity;
-    rope.color_quantity = "height";
-    rope.colormap = 3;  // plasma
-  }
+  };
+  rope.radius = 0.05f;
+  update_rope(0.0f);
+  rope.color_source = ColorSource::Quantity;
+  rope.color_quantity = "height";
+  rope.colormap = 3;  // plasma
 
   // A soft block: a tetrahedralized box (6 tets per cube) with vertex and
   // cell quantities; slice it to see inside.
@@ -238,7 +256,7 @@ int main(int argc, char** argv) {
   {
     const int nx = 12, ny = 6, nz = 6;
     const float h = 0.2f;
-    const glm::vec3 origin(4.2f, -0.6f, 0.0f);
+    const glm::vec3 origin = block_origin;
     std::vector<float> xyz, dist;
     auto id = [&](int i, int j, int k) { return uint32_t((k * (ny + 1) + j) * (nx + 1) + i); };
     for (int k = 0; k <= nz; ++k)
@@ -274,8 +292,11 @@ int main(int argc, char** argv) {
     if (slice) {
       viewer.settings().slice.enabled = true;
       viewer.settings().slice.axis = 1;
-      viewer.settings().slice.offset = 0.0f;
+      viewer.settings().slice.offset = origin.y + 0.6f;  // the block's mid-plane
+      viewer.settings().slice.show = !hide_slice_plane;
       viewer.settings().slice.flip = true;  // keep y > 0, so the cut faces the default camera
+      for (Structure* s : std::initializer_list<Structure*>{&bodies, &sheet, &rope})  // cut only the block
+        s->sliced = false;
     }
   }
 
@@ -283,6 +304,7 @@ int main(int argc, char** argv) {
   bool animate = true;
   auto update = [&](float dt) {
     cloth.update(t);
+    update_rope(t);
     sheet.set_positions(cloth.pos.data());
     size_t nv = cloth.pos.size() / 3;
     // Velocity from the time actually elapsed: assuming a 60 Hz frame made
@@ -330,10 +352,10 @@ int main(int argc, char** argv) {
   t = 0.7f;
   update(1.0f / 60.0f);
 
-  viewer.camera().target = {0.6f, 0.8f, 0.8f};
-  viewer.camera().distance = 13.5f;
-  viewer.camera().yaw = -1.25f;
-  viewer.camera().pitch = 0.42f;
+  viewer.camera().target = {1.4f, 0.6f, 0.8f};
+  viewer.camera().distance = 11.0f;
+  viewer.camera().yaw = -1.0f;
+  viewer.camera().pitch = 0.45f;
   if (use_cam) {  // --cam target_x target_y target_z distance yaw_deg pitch_deg
     viewer.camera().target = {cam[0], cam[1], cam[2]};
     viewer.camera().distance = cam[3];
@@ -379,7 +401,7 @@ int main(int argc, char** argv) {
   if (selftest_v1) {
     // Picking on curves and volumes (the slice plane is on, cut facing the camera).
     ImGuiIO& io = ImGui::GetIO();
-    viewer.camera().target = {5.4f, 0.0f, 0.6f};
+    viewer.camera().target = block_origin + glm::vec3(1.2f, 0.6f, 0.6f);
     viewer.camera().distance = 5.0f;
     viewer.camera().yaw = glm::radians(-60.0f);
     viewer.camera().pitch = glm::radians(30.0f);
@@ -410,16 +432,16 @@ int main(int argc, char** argv) {
       std::printf("%s: %s #%u\n", what, st ? st->name().c_str() : "?", items[0].index);
     };
     // A point on the cut (y = 0 plane) inside the block.
-    glm::vec3 on_cut(5.0f, 0.0f, 0.5f);
+    glm::vec3 on_cut = block_origin + glm::vec3(0.8f, 0.6f, 0.5f);
     key(ImGuiKey_3);  // face mode -> tet cells on volumes
     click(px(on_cut));
     report("cell under the cut");
     if (!items.empty()) {
       glm::vec3 c = block.element_position(ElementKind::Cell, items[0].index);
-      std::printf("  cell centroid (%.2f %.2f %.2f), expect near (5.0, 0.0..0.2, 0.5)\n", c.x, c.y, c.z);
+      std::printf("  cell centroid (%.2f %.2f %.2f), expect near (%.1f, 0.0..0.2, 0.5)\n", c.x, c.y, c.z, on_cut.x);
     }
     key(ImGuiKey_1);
-    click(px({4.2f, 0.0f, 1.2f}));  // the cut's top-left corner is a mesh vertex
+    click(px(block_origin + glm::vec3(0.0f, 0.6f, 1.2f)));  // the cut's top-left corner is a mesh vertex
     report("vertex near the cut corner");
     if (!items.empty()) {
       glm::vec3 v = block.vertex(items[0].index);
@@ -432,7 +454,7 @@ int main(int argc, char** argv) {
     std::printf("pick on the cut: valid=%d point=(%.3f %.3f %.3f) (y should be ~0)\n", h.valid, h.point.x, h.point.y,
                 h.point.z);
     // The rope, seen from its own side.
-    viewer.camera().target = {0.0f, 3.4f, 0.9f};
+    viewer.camera().target = rope_c;
     viewer.camera().distance = 3.2f;
     viewer.camera().yaw = glm::radians(-70.0f);
     viewer.camera().pitch = glm::radians(25.0f);
@@ -472,7 +494,7 @@ int main(int argc, char** argv) {
       viewer.frame();
     };
     for (int i = 0; i < 3; ++i) viewer.frame();
-    glm::vec2 box_px = px({1.2f, -1.1f, 0.5f});  // front face of the big box
+    glm::vec2 box_px = px(box_c + glm::vec3(0.0f, -0.5f, 0.0f));  // front face of the big box
     Hit h = viewer.pick(box_px.x, box_px.y);
     std::printf("pick: valid=%d object=%u face=%u point=(%.3f %.3f %.3f)\n", h.valid, h.surface.object,
                 h.surface.index, h.point.x, h.point.y, h.point.z);
@@ -480,10 +502,10 @@ int main(int argc, char** argv) {
     click(box_px);
     auto& items = viewer.selection().items();
     std::printf("body click: %zu selected, first=%u (expect body 0)\n", items.size(), items.empty() ? 99u : items[0].index);
-    click(px({2.6f, 0.4f, 1.2f}), true);
+    click(px(cyl_c + glm::vec3(0.0f, 0.0f, 0.6f)), true);
     std::printf("shift-click cylinder: %zu selected\n", items.size());
     key(ImGuiKey_1);
-    glm::vec2 a = px({0.5f, -1.2f, 1.2f}), b = px({1.9f, -1.2f, -0.1f});
+    glm::vec2 a = px(box_c + glm::vec3(-0.7f, -0.6f, 0.7f)), b = px(box_c + glm::vec3(0.7f, -0.6f, -0.6f));
     io.AddMousePosEvent(a.x, a.y);
     viewer.frame();
     io.AddMouseButtonEvent(0, true);
@@ -494,8 +516,8 @@ int main(int argc, char** argv) {
     viewer.frame();
     std::printf("box select vertices: %zu selected (visible front corners)\n", items.size());
     key(ImGuiKey_M);
-    click(px({0.7f, -1.1f, 0.0f}));
-    click(px({1.7f, -1.1f, 0.0f}));
+    click(px(box_c + glm::vec3(-0.5f, -0.5f, -0.5f)));
+    click(px(box_c + glm::vec3(0.5f, -0.5f, -0.5f)));
     if (!viewer.measurements().empty()) {
       const Measurement& m = viewer.measurements().back();
       glm::vec3 p0 = resolve_anchor(viewer.scene(), m.anchors[0]), p1 = resolve_anchor(viewer.scene(), m.anchors[1]);
@@ -527,7 +549,7 @@ int main(int argc, char** argv) {
     // the small box stacked on it and anything behind.
     viewer.settings().shading = Shading::Wireframe;
     viewer.selection().clear();
-    glm::vec2 c = px({1.4f, -0.5f, 0.9f});
+    glm::vec2 c = px(box_c + glm::vec3(0.2f, 0.1f, 0.4f));
     io.AddMousePosEvent(c.x - 60, c.y - 60);
     viewer.frame();
     io.AddMouseButtonEvent(0, true);
