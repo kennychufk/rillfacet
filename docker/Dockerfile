@@ -80,7 +80,10 @@ RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir pytest numpy w
 ENV PATH=/venv/bin:$PATH
 RUN python -c "import rillfacet, pathlib; p = pathlib.Path(rillfacet.__file__).parent; \
 print(sorted(x.name for x in p.iterdir())); \
-assert (p/'shaders').is_dir() and (p/'assets'/'fonts').is_dir()"
+assert (p/'shaders').is_dir() and (p/'assets'/'fonts').is_dir(); \
+import importlib.metadata as md; d = md.distribution('rillfacet'); \
+lic = sorted(f.name for f in d.files if 'licenses' in f.parts); print(d.metadata['License-Expression'], lic); \
+assert lic == ['LICENSE', 'THIRD_PARTY_LICENSES.txt'] and d.metadata['License-Expression'] == 'MIT'"
 RUN python -m pytest tests -q
 
 # Only needed to change web/: rebuilds the committed client from the lockfile.

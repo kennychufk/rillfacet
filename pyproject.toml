@@ -5,13 +5,16 @@
 # thing in a clean container. For development, build with plain CMake instead
 # (README.md) and use PYTHONPATH=python.
 [build-system]
-requires = ["scikit-build-core>=0.10", "pybind11>=2.10"]
+requires = ["scikit-build-core>=0.11", "pybind11>=2.10"]
 build-backend = "scikit_build_core.build"
 
 [project]
 name = "rillfacet"
 version = "0.1.0"
 requires-python = ">=3.10"
+license = "MIT"
+# The wheel carries Dawn, GLFW, ImGui, ... and fonts: their notices ship with it.
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES.txt"]
 # websockets >= 13 for websockets.asyncio.server (rillfacet.web.server).
 dependencies = ["numpy", "websockets>=13"]
 
@@ -19,7 +22,7 @@ dependencies = ["numpy", "websockets>=13"]
 # Needed to build the _rillfacet extension (CMake finds pybind11 through
 # `python -m pybind11 --cmakedir`); cmake/ninja only if the system's are older
 # than CMake 3.24 or missing.
-build = ["pybind11", "cmake>=3.24", "ninja", "scikit-build-core>=0.10"]
+build = ["pybind11", "cmake>=3.24", "ninja", "scikit-build-core>=0.11"]
 test = ["pytest"]
 # web/tools/golden.py (native-vs-browser frame diff).
 tools = ["pillow", "matplotlib"]

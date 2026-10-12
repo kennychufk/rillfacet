@@ -311,3 +311,9 @@ the C++ host compiles to WebAssembly with Emscripten's `emdawnwebgpu` port.
 Native-only pieces: `Gpu::wait` (browsers await instead of blocking) and the
 GLFW/X11 surface. The only thing WebGPU cannot do is share CUDA buffers
 directly; simulator data is copied through the CPU each frame.
+
+## License
+
+MIT (`LICENSE`). Wheels also contain Dawn (BSD-3-Clause), GLFW (zlib), Dear ImGui and
+ImPlot (MIT), pybind11, and the Inter and JetBrains Mono fonts (OFL-1.1); their
+licenses are in `THIRD_PARTY_LICENSES.txt` and `assets/fonts/`.
