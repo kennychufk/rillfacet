@@ -5,6 +5,7 @@
 // structure must not be used. `rillfacet.imgui` is a Dear ImGui subset named
 // like polyscope.imgui, for per-frame UI in the viewer callback.
 
+#include "rillfacet/resources.h"
 #include "rillfacet/viewer.h"
 
 #include <imgui.h>
@@ -211,7 +212,7 @@ PYBIND11_MODULE(_rillfacet, m) {
     // The 3D-label font exactly as the renderer builds it (SDF atlas + glyph
     // metrics), for clients that draw text themselves (the web viewer).
     Font f;
-    if (!f.load(path.empty() ? std::string(RILLFACET_ASSET_DIR) + "/fonts/Inter-SemiBold.ttf" : path))
+    if (!f.load(path.empty() ? rillfacet::asset_dir() + "/fonts/Inter-SemiBold.ttf" : path))
       throw std::runtime_error("cannot load font " + path);
     py::array_t<uint8_t> atlas({f.atlas_height(), f.atlas_width()});
     std::memcpy(atlas.mutable_data(), f.atlas().data(), f.atlas().size());

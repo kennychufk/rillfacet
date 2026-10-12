@@ -1,4 +1,5 @@
 #include "rillfacet/renderer.h"
+#include "rillfacet/resources.h"
 
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -379,7 +380,7 @@ bool Renderer::init(std::string* error) {
   }
 
   // Font atlas for 3D labels.
-  std::string font_path = std::string(RILLFACET_ASSET_DIR) + "/fonts/Inter-SemiBold.ttf";
+  std::string font_path = asset_dir() + "/fonts/Inter-SemiBold.ttf";
   if (!font_.load(font_path)) {
     if (error) *error = "cannot load font " + font_path;
     return false;

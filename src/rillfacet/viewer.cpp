@@ -1,4 +1,5 @@
 #include "rillfacet/viewer.h"
+#include "rillfacet/resources.h"
 
 #include "rillfacet/ui.h"
 
@@ -31,7 +32,7 @@ static glm::vec4 srgba(float r, float g, float b, float a = 1.0f) { return {r, g
 Viewer::Viewer(const ViewerOptions& options) : options_(options) {
   gpu_ = std::make_unique<Gpu>();
   if (!gpu_->init()) return;
-  shaders_ = std::make_unique<ShaderLibrary>(RILLFACET_SHADER_DIR);
+  shaders_ = std::make_unique<ShaderLibrary>(shader_dir());
   renderer_ = std::make_unique<Renderer>(*gpu_, *shaders_);
 
   uint32_t w = uint32_t(options.width), h = uint32_t(options.height);
@@ -77,7 +78,7 @@ Viewer::Viewer(const ViewerOptions& options) : options_(options) {
   ImGuiIO& io = ImGui::GetIO();
   io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
   io.IniFilename = nullptr;
-  std::string fonts = std::string(RILLFACET_ASSET_DIR) + "/fonts/";
+  std::string fonts = asset_dir() + "/fonts/";
   ui_font_ = io.Fonts->AddFontFromFileTTF((fonts + "Inter-Medium.ttf").c_str(), 15.0f * content_scale);
   mono_font_ = io.Fonts->AddFontFromFileTTF((fonts + "JetBrainsMono-Regular.ttf").c_str(), 14.0f * content_scale);
   if (window_) ImGui_ImplGlfw_InitForOther(window_, true);

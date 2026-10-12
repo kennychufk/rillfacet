@@ -2,7 +2,7 @@
 # Install the prerequisites listed in README.md on a bare image, for the
 # clean-room check (docker/Dockerfile). Not needed on a developer machine.
 #   install_deps.sh build [gcc|clang]   toolchain, X11 headers, Python
-#   install_deps.sh run                 a Vulkan driver (Mesa software rasteriser)
+#   install_deps.sh run                 a Vulkan driver (Mesa software rasteriser), Python
 set -eu
 stage=$1
 compiler=${2:-gcc}
@@ -20,7 +20,7 @@ if command -v apt-get >/dev/null; then
         libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
       [ "$compiler" = clang ] && apt-get install -y --no-install-recommends clang
       ;;
-    run) apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers ;;
+    run) apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers python3 python3-venv ;;
   esac
   rm -rf /var/lib/apt/lists/*
 elif command -v dnf >/dev/null; then
@@ -33,7 +33,7 @@ elif command -v dnf >/dev/null; then
         libXcursor-devel libXi-devel
       [ "$compiler" = clang ] && dnf install -y --setopt=install_weak_deps=False clang
       ;;
-    run) dnf install -y --setopt=install_weak_deps=False vulkan-loader mesa-vulkan-drivers ;;
+    run) dnf install -y --setopt=install_weak_deps=False vulkan-loader mesa-vulkan-drivers python3 ;;
   esac
   dnf clean all
 else

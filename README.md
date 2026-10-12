@@ -74,8 +74,15 @@ Python module (`rillfacet`, pybind11):
 pip install pybind11                         # CMake finds it through the interpreter
 cmake -S . -B build -G Ninja -DRILLFACET_BUILD_PYTHON=ON \
       -DPython3_EXECUTABLE=$(which python) && cmake --build build
-pip install -e ".[build,test]" --no-build-isolation   # or: PYTHONPATH=python (numpy, websockets)
-python -m pytest tests -q                    # headless checks
+PYTHONPATH=python python -m pytest tests -q  # headless checks (numpy, websockets, pytest)
+```
+
+Installable wheel (extension, Dawn, shaders and fonts in one package; needs Dawn
+built as above, and a Vulkan driver at run time):
+
+```bash
+pip install .                                # scikit-build-core runs the CMake build
+docker/verify.sh --wheel                     # builds it in a container, installs it in a clean image, runs the tests
 ```
 
 ```python

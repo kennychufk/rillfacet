@@ -30,6 +30,26 @@ RUN install_deps.sh run
 RUN ./build/showcase --headless --style 2 --out /tmp/shot.png && test -s /tmp/shot.png
 RUN python -m pytest tests -q
 
+# The installable wheel (scikit-build-core: extension + Dawn + shaders + fonts),
+# then tested in a clean image that has only the runtime prerequisites: no
+# compiler, no source tree, so a missing resource or library shows up here.
+FROM dawn AS wheel
+COPY . .
+RUN python3 -m venv /venv && /venv/bin/pip wheel --no-deps -w /dist .
+
+FROM ${BASE} AS wheel-test
+COPY docker/install_deps.sh /usr/local/bin/install_deps.sh
+RUN install_deps.sh run
+COPY --from=wheel /dist /dist
+COPY tests /work/tests
+WORKDIR /work
+RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir /dist/*.whl pytest
+ENV PATH=/venv/bin:$PATH
+RUN python -c "import rillfacet, pathlib; p = pathlib.Path(rillfacet.__file__).parent; \
+print(sorted(x.name for x in p.iterdir())); \
+assert (p/'shaders').is_dir() and (p/'assets'/'fonts').is_dir() and list(p.glob('libwebgpu_dawn.so'))"
+RUN python -m pytest tests -q
+
 # Only needed to change web/: rebuilds the committed client from the lockfile.
 FROM node:22-slim AS web
 WORKDIR /src

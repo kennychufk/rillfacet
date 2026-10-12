@@ -1,10 +1,12 @@
-# The extension is built by CMake (-DRILLFACET_BUILD_PYTHON=ON) into
-# python/rillfacet/; this only makes the package importable:
-#   pip install -e ".[build,test]" --no-build-isolation
-# Non-Python prerequisites (compiler, Dawn, X11 headers, ...) are in README.md.
+# Built with scikit-build-core: `pip install .` / `pip wheel .` run CMake with
+# -DRILLFACET_BUILD_PYTHON=ON and install the extension, Dawn, the shaders and
+# the fonts into the package. Dawn must already be built by
+# scripts/build_dawn.sh (third_party/dawn); docker/verify.sh --wheel does the whole
+# thing in a clean container. For development, build with plain CMake instead
+# (README.md) and use PYTHONPATH=python.
 [build-system]
-requires = ["setuptools>=64"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.10", "pybind11>=2.10"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "rillfacet"
@@ -17,15 +19,15 @@ dependencies = ["numpy", "websockets>=13"]
 # Needed to build the _rillfacet extension (CMake finds pybind11 through
 # `python -m pybind11 --cmakedir`); cmake/ninja only if the system's are older
 # than CMake 3.24 or missing.
-build = ["pybind11", "cmake>=3.24", "ninja"]
+build = ["pybind11", "cmake>=3.24", "ninja", "scikit-build-core>=0.10"]
 test = ["pytest"]
 # web/tools/golden.py (native-vs-browser frame diff).
 tools = ["pillow", "matplotlib"]
 # Optional: set_geometry / set_poses / recorder accept torch tensors (CUDA too).
 torch = ["torch"]
 
-[tool.setuptools.packages.find]
-where = ["python"]
-
-[tool.setuptools.package-data]
-rillfacet = ["*.so"]
+[tool.scikit-build]
+cmake.version = ">=3.24"
+cmake.build-type = "Release"
+build-dir = "build/skbuild"
+wheel.packages = ["python/rillfacet"]
