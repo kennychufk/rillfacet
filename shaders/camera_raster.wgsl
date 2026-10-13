@@ -13,11 +13,12 @@ const NONE: u32 = SEG_NONE;    // label of "nothing"
 
 struct Frame {
   ambient: vec4f,         // uniform sky radiance (rgb); w = envmap intensity (0 = none)
-  misc: vec4f,            // envmap mip count, directional light count, shadows (0/1), bias
-  shadow_c: vec4f,        // shadow box center, half extent r
-  lx: vec4f,              // shadow frame: lz = direction the light travels
-  ly: vec4f,
-  lz: vec4f,
+  misc: vec4f,            // envmap mip count, directional light count, shadows (0/1), bias (m)
+  shadow_c: vec4f,        // shadow box center, half extent r (across the light)
+  lx: vec4f,              // shadow frame axes; lx.w > 0: the box is centered lx.w
+  ly: vec4f,              //   ahead of each env's camera instead of at shadow_c
+  lz: vec4f,              // lz = direction the light travels; lz.w = depth range
+                          //   toward the light (casters up to there cast)
   dir: array<vec4f, 4>,   // toward each directional light (light 0 casts the shadows)
   col: array<vec4f, 4>,   // its irradiance (rgb)
   sh: array<vec4f, 9>,    // envmap irradiance, SH coefficients (rgb), times intensity
@@ -47,6 +48,9 @@ struct Mat { c: vec4f, p: vec4f };    // linear base color, roughness; metallic,
 @group(0) @binding(7) var repeat_lin: sampler;
 @group(0) @binding(8) var env_tex: texture_2d<f32>;
 @group(0) @binding(9) var clamp_lin: sampler;
+// Directional albedo of the BRDF by (n_dot_v, roughness): GGX scale and
+// bias (F0 * x + y) and Burley diffuse (rillfacet.render.raster.brdf_lut).
+@group(0) @binding(19) var brdf_lut: texture_2d<f32>;
 
 fn qrot(q: vec4f, v: vec3f) -> vec3f {
   let t = 2.0 * cross(q.xyz, v);
@@ -87,17 +91,31 @@ fn body(b: u32, e: u32) -> Body {
   return Body(textureLoad(poses, vec2u(2u * b, e), 0), textureLoad(poses, vec2u(2u * b + 1u, e), 0));
 }
 
+// Shadow-map coordinates of world point p in env e's box: x, y in [-1, 1]
+// across the light, z in [0, 1] from lz.w toward the light to r beyond the
+// box center.
+fn shadow_xyz(p: vec3f, e: u32) -> vec3f {
+  var c = frame.shadow_c.xyz;
+  if (frame.lx.w > 0.0) {
+    let cb = body(view.chunk.z, e);
+    c = cb.p.xyz + qrot(cb.q, vec3f(0.0, 0.0, frame.lx.w));
+  }
+  let d = p - c;
+  let r = frame.shadow_c.w;
+  return vec3f(dot(d, frame.lx.xyz) / r, dot(d, frame.ly.xyz) / r,
+               (dot(d, frame.lz.xyz) + frame.lz.w) / (frame.lz.w + r));
+}
+
 struct SOut { @builtin(position) pos: vec4f, @builtin(clip_distances) cd: array<f32, 2> };
 
 @vertex fn vs_shadow(v: VIn, @builtin(instance_index) inst: u32) -> SOut {
   let n = view.chunk.y;
   let e = inst % n;
   let bp = body(inst / n, e);
-  let d = bp.p.xyz + qrot(bp.q, v.p) - frame.shadow_c.xyz;
-  let r = frame.shadow_c.w;
-  let x = dot(d, frame.lx.xyz) / r;
-  let y = dot(d, frame.ly.xyz) / r;
-  let z = (dot(d, frame.lz.xyz) + r) / (2.0 * r);
+  let s = shadow_xyz(bp.p.xyz + qrot(bp.q, v.p), e);
+  let x = s.x;
+  let y = s.y;
+  let z = s.z;
   let Ts = f32(view.tiles.y);
   let t = f32(e % view.tiles.y);
   var o: SOut;
@@ -165,10 +183,11 @@ struct FIn {
 fn lit(p: vec3f, n: vec3f, e: u32) -> f32 {
   let r = frame.shadow_c.w;
   let res = f32(view.tiles.z);
-  let d = p + n * (2.0 * r / res) - frame.shadow_c.xyz;     // one texel of normal offset
-  let x = dot(d, frame.lx.xyz) / r;
-  let y = dot(d, frame.ly.xyz) / r;
-  let z = (dot(d, frame.lz.xyz) + r) / (2.0 * r);
+  let sc = shadow_xyz(p + n * (2.0 * r / res), e);            // one texel of normal offset
+  let x = sc.x;
+  let y = sc.y;
+  let z = sc.z;
+  let bias = frame.misc.w / (frame.lz.w + r);
   let Ts = view.tiles.y;
   let t = f32(e % Ts);
   let layer = e / Ts;
@@ -179,20 +198,16 @@ fn lit(p: vec3f, n: vec3f, e: u32) -> f32 {
     for (var i = -1; i <= 1; i++) {
       let uvt = clamp(base + vec2f(f32(i), f32(j)) * texel, vec2f(0.5 * texel), vec2f(1.0 - 0.5 * texel));
       let uv = vec2f(uvt.x, (uvt.y + t) / f32(Ts));
-      s += textureSampleCompareLevel(shadow_tex, shadow_cmp, uv, layer, z - frame.misc.w);
+      s += textureSampleCompareLevel(shadow_tex, shadow_cmp, uv, layer, z - bias);
     }
   }
   return select(s / 9.0, 1.0, abs(x) > 1.0 || abs(y) > 1.0 || z > 1.0);
 }
 
-// Analytic fit of the split-sum BRDF integral (Karis, "Mobile PBR", 2014).
-fn env_brdf(f0: vec3f, roughness: f32, n_dot_v: f32) -> vec3f {
-  let c0 = vec4f(-1.0, -0.0275, -0.572, 0.022);
-  let c1 = vec4f(1.0, 0.0425, 1.04, -0.04);
-  let r = roughness * c0 + c1;
-  let a004 = min(r.x * r.x, exp2(-9.28 * n_dot_v)) * r.x + r.y;
-  let ab = vec2f(-1.04, 1.04) * a004 + r.zw;
-  return f0 * ab.x + ab.y;
+fn albedo(n_dot_v: f32, roughness: f32) -> vec3f {
+  let n = f32(textureDimensions(brdf_lut).x);
+  let uv = (vec2f(n_dot_v, roughness) * (n - 1.0) + 0.5) / n;
+  return textureSampleLevel(brdf_lut, clamp_lin, uv, 0.0).xyz;
 }
 
 fn sh_irradiance(n: vec3f) -> vec3f {
@@ -205,8 +220,20 @@ fn sh_irradiance(n: vec3f) -> vec3f {
   return max(e, vec3f(0.0));
 }
 
-// Linear radiance toward the camera: GGX + Lambert under the directional
-// lights (light 0 shadowed), the uniform sky and the environment.
+fn smith_g1(n_dot: f32, a2: f32) -> f32 {
+  return 2.0 * n_dot / (n_dot + sqrt(a2 + (1.0 - a2) * n_dot * n_dot));
+}
+
+fn schlick_weight(c: f32) -> f32 {
+  let m = clamp(1.0 - c, 0.0, 1.0);
+  return m * m * m * m * m;
+}
+
+// Linear radiance toward the camera under the directional lights (light 0
+// shadowed), the uniform sky and the environment. The BRDF is Mitsuba's
+// principled one without sheen / clearcoat / transmission: Burley diffuse
+// with retro-reflection, GGX (alpha = roughness^2) with separable Smith
+// masking and Schlick's Fresnel toward the base color for metals.
 fn shade(i: FIn) -> vec3f {
   let m = mats[(view.chunk.x + i.ids.y) * view.chunk.w + i.ids.x];
   let layer = i32(m.p.y);
@@ -221,7 +248,8 @@ fn shade(i: FIn) -> vec3f {
   let NdV = max(dot(N, V), 1e-4);
   let F0 = mix(vec3f(0.04), base, metal);
   let a2 = rough * rough * rough * rough;
-  let k = (rough + 1.0) * (rough + 1.0) / 8.0;
+  let Fo = schlick_weight(NdV);
+  let gv = smith_g1(NdV, a2);
   var c = vec3f(0.0);
   let nd = u32(frame.misc.y);
   for (var l = 0u; l < nd; l++) {
@@ -230,18 +258,24 @@ fn shade(i: FIn) -> vec3f {
     if (NdL <= 0.0) { continue; }
     let H = normalize(L + V);
     let NdH = max(dot(N, H), 0.0);
+    let LdH = max(dot(L, H), 0.0);
     let dd = NdH * NdH * (a2 - 1.0) + 1.0;
     let D = a2 / (PI * dd * dd);
-    let G = NdV / (NdV * (1.0 - k) + k) * NdL / (NdL * (1.0 - k) + k);
-    let F = F0 + (1.0 - F0) * pow(1.0 - max(dot(V, H), 0.0), 5.0);
-    let spec = D * G * F / (4.0 * NdV * NdL + 1e-4);
-    let diff = (1.0 - F) * (1.0 - metal) * base / PI;
+    let G = gv * smith_g1(NdL, a2);
+    let F = F0 + (1.0 - F0) * schlick_weight(LdH);
+    let spec = D * G * F / (4.0 * NdV * NdL);
+    let Fi = schlick_weight(NdL);
+    let rr = 2.0 * rough * LdH * LdH;
+    let burley = (1.0 - 0.5 * Fi) * (1.0 - 0.5 * Fo) + rr * (Fo + Fi + Fo * Fi * (rr - 1.0));
+    let diff = (1.0 - metal) * base / PI * burley;
     var vis = 1.0;
     if (l == 0u && frame.misc.z > 0.0) { vis = lit(i.wp, N, i.ids.y); }
     c += (diff + spec) * NdL * frame.col[l].rgb * vis;
   }
-  let fe = env_brdf(F0, rough, NdV);
-  let diffuse_albedo = base * (1.0 - metal);
+  // Uniform sky: exactly the BRDF's directional albedo (no occlusion).
+  let alb = albedo(NdV, rough);
+  let fe = F0 * alb.x + alb.y;
+  let diffuse_albedo = base * (1.0 - metal) * alb.z;
   c += frame.ambient.rgb * (diffuse_albedo + fe);
   if (frame.ambient.w > 0.0) {
     c += diffuse_albedo / PI * sh_irradiance(N);

@@ -74,6 +74,9 @@ class CameraRaster {
   // Equirectangular environment, linear RGBA16F (raw half bits), w x h at
   // level 0, halved per level.
   bool set_envmap(uint32_t w, uint32_t h, const std::vector<const uint16_t*>& mips);
+  // Directional albedo of the BRDF, n x n (n_dot_v along x, roughness along
+  // y), RGBA16F half bits: GGX scale and bias (F0 * x + y), Burley diffuse.
+  bool set_brdf_lut(uint32_t n, const uint16_t* data);
   // [envs, slots, 8]: linear base color, roughness, metallic, texture layer
   // (-1 = none), 0, 0.
   bool set_materials(const float* m, uint32_t envs, uint32_t slots);
@@ -145,7 +148,7 @@ class CameraRaster {
   uint64_t mats_size_ = 0, lens_size_ = 0;
   std::vector<uint32_t> first_index_, index_count_;
   uint32_t bodies_ = 0;
-  wgpu::Texture base_tex_, env_tex_;
+  wgpu::Texture base_tex_, env_tex_, brdf_lut_;
   wgpu::Sampler cmp_, repeat_, clamp_;
   wgpu::Texture dummy_out_[4], dummy_rad_, dummy_depth_, dummy_seg_, dummy_shadow_;
   bool groups_dirty_ = true, shadows_ = false;

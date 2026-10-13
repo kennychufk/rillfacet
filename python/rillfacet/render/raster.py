@@ -19,14 +19,17 @@ on the GPU) a frame never waits on the CPU. How it maps the scene, and why
   envmap, seen directly), applies the shared sensor stage (gain,
   vignetting, shot and read noise; :mod:`rillfacet.render.sensor`'s model,
   with its own GPU random numbers) and writes the outputs.
-- Shading: forward PBR (GGX + Lambert, glTF metallic-roughness, base color
+- Shading: forward PBR with Mitsuba's principled BRDF (Burley diffuse,
+  GGX with separable Smith masking; glTF metallic-roughness, base color
   textures times the per-env base color) under up to 4 directional lights,
   the first one casting shadows (a ``shadow_resolution``\\ :sup:`2` map per
-  env over the scene's bounding box, 3x3 PCF), plus the uniform sky
-  (``ambient``) and an ``envmap`` (diffuse from 9 spherical harmonics,
-  specular from its mip chain). No depth of field, motion blur or
-  interreflections: images are sharp and direct-lit, like Mitsuba's
-  ``direct`` integrator without area sampling.
+  env over the scene's bounding box or ahead of the camera, 3x3 PCF), plus
+  the uniform sky (``ambient``; the BRDF's exact directional albedo,
+  :func:`brdf_lut`) and an ``envmap`` (diffuse from 9 spherical harmonics,
+  specular from its mip chain). No depth of field, motion blur,
+  interreflections or occlusion of the sky: images are sharp and
+  direct-lit, like Mitsuba's ``direct`` integrator, except that the sky
+  reaches every surface unblocked.
 - Depth and segmentation: per output pixel, the label of the proxy pixel
   nearest its center ray and a z-depth interpolated in 1/z between its 4
   proxy neighbors where they agree (as the Cycles backend).
@@ -48,7 +51,7 @@ from . import Renderer, srgb_to_linear
 from .camera import PixelRays
 from .sensor import radius2
 
-__all__ = ["RasterRenderer"]
+__all__ = ["RasterRenderer", "brdf_lut"]
 
 _BITS = {"rgb": 1, "linear": 2, "depth": 4, "segmentation": 8}
 _DEFAULT_LIGHTS = (("ambient", 0.35, (1.0, 1.0, 1.0), None),
@@ -56,6 +59,57 @@ _DEFAULT_LIGHTS = (("ambient", 0.35, (1.0, 1.0, 1.0), None),
 #: Largest tangent of the angle off the optical axis a pinhole proxy covers.
 MAX_TAN = 5.0
 MAX_DIRECTIONAL = 4
+
+
+_LUT = None
+
+
+def brdf_lut(n=32, samples=64):
+    """``[n, n, 4]`` float32 directional albedo of the shader's BRDF, by
+    roughness (rows, 0..1) and n_dot_v (columns, 0..1): the GGX lobe's
+    scale and bias (its albedo is ``F0 * scale + bias`` with Schlick's
+    Fresnel; alpha = roughness^2, separable Smith masking) and the Burley
+    diffuse albedo (relative to Lambert's). ``samples``^2 stratified
+    importance samples per entry (torch, CPU)."""
+    import torch
+    T = torch.float64
+    j = torch.arange(n, dtype=T) / (n - 1)
+    rough = j.clamp(min=0.03)[:, None, None]               # as the shader
+    nv = j.clamp(min=1e-3)[None, :, None]
+    g = (torch.arange(samples, dtype=T) + 0.5) / samples
+    u1, u2 = torch.meshgrid(g, g, indexing="ij")
+    u1, u2 = u1.reshape(1, 1, -1), u2.reshape(1, 1, -1)
+    V = torch.stack(torch.broadcast_tensors(
+        (1 - nv * nv).sqrt(), torch.zeros_like(nv), nv), -1)  # [1, n, 1, 3]
+    a2 = rough ** 4
+
+    def g1(x):
+        return 2 * x / (x + (a2 + (1 - a2) * x * x).sqrt())
+
+    # GGX lobe: half vectors from the NDF, estimator G VdH / (NdV NdH)
+    ct = ((1 - u1) / (1 + (a2 - 1) * u1)).sqrt()
+    st = (1 - ct * ct).clamp(min=0).sqrt()
+    ph = 2 * np.pi * u2
+    Hv = torch.stack(torch.broadcast_tensors(st * ph.cos(), st * ph.sin(), ct), -1)
+    vdh = (V * Hv).sum(-1)
+    ndl = 2 * vdh * Hv[..., 2] - nv
+    est = torch.where(ndl > 0, g1(nv) * g1(ndl.clamp(min=1e-9)) * vdh
+                      / (nv * Hv[..., 2]), torch.zeros_like(ndl))
+    w = (1 - vdh).clamp(0, 1) ** 5
+    scale, bias = (est * (1 - w)).mean(-1), (est * w).mean(-1)
+    # Burley diffuse: cosine-sampled light directions
+    r = u1.sqrt()
+    L = torch.stack(torch.broadcast_tensors(r * ph.cos(), r * ph.sin(),
+                                            (1 - u1).sqrt()), -1)
+    Hd = L + V
+    Hd = Hd / Hd.norm(dim=-1, keepdim=True)
+    ldh = (L * Hd).sum(-1)
+    fo, fi = (1 - nv) ** 5, (1 - L[..., 2]) ** 5
+    rr = 2 * rough * ldh * ldh
+    diff = ((1 - 0.5 * fi) * (1 - 0.5 * fo)
+            + rr * (fo + fi + fo * fi * (rr - 1))).mean(-1)
+    out = torch.stack([scale, bias, diff, torch.zeros_like(diff)], -1)
+    return out.float().numpy()
 
 
 def _sh_basis(x, y, z):
@@ -139,9 +193,11 @@ class _View:
                              self.cx, self.cy, cam.near, cam.far, chunk, sets,
                              shadow_res, bits, supersample, remap)
         if self.id < 0:
-            raise RuntimeError(f"RasterRenderer: cannot set up camera "
-                               f"{cam.name!r} (proxy {self.pw}x{self.ph}, "
-                               f"chunk {chunk}): too large for the GPU limits")
+            raise RuntimeError(
+                f"RasterRenderer: cannot set up camera {cam.name!r} (proxy "
+                f"{self.pw}x{self.ph}, chunk {chunk}, shadow maps "
+                f"{shadow_res}^2): beyond the GPU's limits or memory; use a "
+                "smaller chunk, shadow_resolution or oversample")
         self.bufs = {}                 # set -> raw chunk buffers
 
 
@@ -154,14 +210,19 @@ class RasterRenderer(Renderer):
     ``oversample`` scales the proxy's resolution. ``shadow_resolution``: per
     env (0 = no shadows); the shadow box is fit to the scene at the first
     render (over all envs, 5% margin) unless ``shadow_box=(center,
-    half_extent)``; :meth:`fit_shadow_box` refits it. ``zero_copy``: share
+    half_extent)``; :meth:`fit_shadow_box` refits it. ``shadow_extent``
+    (m; a float, or a dict by camera name) instead centers each env's shadow
+    map ``shadow_extent`` ahead of the camera with that half extent: far
+    sharper shadows for a close-up camera (every caster in the scene still
+    casts into it; receivers outside it are lit). ``zero_copy``: share
     poses and images with CUDA (needs torch with CUDA; falls back to host
     copies when unavailable). ``seed`` seeds the sensor noise.
     """
 
     def __init__(self, *, chunk=256, double_buffer=True, supersample=2,
                  oversample=1.0, shadow_resolution=512, shadow_box=None,
-                 texture_size=1024, zero_copy=True, seed=0):
+                 shadow_extent=None, texture_size=1024, zero_copy=True,
+                 seed=0):
         super().__init__(env_spacing=np.inf, seed=seed)
         from .. import _rillfacet
         import torch
@@ -173,6 +234,10 @@ class RasterRenderer(Renderer):
         if not self._r.ok:
             raise RuntimeError("RasterRenderer: no usable WebGPU device "
                                "(needs Vulkan with clip distances)")
+        global _LUT
+        if _LUT is None:
+            _LUT = brdf_lut()
+        self._r.set_brdf_lut(_LUT.astype(np.float16).view(np.uint16))
         self.zero_copy = self._r.zero_copy
         self.dev = torch.device("cuda" if cuda else "cpu")
         self.chunk = int(chunk)
@@ -180,6 +245,7 @@ class RasterRenderer(Renderer):
         self.supersample = int(supersample)
         self.oversample = float(oversample)
         self.shadow_resolution = int(shadow_resolution)
+        self.shadow_extent = shadow_extent
         self.texture_size = int(texture_size)
         self._shadow_box = None if shadow_box is None else (
             np.asarray(shadow_box[0], np.float64), float(shadow_box[1]))
@@ -335,7 +401,6 @@ class RasterRenderer(Renderer):
             lx = np.cross(lz, up)
             lx /= np.linalg.norm(lx)
             F[12:15], F[16:19], F[20:23] = lx, np.cross(lz, lx), lz
-            F[7] = 1.5 / max(self.shadow_resolution, 1)   # depth bias
         if env is not None:
             img = _load_envmap(env[0])
             mips = [img]
@@ -390,10 +455,18 @@ class RasterRenderer(Renderer):
             self._write_materials(cam.instances)
             self._dirty_appearance.clear()
         if self._shadow_box is None and self._frame[6] > 0:
-            self.fit_shadow_box()
+            self.fit_shadow_box()    # the extent of the scene, also for shadow_extent
         F = self._frame.copy()
         if self._shadow_box is not None:
-            F[8:11], F[11] = self._shadow_box[0], self._shadow_box[1]
+            c, r = self._shadow_box
+            ext = self.shadow_extent
+            ext = ext.get(cam.name) if isinstance(ext, dict) else ext
+            F[8:11], F[11] = c, r
+            F[23] = r                       # depth range toward the light
+            if ext:                         # a box ahead of each camera
+                F[11], F[15] = ext, ext
+                F[23] = 2 * r + ext         # casters anywhere in the scene
+            F[7] = 1.5 * 2 * F[11] / max(self.shadow_resolution, 1)  # bias (m)
         self._r.set_frame(F)
         lens = np.zeros((cam.instances, 8), np.float32)
         lens[:, :3] = cam.gain
@@ -458,8 +531,9 @@ class RasterRenderer(Renderer):
         if hit is not None:
             bits |= hit[1].bits if hit[0] == key else 0
             self._r.remove_view(hit[1].id)
-        v = _View(self._r, cam, bits, self.chunk, self.sets,
-                  self.shadow_resolution, self.supersample, self.oversample)
+        v = _View(self._r, cam, bits, min(self.chunk, cam.instances),
+                  self.sets, self.shadow_resolution, self.supersample,
+                  self.oversample)
         self._views[cam.name] = (key, v)
         return v
 

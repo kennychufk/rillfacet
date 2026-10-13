@@ -243,15 +243,24 @@ compute pass resamples through the exact OpenCV distortion (`supersample`
 x `supersample` taps), adding the background (the ambient light, the
 envmap) and the shared sensor stage (same model, its own GPU random
 numbers, drawn per env so images do not depend on the chunking). Shading is
-forward PBR (GGX + Lambert, base color textures times the per-env color)
-under up to 4 directional lights, the first casting shadows
-(`shadow_resolution`^2 per env over the scene's box, fit at the first render
-or given as `shadow_box`), plus the sky and the envmap (9 SH coefficients
-for diffuse, its mip chain for specular). No depth of field (a warning),
-motion blur, interreflections or occlusion of the sky; next to Mitsuba's
-`direct` integrator a lit dielectric is within ~4% and a metal under the
-sky ~20% darker (the split-sum fit). Geometry agrees with Mitsuba's
-(tests/test_render_raster.py).
+forward with Mitsuba's principled BRDF (Burley diffuse, GGX with separable
+Smith masking; base color textures times the per-env color) under up to 4
+directional lights, the first casting shadows (`shadow_resolution`^2 per
+env, 3x3 PCF), plus the uniform sky (the BRDF's exact directional albedo,
+a table `brdf_lut()` computes once) and the envmap (9 SH coefficients for
+diffuse, its mip chain for specular). The shadow maps cover the scene's
+box (fit at the first render or given as `shadow_box`) or, with
+`shadow_extent` (m, per camera as a dict), a box that far ahead of each
+env's camera: a close-up camera then gets millimeter shadow texels at 512^2
+(the oven-grasp wrist camera: 0.4 m, sharper than 2048^2 over the scene),
+and every caster in the scene still casts into it. Next to Mitsuba's
+`direct` integrator a surface under the sun is within 1% (and on the
+oven-grasp scene too, per body); the sky is not: it reaches every surface
+unblocked (no occlusion of the sky), so surfaces that see the table or the
+oven instead of the sky are brighter (up to 1.5x on the oven-grasp scene
+with its 0.5 sky). No depth of field (a warning), motion blur or
+interreflections. Geometry agrees with Mitsuba's (labels on all pixels away
+from edges, z-depth to 1e-5; tests/test_render_raster.py).
 
 On Linux + Vulkan + NVIDIA the poses and images never leave the GPU
 (`src/rillfacet/cuda_share.h`): the shared textures are allocated on our own
@@ -263,12 +272,15 @@ device-to-device copy and a chunk loop never waits on the CPU (with
 stream uses the current one). Elsewhere (`info` tells) poses are uploaded
 from the host and images read back. Measured on an RTX 5070 Ti, the
 oven-grasp wrist camera (Pi Camera Module 3 Wide calibration, 640 x 384,
-proxy 860 x 522), 4096 envs per frame, chunk 256, 512^2 shadows: rgb 97 ms
-with the UR5e's visual meshes decimated to 10% (17.6k triangles in the
-scene), 188 ms at full detail (134k); rgb + depth + segmentation 121 ms
-(decimated). The time goes mostly to memory traffic of the wide proxy
-(`oversample=0.75`: 66 ms) and to triangles at full detail, so give
-`BodyMesh` low-detail visual meshes for RL.
+proxy 860 x 522), chunk 256, 512^2 shadows, the UR5e's visual meshes
+decimated to 10% (17.6k triangles in the scene): rgb in 3.4 ms for 128 envs
+(Mitsuba, direct, 4 spp: 215 ms), 27 ms for 1024, 106 ms for 4096 (178 ms
+at full detail, 134k triangles); rgb + depth + segmentation 131 ms for 4096.
+The time goes mostly to memory traffic of the wide proxy (`oversample=0.75`
+saves a third) and to triangles at full detail, so give `BodyMesh`
+low-detail visual meshes for RL. A detector of YOLOv8n's size on the same
+GPU costs ~5x the rendering, and overlapping the two buys nothing there
+(CUDA and Vulkan work time-slice the GPU).
 
 Records: `rillfacet.web.record.Recorder` is a scene backend that logs every
 update between `start(scene)` and `finish()` against a caller-driven clock

@@ -207,9 +207,11 @@ def test_hidden_body_disappears():
     assert (seg[0] == 1).sum() > 10 and (seg[1] == 1).sum() == 0
 
 
-def test_shadow_and_sun():
-    """A box between the sun and a floor darkens the floor below it."""
-    r = RasterRenderer(shadow_resolution=512)
+@pytest.mark.parametrize("extent", [None, 1.5])
+def test_shadow_and_sun(extent):
+    """A box between the sun and a floor darkens the floor below it, with
+    the scene's shadow box or one ahead of the camera (shadow_extent)."""
+    r = RasterRenderer(shadow_resolution=512, shadow_extent=extent)
     sc = Scene(r)
     floor = np.array([[-2, -2, 0], [2, -2, 0], [2, 2, 0], [-2, 2, 0]], float)
     m = rigid(sc, "m", [(floor, np.array([[0, 1, 2], [0, 2, 3]])),
@@ -323,25 +325,25 @@ def test_geometry_matches_mitsuba():
     ("ambient", dict(intensity=1.0)),
     ("directional", dict(direction=(0, 0, 1.0), intensity=1.0)),
     ("directional", dict(direction=(0.6, 0, 0.8), intensity=1.0))])
-@pytest.mark.parametrize("roughness", [1.0, 0.5, 0.2])
-def test_dielectric_shading_matches_mitsuba(light, roughness):
-    """A plane facing the camera under one light: within 6% of Mitsuba's
-    direct integrator (Lambert vs. Disney diffuse is most of the gap).
-    Not compared: occlusion of the sky (none here; the raster has no
-    ambient occlusion) and metals under the sky (the split-sum fit is ~20%
-    darker)."""
+@pytest.mark.parametrize("roughness,metallic", [(1.0, 0.0), (0.5, 0.0), (0.2, 0.0),
+                                                (0.5, 1.0), (0.3, 0.5)])
+def test_shading_matches_mitsuba(light, roughness, metallic):
+    """A plane facing the camera under one light: within 1.5% of Mitsuba's
+    principled BRDF (direct integrator). What is not compared: the sky
+    blocked by other geometry (no occlusion of the sky in the raster)."""
     res = []
     for R in (RasterRenderer(), _mitsuba()):
         sc = Scene(R)
         v, f = quad(2.0, 1.0)
         m = sc.rigid_mesh("m", v.astype(np.float32), [0] * 4, f, [0, 2], instances=1,
-                          materials=[Material("a", (0.6, 0.6, 0.6), roughness=roughness)])
+                          materials=[Material("a", (0.6, 0.5, 0.4), roughness=roughness,
+                                              metallic=metallic)])
         m.set_poses(identity_poses(1, 1))
         sc.light("l", light[0], **light[1])
         sc.camera_sensor("c", W, H, K, instances=1, local_pose=IDENTITY, far=10)
         res.append(R.render("c", outputs=("linear",))["linear"][0, 18:30, 26:38]
                    .float().mean((0, 1)).cpu().numpy())
-    np.testing.assert_allclose(res[0], res[1], rtol=0.06)
+    np.testing.assert_allclose(res[0], res[1], rtol=0.015)
 
 
 def test_envmap_matches_mitsuba(tmp_path):

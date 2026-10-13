@@ -64,6 +64,12 @@ void bind_camera_raster(py::module_& m) {
         if (keep.empty()) return false;
         return r.set_envmap(uint32_t(keep[0].shape(1)), uint32_t(keep[0].shape(0)), ptrs);
       })
+      .def("set_brdf_lut", [](CameraRaster& r, py::handle lut) {
+        auto a = checked<uint16_t>(lut, 3, "brdf lut (float16 bits)");
+        if (a.shape(0) != a.shape(1) || a.shape(2) != 4)
+          throw std::invalid_argument("CameraRaster.set_brdf_lut: [n, n, 4]");
+        return r.set_brdf_lut(uint32_t(a.shape(0)), a.data());
+      })
       .def("set_materials", [](CameraRaster& r, py::handle m) {
         auto a = checked<float>(m, 3, "materials");
         return r.set_materials(a.data(), uint32_t(a.shape(0)), uint32_t(a.shape(1)));
