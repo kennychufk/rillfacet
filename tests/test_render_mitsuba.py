@@ -213,6 +213,29 @@ def test_gain_and_chunking():
     assert cam.instances == 3
 
 
+def test_vignetting_and_noise():
+    """The shared sensor stage runs on the backend's radiance: per-env
+    vignetting scales by 1 - v r^2, read noise adds its variance."""
+    from rillfacet.render.sensor import radius2
+    sc, r = setup(spp=16, integrator={"type": "direct"}, seed=4)
+    rigid(sc, "wall", [quad([0, 0, 2.0], 20.0)], instances=3,
+          colors=[(0.5, 0.5, 0.5)])
+    sc.light("sky", "ambient", intensity=0.5)
+    K = [[30, 0, 23.5], [0, 30, 17.5], [0, 0, 1]]
+    sc.camera_sensor("cam", 48, 36, K, instances=3, local_pose=IDENTITY,
+                     vignetting=[0.0, 0.5, 0.0], read_noise=[0.0, 0.0, 0.05])
+    lin = r.render("cam", outputs=("linear",))["linear"].mean(-1).cpu()
+    r2 = radius2(K, 48, 36)
+    ratio = lin[1] / lin[0]
+    corner = r2 > 0.7
+    assert float(ratio[r2 < 0.05].mean()) == pytest.approx(1.0, abs=0.03)
+    assert float(ratio[corner].mean()) == pytest.approx(
+        float((1 - 0.5 * r2[corner]).mean()), abs=0.03)
+    # read noise per channel (0.05^2), averaged over 3 channels: / 3
+    extra = float(lin[2].var() - lin[0].var())
+    assert extra == pytest.approx(0.05 ** 2 / 3, rel=0.25)
+
+
 def test_instance_counts_must_match():
     sc, r = setup()
     rigid(sc, "wall", [quad([0, 0, 2.0], 1.0)])

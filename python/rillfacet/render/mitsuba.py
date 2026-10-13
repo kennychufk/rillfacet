@@ -91,7 +91,7 @@ class MitsubaRenderer(Renderer):
     def __init__(self, *, spp=8, integrator=None, denoise=False,
                  env_spacing=50.0, max_samples=8_000_000, seed=0,
                  variant="cuda_ad_rgb"):
-        super().__init__(env_spacing=env_spacing)
+        super().__init__(env_spacing=env_spacing, seed=seed)
         import mitsuba as mi
         import torch
         if mi.variant() != variant:
@@ -404,9 +404,8 @@ class MitsubaRenderer(Renderer):
         out = {}
         want_rgb = "rgb" in outputs or "linear" in outputs
         if want_rgb:
-            lin = self._render_rgb(cam, pix_rays, pose, spp)
-            gain = torch.as_tensor(cam.gain, device=self.dev).float()
-            lin = lin * gain[:, None, None, :]
+            lin = self.sensor_image(
+                cam, self._render_rgb(cam, pix_rays, pose, spp))
             if "linear" in outputs:
                 out["linear"] = lin
             if "rgb" in outputs:

@@ -487,14 +487,21 @@ class CameraSensor(_Object):
     ``aperture_radius`` (m, 0 = pinhole; a lens of focal length f at
     f-number N has f / 2N) and ``focus_distance`` (m) give depth of field;
     ``gain`` ``[3]`` or ``[instances, 3]`` multiplies the linear RGB
-    (exposure and white balance). ``near`` / ``far`` clip the z-depth.
+    (exposure and white balance); ``vignetting`` is the fraction of light
+    lost at the image corner farthest from the principal point (falloff
+    ``1 - v r^2``, ``r`` = 1 there); ``shot_noise`` / ``read_noise`` add
+    sensor noise of variance ``shot_noise * x + read_noise^2`` to each
+    channel of the linear image ``x`` (white = 1). Renderers apply them in
+    that order (:mod:`rillfacet.render.sensor`). ``near`` / ``far`` clip
+    the z-depth.
     """
     kind = "camera_sensor"
 
     def __init__(self, scene, name, width, height, K, *, dist=None,
                  mount=None, body=0, local_pose=(0, 0, 0, 0, 0, 0, 1),
                  instances=None, near=0.01, far=10.0, aperture_radius=0.0,
-                 focus_distance=1.0, gain=(1.0, 1.0, 1.0)):
+                 focus_distance=1.0, gain=(1.0, 1.0, 1.0), vignetting=0.0,
+                 shot_noise=0.0, read_noise=0.0):
         super().__init__(scene, name)
         self.width, self.height = int(width), int(height)
         self.K = np.asarray(K, np.float64).reshape(3, 3)
@@ -523,9 +530,11 @@ class CameraSensor(_Object):
         self.local_pose = None
         self.set_local_pose(local_pose, _notify=False)
         self.aperture_radius = self.focus_distance = self.gain = None
+        self.vignetting = self.shot_noise = self.read_noise = None
         self.set_lens(aperture_radius=aperture_radius,
                       focus_distance=focus_distance, gain=gain,
-                      _notify=False)
+                      vignetting=vignetting, shot_noise=shot_noise,
+                      read_noise=read_noise, _notify=False)
 
     def set_local_pose(self, pose, _notify=True) -> None:
         """``[7]`` or ``[instances, 7]``: the camera in its mount body's
@@ -540,9 +549,17 @@ class CameraSensor(_Object):
             self._changed("pose")
 
     def set_lens(self, *, aperture_radius=None, focus_distance=None,
-                 gain=None, _notify=True) -> None:
+                 gain=None, vignetting=None, shot_noise=None, read_noise=None,
+                 _notify=True) -> None:
         """Per-instance (or shared) lens / sensor values."""
         I = self.instances
+        for name, v in (("vignetting", vignetting), ("shot_noise", shot_noise),
+                        ("read_noise", read_noise)):
+            if v is not None:
+                v = np.broadcast_to(_host(v), (I,)).astype(np.float32)
+                if (v < 0).any() or (name == "vignetting" and (v > 1).any()):
+                    raise ValueError(f"CameraSensor: {name} out of range")
+                setattr(self, name, v.copy())
         if aperture_radius is not None:
             self.aperture_radius = np.broadcast_to(
                 _host(aperture_radius), (I,)).copy()
@@ -585,7 +602,10 @@ class CameraSensor(_Object):
                      instances=self.instances, near=self.near, far=self.far)
         return attrs, dict(local_pose=_host(self.local_pose),
                            aperture_radius=self.aperture_radius,
-                           focus_distance=self.focus_distance, gain=self.gain)
+                           focus_distance=self.focus_distance, gain=self.gain,
+                           vignetting=self.vignetting,
+                           shot_noise=self.shot_noise,
+                           read_noise=self.read_noise)
 
 
 # --------------------------------------------------------------------------

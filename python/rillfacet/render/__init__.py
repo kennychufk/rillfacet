@@ -17,7 +17,10 @@ tensors::
 
 Every instance is rendered in its own world: a camera of env k sees only
 env k's geometry (renderers place the envs far apart, beyond the cameras'
-``far``). Lights are shared by all instances.
+``far``). Lights are shared by all instances. Every backend passes its
+radiance through the same sensor stage (:mod:`rillfacet.render.sensor`:
+gain, vignetting, shot and read noise, per instance) before ``"linear"``
+and ``"rgb"``.
 
 Backends: :mod:`rillfacet.render.mitsuba` (Mitsuba 3 path tracing on CUDA,
 thin-lens depth of field, exact OpenCV distortion); Blender Cycles in the
@@ -61,12 +64,16 @@ class Renderer(Backend):
 
     ``env_spacing`` (m): instance k is rendered at a grid offset of
     ``env_spacing`` per cell, so it must exceed a camera's ``far`` plus the
-    size of one env's geometry."""
+    size of one env's geometry. ``seed`` seeds the sensor noise
+    (:meth:`sensor_image`)."""
 
     OUTPUTS = ("rgb", "linear", "depth", "segmentation")
 
-    def __init__(self, env_spacing=50.0):
+    def __init__(self, env_spacing=50.0, seed=0):
         self.env_spacing = float(env_spacing)
+        self._sensor_seed = int(seed)
+        self._sensor_gen = None
+        self._r2: dict = {}                    # camera -> (key, r^2 map)
         self.meshes: dict = {}                 # name -> RigidMesh (in order)
         self.lights: dict = {}
         self.cameras: dict = {}
@@ -136,9 +143,27 @@ class Renderer(Backend):
                              f"below env_spacing ({self.env_spacing} m)")
         return cam
 
+    def sensor_image(self, cam, radiance):
+        """The camera's linear image from the linear ``radiance`` a backend
+        rendered (``[I, H, W, 3]`` torch): gain, vignetting and sensor
+        noise, the stage every backend shares (:mod:`.sensor`)."""
+        import torch
+        from . import sensor
+        dev = radiance.device
+        if self._sensor_gen is None or self._sensor_gen.device != dev:
+            self._sensor_gen = torch.Generator(device=dev)
+            self._sensor_gen.manual_seed(self._sensor_seed)
+        key = (cam.width, cam.height, cam.K.tobytes(), str(dev))
+        hit = self._r2.get(cam.name)
+        if hit is None or hit[0] != key:
+            hit = self._r2[cam.name] = (
+                key, sensor.radius2(cam.K, cam.width, cam.height, dev))
+        return sensor.apply(cam, radiance, generator=self._sensor_gen,
+                            r2=hit[1])
+
     def render(self, camera: str, outputs=("rgb",), **kw) -> dict:
         """Images of every instance from ``camera``: a dict of the requested
-        ``outputs`` (``"rgb"`` sRGB ``[I, H, W, 3]``, ``"linear"`` linear
-        radiance ``[I, H, W, 3]``, ``"depth"`` ``[I, H, W]``,
+        ``outputs`` (``"rgb"`` sRGB ``[I, H, W, 3]``, ``"linear"`` the
+        linear camera image ``[I, H, W, 3]`` (:meth:`sensor_image`), ``"depth"`` ``[I, H, W]``,
         ``"segmentation"`` ``[I, H, W]`` int32)."""
         raise NotImplementedError

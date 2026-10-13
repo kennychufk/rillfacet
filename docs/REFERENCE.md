@@ -168,10 +168,20 @@ every material's parameters, so domain randomization is an array write
 OpenCV intrinsics and distortion (`K`, `dist`; camera frame x right, y down,
 z forward), mounted on a body (`mount`, `body`, `local_pose`), with
 per-env lens and sensor values (`aperture_radius`, `focus_distance` for
-depth of field; `gain` for exposure / white balance). A `Renderer` is a
-scene backend whose `render(camera, outputs)` returns every env's images
-as torch tensors; each env is rendered in its own world (envs sit
-`env_spacing` apart, beyond the cameras' `far`).
+depth of field; `gain` for exposure / white balance; `vignetting`,
+`shot_noise`, `read_noise`; all settable later with `set_lens`). A
+`Renderer` is a scene backend whose `render(camera, outputs)` returns every
+env's images as torch tensors; each env is rendered in its own world (envs
+sit `env_spacing` apart, beyond the cameras' `far`).
+
+Every backend passes its linear radiance `L` through the same sensor stage
+(`render/sensor.py`, `Renderer.sensor_image`) before the `linear` and `rgb`
+outputs: `x = gain * (1 - vignetting * r^2) * L`, with `r` = 1 at the image
+corner farthest from the principal point (so `vignetting` is the light lost
+there), then Gaussian noise of variance `shot_noise * x + read_noise^2` per
+channel (the Poisson-Gaussian sensor model; white = 1), clamped at 0. The
+noise is seeded by the renderer's `seed`. The module docstring gives
+published randomization ranges for the noise.
 
 ```python
 from rillfacet.assets import load_mesh, merge_bodies     # glTF 2.0 (.glb) / OBJ
@@ -356,7 +366,8 @@ src/python/module.cpp   pybind11 module `_rillfacet` (+ `rillfacet.imgui`)
 python/rillfacet/        Python package
   scene_api.py          backend-neutral scene (+ materials, lights, camera sensors)
   assets.py             glTF / OBJ visual meshes, merge_bodies
-  render/               camera renderers: camera.py (OpenCV model), mitsuba.py
+  render/               camera renderers: camera.py (OpenCV model), sensor.py
+                        (gain, vignetting, noise), mitsuba.py
   web/                  stream server, recorder, replay, built browser client
 tests/                  headless Python tests (render tests need CUDA + mitsuba)
 ```
