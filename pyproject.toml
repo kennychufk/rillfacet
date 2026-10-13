@@ -54,6 +54,10 @@ test = ["pytest"]
 tools = ["pillow", "matplotlib"]
 # Optional: set_geometry / set_poses / recorder accept torch tensors (CUDA too).
 torch = ["torch"]
+# Camera rendering with Mitsuba 3 (rillfacet.render.mitsuba; needs CUDA).
+mitsuba = ["mitsuba>=3.9", "torch", "pillow"]
+# Embedded / image-file textures of rillfacet.assets meshes.
+assets = ["pillow"]
 
 [tool.scikit-build]
 cmake.version = ">=3.24"

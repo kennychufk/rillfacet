@@ -157,6 +157,67 @@ bodies = sc.rigid_mesh("bodies", local_verts, vertex_body, tris, body_tri_offset
 bodies.set_poses(poses)                 # [4, B, 7] translation + xyzw quaternion
 ```
 
+Camera rendering (`rillfacet.render`, for vision RL and synthetic data): a
+scene also carries what viewers ignore. Rigid meshes take `normals`, `uvs`,
+`materials` (`Material`: glTF's PBR metallic-roughness, optional base color
+texture) and `triangle_material`; each instance (env) has its own copy of
+every material's parameters, so domain randomization is an array write
+(`set_materials(base_color=[E, M, 3], roughness=[E, M], metallic=...)`).
+`scene.light(...)` adds lights shared by all envs (`directional`,
+`ambient`, `envmap`); `scene.camera_sensor(...)` adds a camera per env with
+OpenCV intrinsics and distortion (`K`, `dist`; camera frame x right, y down,
+z forward), mounted on a body (`mount`, `body`, `local_pose`), with
+per-env lens and sensor values (`aperture_radius`, `focus_distance` for
+depth of field; `gain` for exposure / white balance). A `Renderer` is a
+scene backend whose `render(camera, outputs)` returns every env's images
+as torch tensors; each env is rendered in its own world (envs sit
+`env_spacing` apart, beyond the cameras' `far`).
+
+```python
+from rillfacet.assets import load_mesh, merge_bodies     # glTF 2.0 (.glb) / OBJ
+from rillfacet.render.camera import look_at, scale_intrinsics
+from rillfacet.render.mitsuba import MitsubaRenderer      # pip install rillfacet[mitsuba]
+
+r = MitsubaRenderer(spp=8)          # path tracing on CUDA
+sc = Scene(r)
+robot = sc.rigid_mesh("robot", **merge_bodies([load_mesh(p) for p in links]),
+                      instances=E)
+robot.set_poses(poses)              # [E, B, 7], torch CUDA ok
+robot.set_materials(base_color=rng.uniform(0, 1, (E, len(robot.materials), 3)))
+sc.camera_sensor("wrist", 320, 180, scale_intrinsics(K, (4608, 2592), (320, 180)),
+                 dist=dist, mount=robot, body=6, local_pose=cam_in_flange,
+                 aperture_radius=0.6e-3, focus_distance=rng.uniform(0.1, 1, E))
+out = r.render("wrist", outputs=("rgb", "depth", "segmentation"))
+# rgb [E, H, W, 3] sRGB 0..1, depth [E, H, W] z in m (0 = none),
+# segmentation [E, H, W] int32 (-1 = none; r.segment_labels() names them)
+```
+
+`MitsubaRenderer` (Mitsuba 3, `cuda_ad_rgb`) path-traces RGB (any Mitsuba
+integrator: `integrator={"type": "direct"}` is faster and cleaner) and
+casts one sharp pinhole ray per pixel for depth and segmentation. It keeps
+the shape count independent of the env count (one Mitsuba mesh per rigid
+mesh and textured material, holding all envs; poses are GPU-skinned into
+its vertex buffer) because Mitsuba re-traces its kernels on the host each
+render at a cost growing with the shapes, and generates camera rays in
+torch: per-env poses and lenses stay tensors, and the OpenCV distortion is
+applied exactly per sample (`render.camera.PixelRays`; strong wide-angle
+models often fold just outside the calibrated area, and the pixels there
+get the nearest reachable ray, with a warning). Large batches render in
+chunks of `max_samples`. Measured on an RTX 5070 Ti, 224x224 RGB with depth
+of field plus depth and segmentation, simple scene: 256 envs at 4 spp in
+~260 ms (`path`, max depth 4) or ~117 ms (`direct`); 1024 envs at 1 spp
+(`direct`) in ~165 ms. The first render compiles kernels (~0.2-0.7 s).
+`denoise=True` runs Mitsuba's OptiX denoiser on the batch.
+
+Blender Cycles is a second backend with the same interface, in the separate
+GPL-3.0 package `rillfacet-cycles` (`from rillfacet_cycles import
+CyclesRenderer`; it imports `bpy`, so it cannot live in this MIT package).
+It renders one Blender render per env and camera (a pinhole proxy, with
+Cycles' own depth of field and denoiser, resampled through the exact OpenCV
+distortion in torch) and is several times slower than Mitsuba at RL batch
+sizes, with less noise per sample; per-env tints also apply to textured
+materials there.
+
 Records: `rillfacet.web.record.Recorder` is a scene backend that logs every
 update between `start(scene)` and `finish()` against a caller-driven clock
 (`tick(t)`), as tracks `(object, field) -> (t, values)`; CUDA tensors are
@@ -293,7 +354,11 @@ shaders/
   mesh, points, curves, arrows, grid, ssao, composite, overlay_*, env_prefilter .wgsl
 src/python/module.cpp   pybind11 module `_rillfacet` (+ `rillfacet.imgui`)
 python/rillfacet/        Python package
-tests/                  headless Python tests
+  scene_api.py          backend-neutral scene (+ materials, lights, camera sensors)
+  assets.py             glTF / OBJ visual meshes, merge_bodies
+  render/               camera renderers: camera.py (OpenCV model), mitsuba.py
+  web/                  stream server, recorder, replay, built browser client
+tests/                  headless Python tests (render tests need CUDA + mitsuba)
 ```
 
 ## Changing the look

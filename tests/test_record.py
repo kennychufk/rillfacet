@@ -134,3 +134,30 @@ def test_write_read_index_and_shared_scene(tmp_path):
     write_record(root, "t10", rec.finish(), meta=dict(timestep=10),
                  summary=dict(batch={}))
     assert [e["id"] for e in read_index(root)] == ["t20", "t10"]
+
+
+def test_record_with_render_only_objects(tmp_path):
+    """Materials, lights and camera sensors ride along in the snapshot."""
+    from rillfacet.scene_api import Material
+    sc = Scene()
+    v, t = box_mesh([[0, 0, 0]], [[1, 1, 1]])
+    rm = sc.rigid_mesh("bodies", v, np.zeros(len(v), int), t, [0, 12],
+                       instances=2, materials=[Material("m", (1, 0, 0))])
+    rm.set_poses(unit_pose(2, 1))
+    sc.light("sun", "directional", intensity=2.0)
+    sc.camera_sensor("wrist", 8, 8, np.eye(3), mount=rm)
+    rec = Recorder()
+    sc.add_backend(rec)
+    rec.start(sc)
+    rec.tick(1)
+    rm.set_materials(roughness=0.1)
+    writer = RecordWriter(str(tmp_path))
+    writer.submit("t0", rec.finish(), meta={}, summary={})
+    writer.flush()
+    writer.close()
+    assert not writer.errors
+    _, r, _ = read_record(os.path.join(str(tmp_path), "t0"))
+    objs = {o["name"]: o for o in r.snapshot["objects"]}
+    assert objs["sun"]["kind"] == "light"
+    assert objs["wrist"]["attrs"]["mount"] == "bodies"
+    assert objs["bodies"]["attrs"]["materials"][0]["name"] == "m"

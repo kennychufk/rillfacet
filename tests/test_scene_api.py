@@ -167,3 +167,95 @@ def test_native_boxes_points_labels(v):
     assert v.frame()
     sc.remove("dots")
     assert "dots" not in v.scene.names
+
+
+def test_materials_per_instance():
+    verts, body, tris, off = two_boxes()
+    mats = [viz_mat("blue", (0, 0, 1)), viz_mat("grey", (0.5, 0.5, 0.5), 0.3)]
+    rec = Recorder()
+    sc = Scene(rec)
+    rm = sc.rigid_mesh("arm", verts, body, tris, off, instances=3,
+                       materials=mats, triangle_material=np.repeat([0, 1], 12))
+    assert rm.material_index("grey") == 1
+    assert rm.material_base_color.shape == (3, 2, 3)
+    assert np.allclose(rm.material_metallic[:, 1], 0.3)
+    rm.set_materials(roughness=[0.1, 0.9])            # broadcast over instances
+    col = rm.material_base_color.copy()
+    col[2, 0] = (1, 0, 0)
+    rm.set_materials(base_color=col)
+    assert np.allclose(rm.material_roughness, [[0.1, 0.9]] * 3)
+    assert np.allclose(rm.material_base_color[2, 0], (1, 0, 0))
+    assert np.allclose(rm.material_base_color[1, 0], (0, 0, 1))
+    assert rec.calls[-1] == ("update", "arm", "materials")
+    with pytest.raises(ValueError):
+        sc.rigid_mesh("bad", verts, body, tris, off, triangle_material=np.zeros(24))
+    with pytest.raises(KeyError):
+        rm.material_index("nope")
+
+
+def viz_mat(name, color, metallic=0.0):
+    from rillfacet.scene_api import Material
+    return Material(name, color, metallic=metallic)
+
+
+def test_lights_and_cameras_snapshot_as_json():
+    import json
+    from rillfacet.scene_api import CameraSensor, Light
+    verts, body, tris, off = two_boxes()
+    sc = Scene()
+    sc.rigid_mesh("arm", verts, body, tris, off, instances=2,
+                  materials=[viz_mat("m", (1, 1, 1))],
+                  normals=np.tile([0, 0, 1.0], (len(verts), 1)))
+    sun = sc.light("sun", "directional", direction=(0, 0, -1), intensity=3)
+    cam = sc.camera_sensor("wrist", 64, 48, np.eye(3), mount="arm", body=1,
+                           dist=[0.1, 0, 0, 0, 0], aperture_radius=0.001,
+                           focus_distance=[0.3, 0.5])
+    assert isinstance(sun, Light) and isinstance(cam, CameraSensor)
+    assert cam.instances == 2 and np.allclose(cam.focus_distance, [0.3, 0.5])
+    snap = sc.snapshot()
+    json.dumps([dict(kind=o["kind"], name=o["name"], attrs=o["attrs"])
+                for o in snap["objects"]])
+    kinds = {o["name"]: o["kind"] for o in snap["objects"]}
+    assert kinds == {"arm": "rigid_mesh", "sun": "light",
+                     "wrist": "camera_sensor"}
+    with pytest.raises(ValueError):
+        sc.light("x", "spot")
+    with pytest.raises(ValueError):
+        sc.camera_sensor("c", 8, 8, np.eye(3))        # no mount, no instances
+    with pytest.raises(ValueError):
+        sc.camera_sensor("c", 8, 8, np.eye(3), mount="arm", body=5)
+
+
+def test_camera_world_poses_follow_the_mount():
+    from rillfacet.scene_api import compose
+    verts, body, tris, off = two_boxes()
+    sc = Scene()
+    rm = sc.rigid_mesh("arm", verts, body, tris, off, instances=2)
+    local = np.array([0.1, 0, 0, 0, 0, 0, 1.0])
+    cam = sc.camera_sensor("wrist", 8, 8, np.eye(3), mount=rm, body=1,
+                           local_pose=local)
+    with pytest.raises(RuntimeError):
+        cam.world_poses()                             # no poses yet
+    poses = np.zeros((2, 2, 7))
+    poses[..., 6] = 1
+    poses[1, 1] = np.concatenate([[1, 2, 3], quat([0, 0, 1], np.pi / 2)])
+    rm.set_poses(poses)
+    w = cam.world_poses()
+    assert np.allclose(w[0, :3], [0.1, 0, 0])
+    assert np.allclose(w[1, :3], [1, 2.1, 3], atol=1e-6)
+    assert np.allclose(w[1], compose(poses[1, 1], local), atol=1e-6)
+    torch = pytest.importorskip("torch")
+    rm.set_poses(torch.as_tensor(poses))
+    assert np.allclose(cam.world_poses().numpy(), w, atol=1e-6)
+
+
+def test_native_and_recorder_ignore_render_only_objects(v):
+    verts, body, tris, off = two_boxes()
+    sc = Scene(NativeBackend(v))
+    rm = sc.rigid_mesh("arm", verts, body, tris, off,
+                       materials=[viz_mat("m", (1, 1, 1))])
+    sc.light("sun")
+    sc.camera_sensor("wrist", 8, 8, np.eye(3), mount=rm)
+    rm.set_materials(roughness=0.2)
+    assert set(v.scene.names) == {"arm"}
+    assert v.frame()

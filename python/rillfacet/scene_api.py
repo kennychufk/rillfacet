@@ -19,6 +19,11 @@ The scene is split by how often things change, so streaming stays cheap:
 Handles keep their latest state, so a backend attached later (a browser
 connecting mid-run) can be sent the whole scene.
 
+For camera rendering (``rillfacet.render``) a scene also carries what a
+viewer ignores: PBR materials on rigid meshes (per instance, for domain
+randomization), :class:`Light` s and :class:`CameraSensor` s mounted on
+bodies.
+
 Poses are ``[..., 7]`` = translation xyz + quaternion xyzw. Arrays may be
 numpy or torch (CUDA ok); they are converted where a backend needs host data.
 Colors are sRGB in 0..1.
@@ -28,7 +33,8 @@ from __future__ import annotations
 import numpy as np
 
 __all__ = ["Scene", "Backend", "NativeBackend", "RigidMesh", "Boxes",
-           "Points", "Polyline", "Labels", "box_mesh", "as_scene"]
+           "Points", "Polyline", "Labels", "Material", "Light",
+           "CameraSensor", "box_mesh", "skin", "compose", "as_scene"]
 
 
 def _host(a, dtype=np.float32) -> np.ndarray:
@@ -82,6 +88,26 @@ def skin(local, vertex_body, poses):
     return t + local[None] + qw * u + cross(qv, u)
 
 
+def compose(a, b):
+    """Pose product ``a * b`` of ``[..., 7]`` poses (broadcasting): pose
+    ``b`` given in frame ``a``, expressed in ``a``'s parent frame. numpy or
+    torch (both the same type)."""
+    if hasattr(a, "detach"):
+        import torch
+        cross, cat = torch.linalg.cross, torch.cat
+        a, b = torch.broadcast_tensors(a, b)
+    else:
+        cross, cat = np.cross, np.concatenate
+        a, b = np.broadcast_arrays(np.asarray(a, np.float64),
+                                   np.asarray(b, np.float64))
+    av, aw, bv, bw = a[..., 3:6], a[..., 6:7], b[..., 3:6], b[..., 6:7]
+    u = 2.0 * cross(av, b[..., :3])
+    t = a[..., :3] + b[..., :3] + aw * u + cross(av, u)
+    qv = aw * bv + bw * av + cross(av, bv)
+    qw = aw * bw - (av * bv).sum(-1)[..., None]
+    return cat([t, qv, qw], -1)
+
+
 # --------------------------------------------------------------------------
 # scene objects
 # --------------------------------------------------------------------------
@@ -102,6 +128,33 @@ class _Object:
         raise NotImplementedError
 
 
+class Material:
+    """A PBR metallic-roughness material (glTF 2.0's model): ``base_color``
+    sRGB, ``metallic`` and ``roughness`` in 0..1, and an optional
+    ``base_color_texture`` (an image path or an ``[H, W, 3|4]`` sRGB array,
+    uint8 or 0..1 float) sampled at the mesh UVs (origin top-left, glTF's
+    convention). The texture is multiplied by ``base_color``, as in glTF."""
+
+    def __init__(self, name, base_color=(0.8, 0.8, 0.8), metallic=0.0,
+                 roughness=0.5, base_color_texture=None):
+        self.name = str(name)
+        self.base_color = _rgb(base_color)
+        self.metallic, self.roughness = float(metallic), float(roughness)
+        self.base_color_texture = base_color_texture
+
+    def state(self) -> dict:
+        tex = self.base_color_texture
+        return dict(name=self.name, base_color=self.base_color,
+                    metallic=self.metallic, roughness=self.roughness,
+                    texture=(tex if isinstance(tex, str)
+                             else None if tex is None else "<array>"))
+
+    def __repr__(self):
+        return (f"Material({self.name!r}, base_color={self.base_color}, "
+                f"metallic={self.metallic}, roughness={self.roughness}"
+                f"{', textured' if self.base_color_texture is not None else ''})")
+
+
 class RigidMesh(_Object):
     """Rigid bodies of one simulator, drawn for ``instances`` copies (envs).
 
@@ -112,13 +165,22 @@ class RigidMesh(_Object):
     ``segment = instance * B + body``. ``offsets`` ``[instances, 3]`` shift
     each instance render-side (a display grid). Segment names are
     ``"<instance name>/<body name>"`` (just the body name for one instance);
-    ``instance_names`` default to ``env0``, ``env1``, ..."""
+    ``instance_names`` default to ``env0``, ``env1``, ...
+
+    Appearance for camera renderers (viewers ignore it): ``normals`` and
+    ``uvs`` ``[V, 3|2]`` (body-local), and ``materials`` (a list of
+    :class:`Material`) with ``triangle_material`` ``[T]`` the material slot
+    of each triangle. Each instance has its own copy of every slot's
+    parameters (:meth:`set_materials`), so appearance is randomized per env
+    by writing arrays. Without materials, renderers shade each segment with
+    its segment color (roughness 0.5, not metallic)."""
     kind = "rigid_mesh"
 
     def __init__(self, scene, name, local_vertices, vertex_body, triangles,
                  body_triangle_offsets, *, instances=1, offsets=None,
                  body_names=None, instance_names=None, colors=None,
-                 smooth=False):
+                 smooth=False, normals=None, uvs=None, materials=None,
+                 triangle_material=None):
         super().__init__(scene, name)
         self.local_vertices = _host(local_vertices)
         self.vertex_body = np.asarray(vertex_body, np.int64)
@@ -144,6 +206,29 @@ class RigidMesh(_Object):
         self.smooth = bool(smooth)
         self.poses = None                  # [instances, B, 7] once set
         self.world_vertices = None         # optional exact vertices (native)
+        V, T = len(self.local_vertices), len(self.triangles)
+        self.normals = (None if normals is None
+                        else _host(normals).reshape(V, 3))
+        self.uvs = None if uvs is None else _host(uvs).reshape(V, 2)
+        self.materials = list(materials) if materials else []
+        if self.materials:
+            self.triangle_material = (
+                np.zeros(T, np.int32) if triangle_material is None
+                else np.asarray(triangle_material, np.int32).reshape(T))
+            if self.triangle_material.max(initial=0) >= len(self.materials):
+                raise ValueError("RigidMesh: triangle_material out of range")
+        elif triangle_material is not None:
+            raise ValueError("RigidMesh: triangle_material needs materials")
+        else:
+            self.triangle_material = None
+        M, I = len(self.materials), self.instances
+        self.material_base_color = np.tile(np.asarray(
+            [m.base_color for m in self.materials], np.float32
+        ).reshape(1, M, 3), (I, 1, 1))
+        self.material_metallic = np.tile(np.asarray(
+            [m.metallic for m in self.materials], np.float32), (I, 1))
+        self.material_roughness = np.tile(np.asarray(
+            [m.roughness for m in self.materials], np.float32), (I, 1))
 
     @property
     def num_segments(self) -> int:
@@ -173,6 +258,33 @@ class RigidMesh(_Object):
         self.segment_visible[int(segment)] = bool(on)
         self._changed("visibility")
 
+    def material_index(self, name: str) -> int:
+        """Slot of the material called ``name``."""
+        for i, m in enumerate(self.materials):
+            if m.name == name:
+                return i
+        raise KeyError(f"RigidMesh {self.name!r}: no material {name!r}")
+
+    def set_materials(self, base_color=None, metallic=None,
+                      roughness=None) -> None:
+        """Per-instance material parameters: ``base_color`` broadcasts to
+        ``[instances, M, 3]`` (sRGB), ``metallic`` / ``roughness`` to
+        ``[instances, M]``; None keeps the current values. E.g.
+        ``base_color=rng.uniform(0, 1, (E, M, 3))`` randomizes every slot of
+        every env; write a slice of :attr:`material_base_color` and pass it
+        back to change a few."""
+        I, M = self.instances, len(self.materials)
+        if base_color is not None:
+            self.material_base_color = np.ascontiguousarray(np.broadcast_to(
+                _host(base_color), (I, M, 3)))
+        if metallic is not None:
+            self.material_metallic = np.ascontiguousarray(np.broadcast_to(
+                _host(metallic), (I, M)))
+        if roughness is not None:
+            self.material_roughness = np.ascontiguousarray(np.broadcast_to(
+                _host(roughness), (I, M)))
+        self._changed("materials")
+
     def state(self):
         arrays = dict(local_vertices=self.local_vertices,
                       vertex_body=self.vertex_body.astype(np.int32),
@@ -184,9 +296,19 @@ class RigidMesh(_Object):
                       segment_visible=self.segment_visible)
         if self.poses is not None:
             arrays["poses"] = _host(self.poses)
-        return (dict(instances=self.instances, body_names=self.body_names,
-                     instance_names=self.instance_names, smooth=self.smooth),
-                arrays)
+        attrs = dict(instances=self.instances, body_names=self.body_names,
+                     instance_names=self.instance_names, smooth=self.smooth)
+        if self.normals is not None:
+            arrays["normals"] = self.normals
+        if self.uvs is not None:
+            arrays["uvs"] = self.uvs
+        if self.materials:
+            attrs["materials"] = [m.state() for m in self.materials]
+            arrays.update(triangle_material=self.triangle_material,
+                          material_base_color=self.material_base_color,
+                          material_metallic=self.material_metallic,
+                          material_roughness=self.material_roughness)
+        return attrs, arrays
 
 
 class Boxes(_Object):
@@ -307,6 +429,165 @@ class Labels(_Object):
         return [self.fmt.format(float(x)) for x in self.values]
 
 
+class Light(_Object):
+    """A light shared by every instance (env) of the scene.
+
+    ``type``: ``"directional"`` (``direction`` it shines along, world;
+    ``intensity`` = irradiance), ``"ambient"`` (uniform sky radiance
+    ``intensity``, also the background) or ``"envmap"`` (an equirectangular
+    HDR/LDR image ``envmap``, z-up, scaled by ``intensity``). ``color`` is
+    linear RGB. Per-env lighting variation is left to the cameras'
+    :attr:`CameraSensor.gain` (exposure / white balance)."""
+    kind = "light"
+    TYPES = ("directional", "ambient", "envmap")
+
+    def __init__(self, scene, name, type="directional", *, intensity=1.0,
+                 color=(1.0, 1.0, 1.0), direction=(0.0, 0.0, -1.0),
+                 envmap=None):
+        super().__init__(scene, name)
+        if type not in self.TYPES:
+            raise ValueError(f"Light: type must be one of {self.TYPES}")
+        if type == "envmap" and envmap is None:
+            raise ValueError("Light: envmap needs an image path")
+        self.type = type
+        self.intensity, self.color = float(intensity), _rgb(color)
+        self.direction = _rgb(direction)
+        self.envmap = envmap
+
+    def set(self, *, intensity=None, color=None, direction=None) -> None:
+        if intensity is not None:
+            self.intensity = float(intensity)
+        if color is not None:
+            self.color = _rgb(color)
+        if direction is not None:
+            self.direction = _rgb(direction)
+        self._changed("light")
+
+    def state(self):
+        return (dict(type=self.type, intensity=self.intensity,
+                     color=self.color, direction=self.direction,
+                     envmap=self.envmap), {})
+
+
+class CameraSensor(_Object):
+    """A camera (an image sensor, not the viewer's camera) per instance.
+
+    Intrinsics are OpenCV's: ``K`` ``[3, 3]`` for a ``width`` x ``height``
+    image (pixel centers at integers) and optional distortion ``dist``
+    (OpenCV order k1 k2 p1 p2 [k3 [k4 k5 k6 [s1 s2 s3 s4]]], tilt not
+    supported). The camera frame is OpenCV's too: x right, y down, z
+    forward.
+
+    ``mount`` (a :class:`RigidMesh` or its name) and ``body`` attach the
+    camera to a body: its pose is that body's pose times ``local_pose``
+    (``[7]`` or ``[instances, 7]``). Without a mount, ``local_pose`` is the
+    camera's world pose and ``instances`` must be given.
+
+    Per-instance lens and sensor values, for domain randomization:
+    ``aperture_radius`` (m, 0 = pinhole; a lens of focal length f at
+    f-number N has f / 2N) and ``focus_distance`` (m) give depth of field;
+    ``gain`` ``[3]`` or ``[instances, 3]`` multiplies the linear RGB
+    (exposure and white balance). ``near`` / ``far`` clip the z-depth.
+    """
+    kind = "camera_sensor"
+
+    def __init__(self, scene, name, width, height, K, *, dist=None,
+                 mount=None, body=0, local_pose=(0, 0, 0, 0, 0, 0, 1),
+                 instances=None, near=0.01, far=10.0, aperture_radius=0.0,
+                 focus_distance=1.0, gain=(1.0, 1.0, 1.0)):
+        super().__init__(scene, name)
+        self.width, self.height = int(width), int(height)
+        self.K = np.asarray(K, np.float64).reshape(3, 3)
+        d = None if dist is None else np.asarray(dist, np.float64).ravel()
+        self.dist = None if d is None or not np.any(d) else d
+        if self.dist is not None and len(self.dist) > 12 and np.any(
+                self.dist[12:]):
+            raise ValueError("CameraSensor: tilted sensors (tau_x, tau_y) "
+                             "are not supported")
+        self.mount = (None if mount is None
+                      else mount if isinstance(mount, str) else mount.name)
+        self.body = int(body)
+        if self.mount is not None:
+            m = scene.objects.get(self.mount)
+            if not isinstance(m, RigidMesh):
+                raise ValueError(f"CameraSensor: no rigid mesh {self.mount!r}")
+            if not 0 <= self.body < m.num_bodies:
+                raise ValueError("CameraSensor: body out of range")
+            if instances is not None and int(instances) != m.instances:
+                raise ValueError("CameraSensor: instances != the mount's")
+            instances = m.instances
+        elif instances is None:
+            raise ValueError("CameraSensor: give a mount or instances")
+        self.instances = int(instances)
+        self.near, self.far = float(near), float(far)
+        self.local_pose = None
+        self.set_local_pose(local_pose, _notify=False)
+        self.aperture_radius = self.focus_distance = self.gain = None
+        self.set_lens(aperture_radius=aperture_radius,
+                      focus_distance=focus_distance, gain=gain,
+                      _notify=False)
+
+    def set_local_pose(self, pose, _notify=True) -> None:
+        """``[7]`` or ``[instances, 7]``: the camera in its mount body's
+        frame (or in the world, without a mount). numpy or torch."""
+        if hasattr(pose, "detach"):
+            self.local_pose = pose.reshape(-1, 7).expand(self.instances, 7)
+        else:
+            self.local_pose = np.broadcast_to(
+                np.asarray(pose, np.float32).reshape(-1, 7),
+                (self.instances, 7)).copy()
+        if _notify:
+            self._changed("pose")
+
+    def set_lens(self, *, aperture_radius=None, focus_distance=None,
+                 gain=None, _notify=True) -> None:
+        """Per-instance (or shared) lens / sensor values."""
+        I = self.instances
+        if aperture_radius is not None:
+            self.aperture_radius = np.broadcast_to(
+                _host(aperture_radius), (I,)).copy()
+        if focus_distance is not None:
+            self.focus_distance = np.broadcast_to(
+                _host(focus_distance), (I,)).copy()
+        if gain is not None:
+            self.gain = np.broadcast_to(_host(gain), (I, 3)).copy()
+        if _notify:
+            self._changed("lens")
+
+    def world_poses(self):
+        """``[instances, 7]`` camera poses in the world (env-local frame):
+        the mount body's current poses composed with :attr:`local_pose`.
+        torch if the mount's poses or the local pose are torch."""
+        local = self.local_pose
+        if self.mount is None:
+            return local
+        m = self.scene.objects.get(self.mount)
+        if m is None:
+            raise RuntimeError(f"CameraSensor {self.name!r}: mount "
+                               f"{self.mount!r} was removed")
+        if m.poses is None:
+            raise RuntimeError(f"CameraSensor {self.name!r}: the mount has "
+                               "no poses yet (set_poses)")
+        body = m.poses[:, self.body]
+        if hasattr(body, "detach") or hasattr(local, "detach"):
+            import torch
+            dev = body.device if hasattr(body, "device") else local.device
+            body = torch.as_tensor(body, device=dev).float()
+            local = torch.as_tensor(local, device=dev).float()
+            return compose(body, local)
+        return compose(np.asarray(body), local).astype(np.float32)
+
+    def state(self):
+        attrs = dict(width=self.width, height=self.height,
+                     K=self.K.tolist(),
+                     dist=None if self.dist is None else self.dist.tolist(),
+                     mount=self.mount, body=self.body,
+                     instances=self.instances, near=self.near, far=self.far)
+        return attrs, dict(local_pose=_host(self.local_pose),
+                           aperture_radius=self.aperture_radius,
+                           focus_distance=self.focus_distance, gain=self.gain)
+
+
 # --------------------------------------------------------------------------
 # scene + backends
 # --------------------------------------------------------------------------
@@ -314,9 +595,11 @@ class Labels(_Object):
 class Backend:
     """What a scene sends its changes to. ``create`` gets a new object,
     ``update`` the object and what changed ("poses", "colors",
-    "visibility", "boxes", "points", "values", "texts"), ``remove`` its
-    name. ``draw_overlay`` is called once per frame with every label set
-    (immediate-mode viewers rebuild text each frame)."""
+    "visibility", "materials", "boxes", "points", "values", "texts",
+    "light", "pose", "lens"), ``remove`` its name. Backends skip the
+    object kinds they do not draw. ``draw_overlay`` is called once per
+    frame with every label set (immediate-mode viewers rebuild text each
+    frame)."""
 
     def create(self, obj) -> None: ...
     def update(self, obj, what: str) -> None: ...
@@ -402,6 +685,12 @@ class Scene:
 
     def labels(self, name, anchors, **kw) -> Labels:
         return self._add(Labels(self, name, anchors, **kw))
+
+    def light(self, name, type="directional", **kw) -> Light:
+        return self._add(Light(self, name, type, **kw))
+
+    def camera_sensor(self, name, width, height, K, **kw) -> CameraSensor:
+        return self._add(CameraSensor(self, name, width, height, K, **kw))
 
     # -- per frame ----------------------------------------------------------
 
