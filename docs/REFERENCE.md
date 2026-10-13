@@ -228,6 +228,48 @@ distortion in torch) and is several times slower than Mitsuba at RL batch
 sizes, with less noise per sample; per-env tints also apply to textured
 materials there.
 
+`RasterRenderer` (`rillfacet.render.raster`, part of the extension, no extra
+dependency) rasterizes with Dawn for vision RL at thousands of envs:
+`RasterRenderer(chunk=256)`, then `render(camera, outputs)` as above (or
+`raw=True` for uint8 rgb, float16 linear, int16 labels) or
+`render_chunks(camera, outputs)`, which yields `(e0, e1, images)` per chunk
+of envs in those raw dtypes (rgb is a `[n, H, W, 3]` view of RGBA; buffers
+are reused, so use or copy a chunk before asking for the one after the
+next). All envs share one world frame: each is drawn into its own tile of a
+layered atlas by instanced draws (instance = body * n + env) posed in the
+vertex shader from a pose texture, and kept in its tile by clip distances.
+Each env renders a centered pinhole proxy (as the Cycles backend), which a
+compute pass resamples through the exact OpenCV distortion (`supersample`
+x `supersample` taps), adding the background (the ambient light, the
+envmap) and the shared sensor stage (same model, its own GPU random
+numbers, drawn per env so images do not depend on the chunking). Shading is
+forward PBR (GGX + Lambert, base color textures times the per-env color)
+under up to 4 directional lights, the first casting shadows
+(`shadow_resolution`^2 per env over the scene's box, fit at the first render
+or given as `shadow_box`), plus the sky and the envmap (9 SH coefficients
+for diffuse, its mip chain for specular). No depth of field (a warning),
+motion blur, interreflections or occlusion of the sky; next to Mitsuba's
+`direct` integrator a lit dielectric is within ~4% and a metal under the
+sky ~20% darker (the split-sum fit). Geometry agrees with Mitsuba's
+(tests/test_render_raster.py).
+
+On Linux + Vulkan + NVIDIA the poses and images never leave the GPU
+(`src/rillfacet/cuda_share.h`): the shared textures are allocated on our own
+VkDevice as exportable memory and imported by both Dawn and CUDA (driver
+API, loaded at runtime; the build only needs CUDA's headers), each hand-over
+ordered by a semaphore in each direction, so torch receives images with one
+device-to-device copy and a chunk loop never waits on the CPU (with
+`double_buffer`, Dawn renders the next chunk while CUDA work on torch's
+stream uses the current one). Elsewhere (`info` tells) poses are uploaded
+from the host and images read back. Measured on an RTX 5070 Ti, the
+oven-grasp wrist camera (Pi Camera Module 3 Wide calibration, 640 x 384,
+proxy 860 x 522), 4096 envs per frame, chunk 256, 512^2 shadows: rgb 97 ms
+with the UR5e's visual meshes decimated to 10% (17.6k triangles in the
+scene), 188 ms at full detail (134k); rgb + depth + segmentation 121 ms
+(decimated). The time goes mostly to memory traffic of the wide proxy
+(`oversample=0.75`: 66 ms) and to triangles at full detail, so give
+`BodyMesh` low-detail visual meshes for RL.
+
 Records: `rillfacet.web.record.Recorder` is a scene backend that logs every
 update between `start(scene)` and `finish()` against a caller-driven clock
 (`tick(t)`), as tracks `(object, field) -> (t, values)`; CUDA tensors are

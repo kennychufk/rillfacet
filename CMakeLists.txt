@@ -23,6 +23,8 @@ add_library(rillfacet STATIC
   src/rillfacet/selection.cpp
   src/rillfacet/ui.cpp
   src/rillfacet/viewer.cpp
+  src/rillfacet/camera_raster.cpp
+  src/rillfacet/cuda_share.cpp
   src/rillfacet/stb_impl.cpp)
 target_include_directories(rillfacet PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(rillfacet PUBLIC cxx_std_20)  # webgpu_cpp.h needs C++20
@@ -40,6 +42,25 @@ target_compile_definitions(rillfacet PUBLIC
   RILLFACET_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets"
   GLM_ENABLE_EXPERIMENTAL GLM_FORCE_DEPTH_ZERO_TO_ONE)
 target_compile_options(rillfacet PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+# Zero-copy camera images (cuda_share.cpp): Vulkan and the CUDA driver are
+# loaded at runtime, so only their headers are needed here. Vulkan's come
+# with Dawn's source checkout (scripts/build_dawn.sh); without CUDA's
+# (cuda.h, a CUDA toolkit) the camera rasterizer reads images back instead.
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+  set(RILLFACET_VULKAN_INCLUDE ${RILLFACET_ROOT}/third_party/dawn-src/third_party/vulkan-headers/src/include)
+  if(NOT EXISTS ${RILLFACET_VULKAN_INCLUDE}/vulkan/vulkan.h)
+    FetchContent_Declare(vulkan_headers
+      GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers GIT_TAG v1.4.309)
+    FetchContent_Populate(vulkan_headers)
+    set(RILLFACET_VULKAN_INCLUDE ${vulkan_headers_SOURCE_DIR}/include)
+  endif()
+  target_include_directories(rillfacet SYSTEM PRIVATE ${RILLFACET_VULKAN_INCLUDE} ${CUDAToolkit_INCLUDE_DIRS})
+  target_compile_definitions(rillfacet PRIVATE RILLFACET_HAVE_CUDA_H=1)
+  message(STATUS "rillfacet: zero-copy camera images with CUDA ${CUDAToolkit_VERSION}")
+else()
+  message(STATUS "rillfacet: no CUDA toolkit, camera images are read back (no zero-copy)")
+endif()
 set_target_properties(rillfacet PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 option(RILLFACET_BUILD_EXAMPLES "Build rillfacet standalone examples" ${PROJECT_IS_TOP_LEVEL})
@@ -61,7 +82,7 @@ if(RILLFACET_BUILD_PYTHON)
   execute_process(COMMAND ${Python3_EXECUTABLE} -m pybind11 --cmakedir
                   OUTPUT_VARIABLE pybind11_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
   find_package(pybind11 CONFIG REQUIRED)
-  pybind11_add_module(_rillfacet src/python/module.cpp)
+  pybind11_add_module(_rillfacet src/python/module.cpp src/python/camera_raster_bindings.cpp)
   target_link_libraries(_rillfacet PRIVATE rillfacet)
   if(SKBUILD)
     set_target_properties(_rillfacet PROPERTIES INSTALL_RPATH "$ORIGIN")

@@ -10,7 +10,7 @@ static std::string to_string(wgpu::StringView s) {
   return s.length == WGPU_STRLEN ? std::string(s.data) : std::string(s.data, s.length);
 }
 
-bool Gpu::init() {
+bool Gpu::init(const GpuOptions& options) {
   wgpu::InstanceFeatureName features[] = {wgpu::InstanceFeatureName::TimedWaitAny};
   wgpu::InstanceDescriptor instance_desc{};
   instance_desc.requiredFeatureCount = 1;
@@ -44,10 +44,19 @@ bool Gpu::init() {
   wgpu::Limits required{};
   required.maxStorageBufferBindingSize = limits.maxStorageBufferBindingSize;
   required.maxBufferSize = limits.maxBufferSize;
+  if (options.max_texture_limits) {
+    required.maxTextureDimension2D = limits.maxTextureDimension2D;
+    required.maxTextureArrayLayers = limits.maxTextureArrayLayers;
+  }
 
   wgpu::DeviceDescriptor device_desc{};
   device_desc.label = "rillfacet";
   device_desc.requiredLimits = &required;
+  std::vector<wgpu::FeatureName> device_features = options.features;
+  for (auto f : options.optional_features)
+    if (adapter.HasFeature(f)) device_features.push_back(f);
+  device_desc.requiredFeatureCount = device_features.size();
+  device_desc.requiredFeatures = device_features.data();
   device_desc.SetDeviceLostCallback(
       wgpu::CallbackMode::AllowSpontaneous,
       [](const wgpu::Device&, wgpu::DeviceLostReason reason, wgpu::StringView msg) {

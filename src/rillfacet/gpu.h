@@ -11,10 +11,16 @@
 
 namespace rillfacet {
 
+struct GpuOptions {
+  std::vector<wgpu::FeatureName> features;   // required device features
+  std::vector<wgpu::FeatureName> optional_features;   // requested when the adapter has them
+  bool max_texture_limits = false;           // ask for the adapter's texture size / layer limits
+};
+
 class Gpu {
  public:
   // Creates instance, adapter and device. No window is needed (headless OK).
-  bool init();
+  bool init(const GpuOptions& options = {});
 
   // Blocks until `future` resolves. Native-only: the web port awaits instead.
   void wait(wgpu::Future future) const;

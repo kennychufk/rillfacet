@@ -27,6 +27,8 @@ using namespace rillfacet;
 
 PYBIND11_MAKE_OPAQUE(std::vector<Measurement>);
 
+void bind_camera_raster(py::module_& m);   // camera_raster_bindings.cpp
+
 // ---- glm vectors <-> Python sequences ---------------------------------------------
 
 namespace pybind11::detail {
@@ -151,6 +153,7 @@ static void bind_imgui(py::module_ m);
 static void bind_implot(py::module_ m);
 
 PYBIND11_MODULE(_rillfacet, m) {
+  bind_camera_raster(m);
   m.doc() = "rillfacet: real-time scientific viewer (WebGPU)";
 
   // ---- Enums ----
