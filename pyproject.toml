@@ -11,13 +11,38 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "rillfacet"
 version = "0.1.0"
+description = "Real-time WebGPU (Dawn) 3D viewer for physics and RL simulation, native and in the browser"
 requires-python = ">=3.10"
 readme = "README.md"
 license = "MIT"
+authors = [{ name = "Kenny Chu", email = "kennychu@riec.tohoku.ac.jp" }]
+keywords = ["webgpu", "dawn", "visualization", "3d", "viewer", "physics", "simulation", "reinforcement-learning", "robotics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Graphics :: 3D Rendering",
+]
 # The wheel carries Dawn, GLFW, ImGui, ... and fonts: their notices ship with it.
 license-files = ["LICENSE", "THIRD_PARTY_LICENSES.txt"]
 # websockets >= 13 for websockets.asyncio.server (rillfacet.web.server).
 dependencies = ["numpy", "websockets>=13"]
+
+[project.urls]
+Homepage = "https://github.com/kennychufk/rillfacet"
+Repository = "https://github.com/kennychufk/rillfacet"
+Issues = "https://github.com/kennychufk/rillfacet/issues"
 
 [project.optional-dependencies]
 # Needed to build the _rillfacet extension (CMake finds pybind11 through
