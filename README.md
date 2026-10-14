@@ -19,6 +19,14 @@
 pip install rillfacet
 ```
 
+Start with [examples/hello.py](examples/hello.py): a rippling sheet colored by height, in about 50 lines with no simulator.
+
+<p align="center">
+  <img src="https://media.githubusercontent.com/media/kennychufk/public-assets/main/rillfacet/hello.gif" alt="A rippling sheet colored by height" width="560">
+</p>
+
+Plugging in your own simulator looks like this:
+
 ```python
 import rillfacet as viz
 
