@@ -37,6 +37,7 @@ Viewer::Viewer(const ViewerOptions& options) : options_(options) {
 
   uint32_t w = uint32_t(options.width), h = uint32_t(options.height);
   float content_scale = 1.0f;
+  float fb_ratio = 1.0f;  // framebuffer pixels per window unit (2 on Retina, 1 on X11)
   if (!options.headless) {
     if (!glfwInit()) {
       std::fprintf(stderr, "[rillfacet] glfwInit failed (no display?)\n");
@@ -64,8 +65,12 @@ Viewer::Viewer(const ViewerOptions& options) : options_(options) {
     float sx, sy;
     glfwGetWindowContentScale(window_, &sx, &sy);
     content_scale = sx;
+    int ww, wh;
+    glfwGetWindowSize(window_, &ww, &wh);
+    if (ww > 0) fb_ratio = float(fw) / float(ww);
   }
   renderer_->resize(w, h);
+  renderer_->set_label_scale(content_scale);
   std::string error;
   if (!renderer_->init(&error)) {
     std::fprintf(stderr, "[rillfacet] renderer init failed: %s\n", error.c_str());
@@ -79,8 +84,13 @@ Viewer::Viewer(const ViewerOptions& options) : options_(options) {
   io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
   io.IniFilename = nullptr;
   std::string fonts = asset_dir() + "/fonts/";
-  ui_font_ = io.Fonts->AddFontFromFileTTF((fonts + "Inter-Medium.ttf").c_str(), 15.0f * content_scale);
-  mono_font_ = io.Fonts->AddFontFromFileTTF((fonts + "JetBrainsMono-Regular.ttf").c_str(), 14.0f * content_scale);
+  // ImGui sizes are in window units: with a Retina-style framebuffer (ratio 2) the
+  // size stays 15 and the glyphs are rasterized at twice the density instead.
+  const float ui_scale = content_scale / fb_ratio;
+  ImFontConfig font_cfg;
+  font_cfg.RasterizerDensity = fb_ratio;
+  ui_font_ = io.Fonts->AddFontFromFileTTF((fonts + "Inter-Medium.ttf").c_str(), 15.0f * ui_scale, &font_cfg);
+  mono_font_ = io.Fonts->AddFontFromFileTTF((fonts + "JetBrainsMono-Regular.ttf").c_str(), 14.0f * ui_scale, &font_cfg);
   if (window_) ImGui_ImplGlfw_InitForOther(window_, true);
   ImGui_ImplWGPU_InitInfo info;
   info.Device = gpu_->device.Get();
