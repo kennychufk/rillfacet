@@ -4,8 +4,12 @@
 #include "rillfacet/ui.h"
 
 #include <GLFW/glfw3.h>
+#ifdef __APPLE__
+#include "rillfacet/metal_layer.h"
+#else
 #define GLFW_EXPOSE_NATIVE_X11
 #include <GLFW/glfw3native.h>
+#endif
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_wgpu.h>
@@ -46,11 +50,16 @@ Viewer::Viewer(const ViewerOptions& options) : options_(options) {
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     window_ = glfwCreateWindow(options.width, options.height, options.title.c_str(), nullptr, nullptr);
     if (!window_) return;
-    wgpu::SurfaceSourceXlibWindow x11{};
-    x11.display = glfwGetX11Display();
-    x11.window = glfwGetX11Window(window_);
+#ifdef __APPLE__
+    wgpu::SurfaceSourceMetalLayer native{};
+    native.layer = create_metal_layer(window_);
+#else
+    wgpu::SurfaceSourceXlibWindow native{};
+    native.display = glfwGetX11Display();
+    native.window = glfwGetX11Window(window_);
+#endif
     wgpu::SurfaceDescriptor sd{};
-    sd.nextInChain = &x11;
+    sd.nextInChain = &native;
     surface_ = gpu_->instance.CreateSurface(&sd);
     wgpu::SurfaceCapabilities caps{};
     surface_.GetCapabilities(gpu_->adapter, &caps);

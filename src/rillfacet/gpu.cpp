@@ -23,7 +23,11 @@ bool Gpu::init(const GpuOptions& options) {
 
   wgpu::RequestAdapterOptions adapter_opts{};
   adapter_opts.powerPreference = wgpu::PowerPreference::HighPerformance;
+#ifdef __APPLE__
+  adapter_opts.backendType = wgpu::BackendType::Metal;
+#else
   adapter_opts.backendType = wgpu::BackendType::Vulkan;
+#endif
   wait(instance.RequestAdapter(
       &adapter_opts, wgpu::CallbackMode::WaitAnyOnly,
       [this](wgpu::RequestAdapterStatus status, wgpu::Adapter a, wgpu::StringView msg) {

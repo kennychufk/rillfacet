@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
 project(rillfacet LANGUAGES C CXX)
+if(APPLE)
+  enable_language(OBJC OBJCXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,6 +29,10 @@ add_library(rillfacet STATIC
   src/rillfacet/camera_raster.cpp
   src/rillfacet/cuda_share.cpp
   src/rillfacet/stb_impl.cpp)
+if(APPLE)
+  target_sources(rillfacet PRIVATE src/rillfacet/metal_layer.mm)
+  target_link_libraries(rillfacet PUBLIC "-framework Cocoa" "-framework QuartzCore" "-framework Metal")
+endif()
 target_include_directories(rillfacet PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(rillfacet PUBLIC cxx_std_20)  # webgpu_cpp.h needs C++20
 if(NOT CMAKE_BUILD_TYPE)  # e.g. added to a parent project without a build type
@@ -85,7 +92,7 @@ if(RILLFACET_BUILD_PYTHON)
   pybind11_add_module(_rillfacet src/python/module.cpp src/python/camera_raster_bindings.cpp)
   target_link_libraries(_rillfacet PRIVATE rillfacet)
   if(SKBUILD)
-    set_target_properties(_rillfacet PROPERTIES INSTALL_RPATH "$ORIGIN")
+    set_target_properties(_rillfacet PROPERTIES INSTALL_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path,$ORIGIN>")
     install(TARGETS _rillfacet LIBRARY DESTINATION rillfacet)
     install(IMPORTED_RUNTIME_ARTIFACTS dawn::webgpu_dawn LIBRARY DESTINATION rillfacet)
     install(DIRECTORY shaders/ DESTINATION rillfacet/shaders)
