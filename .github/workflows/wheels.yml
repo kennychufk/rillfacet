@@ -1,6 +1,7 @@
 # Builds the manylinux_2_28 wheels (CPython 3.10-3.14) in Docker, tests them in
 # clean Ubuntu / Debian / Fedora images, builds the macOS arm64 wheels (macOS 12+,
-# Metal) with cibuildwheel, and publishes them all to TestPyPI.
+# Metal) and Windows x64 wheels (Windows 10+, D3D12) with cibuildwheel, and
+# publishes them all to TestPyPI.
 #   - every push / PR: build + test, wheels kept as a workflow artifact
 #   - tag v*, or "Run workflow" by hand: also upload to TestPyPI
 #   - tag v* only: then upload to PyPI, after TestPyPI succeeded
@@ -64,8 +65,34 @@ jobs:
           path: wheelhouse/*.whl
           if-no-files-found: error
 
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      # MSVC and Ninja on PATH, for Dawn and for the wheel builds below.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: actions/cache@v4
+        with:
+          path: third_party/dawn
+          key: dawn-windows-x64-${{ hashFiles('scripts/build_dawn.sh') }}
+      - name: Build Dawn
+        shell: bash
+        run: test -f third_party/dawn/lib/cmake/Dawn/DawnConfig.cmake || scripts/build_dawn.sh
+      - uses: pypa/cibuildwheel@v3.2.1
+        env:
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_ARCHS_WINDOWS: AMD64
+          CIBW_TEST_COMMAND: python -c "import rillfacet"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
   publish-testpypi:
-    needs: [build, build-macos]
+    needs: [build, build-macos, build-windows]
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     environment: testpypi

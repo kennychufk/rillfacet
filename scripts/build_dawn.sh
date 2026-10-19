@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build Dawn (native WebGPU) once into third_party/dawn (gitignored).
-# Vulkan backend only; X11 surfaces; installs a CMake package (find_package(Dawn)).
+# Vulkan backend with X11 surfaces on Linux, Metal on macOS, D3D12 on Windows; installs a CMake package (find_package(Dawn)).
 # Needs the X11 dev headers, including libx11-xcb-dev.
 set -euo pipefail
 DAWN_COMMIT=${DAWN_COMMIT:-42a517fc1fc721921659f02533d1aace7e969d4b}
@@ -9,15 +9,22 @@ SRC=$ROOT/third_party/dawn-src
 BUILD=$ROOT/third_party/dawn-build
 PREFIX=$ROOT/third_party/dawn
 
-if [ "$(uname)" = Darwin ]; then  # Metal backend, no X11/Vulkan
-  BACKEND_FLAGS="-DDAWN_ENABLE_METAL=ON -DDAWN_ENABLE_VULKAN=OFF -DDAWN_USE_X11=OFF"
-  TINT_MSL=-DTINT_BUILD_MSL_WRITER=ON
-  JOBS=$(sysctl -n hw.ncpu)
-else
-  BACKEND_FLAGS="-DDAWN_ENABLE_METAL=OFF -DDAWN_ENABLE_VULKAN=ON -DDAWN_USE_X11=ON"
-  TINT_MSL=-DTINT_BUILD_MSL_WRITER=OFF
-  JOBS=$(nproc)
-fi
+case "$(uname)" in
+  Darwin)  # Metal backend, no X11/Vulkan
+    BACKEND_FLAGS="-DDAWN_ENABLE_METAL=ON -DDAWN_ENABLE_VULKAN=OFF -DDAWN_ENABLE_D3D12=OFF -DDAWN_USE_X11=OFF"
+    TINT_WRITERS="-DTINT_BUILD_MSL_WRITER=ON -DTINT_BUILD_HLSL_WRITER=OFF"
+    JOBS=$(sysctl -n hw.ncpu) ;;
+  MINGW*|MSYS*|CYGWIN*)  # D3D12 backend (run from Git Bash, in an MSVC developer environment)
+    BACKEND_FLAGS="-DDAWN_ENABLE_METAL=OFF -DDAWN_ENABLE_VULKAN=OFF -DDAWN_ENABLE_D3D12=ON -DDAWN_USE_X11=OFF"
+    TINT_WRITERS="-DTINT_BUILD_MSL_WRITER=OFF -DTINT_BUILD_HLSL_WRITER=ON"
+    JOBS=$NUMBER_OF_PROCESSORS
+    EXE=.exe ;;
+  *)
+    BACKEND_FLAGS="-DDAWN_ENABLE_METAL=OFF -DDAWN_ENABLE_VULKAN=ON -DDAWN_ENABLE_D3D12=OFF -DDAWN_USE_X11=ON"
+    TINT_WRITERS="-DTINT_BUILD_MSL_WRITER=OFF -DTINT_BUILD_HLSL_WRITER=OFF"
+    JOBS=$(nproc) ;;
+esac
+EXE=${EXE:-}
 
 # Dawn's dependency fetch (DAWN_FETCH_DEPENDENCIES, run by the configure step)
 # sometimes leaves a dependency half-downloaded (a missing CMakeLists.txt, an
@@ -59,11 +66,11 @@ overloaded(Ts...) -> overloaded<Ts...>;\
     -DDAWN_ENABLE_INSTALL=ON \
     -DDAWN_BUILD_MONOLITHIC_LIBRARY=SHARED \
     -DDAWN_BUILD_SAMPLES=OFF -DDAWN_BUILD_TESTS=OFF -DDAWN_BUILD_BENCHMARKS=OFF \
-    -DDAWN_ENABLE_D3D11=OFF -DDAWN_ENABLE_D3D12=OFF \
+    -DDAWN_ENABLE_D3D11=OFF \
     -DDAWN_ENABLE_NULL=OFF -DDAWN_ENABLE_DESKTOP_GL=OFF -DDAWN_ENABLE_OPENGLES=OFF \
     $BACKEND_FLAGS -DDAWN_USE_WAYLAND=OFF -DDAWN_USE_GLFW=OFF \
     -DTINT_BUILD_TESTS=OFF -DTINT_BUILD_CMD_TOOLS=ON \
-    -DTINT_BUILD_GLSL_WRITER=OFF -DTINT_BUILD_HLSL_WRITER=OFF $TINT_MSL \
+    -DTINT_BUILD_GLSL_WRITER=OFF $TINT_WRITERS \
     -DTINT_BUILD_GLSL_VALIDATOR=OFF -DTINT_BUILD_SPV_READER=OFF || return 1
 }
 for attempt in 1 2 3; do
@@ -75,5 +82,5 @@ done
 cmake --build "$BUILD" -j"$JOBS"
 cmake --install "$BUILD"
 # tint CLI is handy for offline WGSL validation (scripts/check_shaders.sh).
-mkdir -p "$PREFIX/bin" && cp -f "$BUILD/tint" "$PREFIX/bin/"
+mkdir -p "$PREFIX/bin" && cp -f "$BUILD/tint$EXE" "$PREFIX/bin/"
 echo "Dawn installed to $PREFIX"

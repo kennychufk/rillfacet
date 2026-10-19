@@ -4,8 +4,11 @@
 #include "rillfacet/ui.h"
 
 #include <GLFW/glfw3.h>
-#ifdef __APPLE__
+#if defined(__APPLE__)
 #include "rillfacet/metal_layer.h"
+#elif defined(_WIN32)
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
 #else
 #define GLFW_EXPOSE_NATIVE_X11
 #include <GLFW/glfw3native.h>
@@ -50,9 +53,13 @@ Viewer::Viewer(const ViewerOptions& options) : options_(options) {
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     window_ = glfwCreateWindow(options.width, options.height, options.title.c_str(), nullptr, nullptr);
     if (!window_) return;
-#ifdef __APPLE__
+#if defined(__APPLE__)
     wgpu::SurfaceSourceMetalLayer native{};
     native.layer = create_metal_layer(window_);
+#elif defined(_WIN32)
+    wgpu::SurfaceSourceWindowsHWND native{};
+    native.hinstance = GetModuleHandleW(nullptr);
+    native.hwnd = glfwGetWin32Window(window_);
 #else
     wgpu::SurfaceSourceXlibWindow native{};
     native.display = glfwGetX11Display();
@@ -255,7 +262,11 @@ void Viewer::request_screenshot(const std::string& path, bool with_ui) {
 
 static bool have_ffmpeg() {
   static int found = -1;
+#ifdef _WIN32
+  if (found < 0) found = std::system("ffmpeg -version > NUL 2>&1") == 0;
+#else
   if (found < 0) found = std::system("ffmpeg -version > /dev/null 2>&1") == 0;
+#endif
   return found == 1;
 }
 
@@ -272,12 +283,16 @@ bool Viewer::start_recording(const std::string& path, int fps, bool with_ui) {
     char cmd[1024];
     std::snprintf(cmd, sizeof cmd,
                   "ffmpeg -y -loglevel error -f rawvideo -pix_fmt rgba -s %ux%u -r %d -i - "
-                  "-vf 'crop=trunc(iw/2)*2:trunc(ih/2)*2' -c:v libx264 -preset veryfast -crf 18 "
+                  "-vf \"crop=trunc(iw/2)*2:trunc(ih/2)*2\" -c:v libx264 -preset veryfast -crf 18 "
                   "-pix_fmt yuv420p \"%s\"",
                   video_w_, video_h_, video_fps_, path.c_str());
     // A dying ffmpeg must not take the viewer down with SIGPIPE.
+#ifdef _WIN32
+    video_ = _popen(cmd, "wb");
+#else
     std::signal(SIGPIPE, SIG_IGN);
     video_ = popen(cmd, "w");
+#endif
     if (!video_) return false;
   } else {
     video_png_ = true;  // numbered PNGs: <path without extension>_00000.png
@@ -289,7 +304,11 @@ bool Viewer::start_recording(const std::string& path, int fps, bool with_ui) {
 
 void Viewer::stop_recording() {
   if (!recording()) return;
+#ifdef _WIN32
+  if (video_) _pclose(video_);
+#else
   if (video_) pclose(video_);
+#endif
   video_ = nullptr;
   video_png_ = false;
   status_ = "Saved " + std::to_string(video_frames_) + " frames to " + video_path_;

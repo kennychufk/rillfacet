@@ -1,13 +1,13 @@
 #include "rillfacet/cuda_share.h"
 
-#include <dlfcn.h>
-#include <unistd.h>
-
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 #if RILLFACET_HAVE_CUDA_H
+#include <dlfcn.h>
+#include <unistd.h>
+
 #define VK_NO_PROTOTYPES
 #include <cuda.h>
 #include <vulkan/vulkan.h>

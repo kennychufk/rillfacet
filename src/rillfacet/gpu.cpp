@@ -23,8 +23,10 @@ bool Gpu::init(const GpuOptions& options) {
 
   wgpu::RequestAdapterOptions adapter_opts{};
   adapter_opts.powerPreference = wgpu::PowerPreference::HighPerformance;
-#ifdef __APPLE__
+#if defined(__APPLE__)
   adapter_opts.backendType = wgpu::BackendType::Metal;
+#elif defined(_WIN32)
+  adapter_opts.backendType = wgpu::BackendType::D3D12;
 #else
   adapter_opts.backendType = wgpu::BackendType::Vulkan;
 #endif

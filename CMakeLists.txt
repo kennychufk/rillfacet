@@ -35,7 +35,7 @@ if(APPLE)
 endif()
 target_include_directories(rillfacet PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_compile_features(rillfacet PUBLIC cxx_std_20)  # webgpu_cpp.h needs C++20
-if(NOT CMAKE_BUILD_TYPE)  # e.g. added to a parent project without a build type
+if(NOT CMAKE_BUILD_TYPE AND NOT MSVC)  # e.g. added to a parent project without a build type
   target_compile_options(rillfacet PRIVATE -O2)
   target_compile_options(rillfacet_imgui PRIVATE -O2)
 endif()
@@ -48,13 +48,18 @@ target_compile_definitions(rillfacet PUBLIC
   RILLFACET_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/shaders"
   RILLFACET_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets"
   GLM_ENABLE_EXPERIMENTAL GLM_FORCE_DEPTH_ZERO_TO_ONE)
-target_compile_options(rillfacet PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+if(MSVC)
+  target_compile_options(rillfacet PRIVATE /utf-8 /bigobj /W3)
+  target_compile_definitions(rillfacet PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES)
+else()
+  target_compile_options(rillfacet PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+endif()
 # Zero-copy camera images (cuda_share.cpp): Vulkan and the CUDA driver are
 # loaded at runtime, so only their headers are needed here. Vulkan's come
 # with Dawn's source checkout (scripts/build_dawn.sh); without CUDA's
 # (cuda.h, a CUDA toolkit) the camera rasterizer reads images back instead.
 find_package(CUDAToolkit QUIET)
-if(CUDAToolkit_FOUND)
+if(CUDAToolkit_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")  # the Vulkan/CUDA fd hand-over is Linux-only
   set(RILLFACET_VULKAN_INCLUDE ${RILLFACET_ROOT}/third_party/dawn-src/third_party/vulkan-headers/src/include)
   if(NOT EXISTS ${RILLFACET_VULKAN_INCLUDE}/vulkan/vulkan.h)
     FetchContent_Declare(vulkan_headers
@@ -93,8 +98,9 @@ if(RILLFACET_BUILD_PYTHON)
   target_link_libraries(_rillfacet PRIVATE rillfacet)
   if(SKBUILD)
     set_target_properties(_rillfacet PROPERTIES INSTALL_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path,$ORIGIN>")
-    install(TARGETS _rillfacet LIBRARY DESTINATION rillfacet)
-    install(IMPORTED_RUNTIME_ARTIFACTS dawn::webgpu_dawn LIBRARY DESTINATION rillfacet)
+    install(TARGETS _rillfacet LIBRARY DESTINATION rillfacet RUNTIME DESTINATION rillfacet)
+    install(IMPORTED_RUNTIME_ARTIFACTS dawn::webgpu_dawn LIBRARY DESTINATION rillfacet
+            RUNTIME DESTINATION rillfacet)
     install(DIRECTORY shaders/ DESTINATION rillfacet/shaders)
     install(DIRECTORY assets/ DESTINATION rillfacet/assets)
   else()
