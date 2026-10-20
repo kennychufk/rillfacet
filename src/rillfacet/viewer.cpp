@@ -194,6 +194,13 @@ bool Viewer::frame() {
   ImGui_ImplWGPU_NewFrame();
   if (window_) {
     ImGui_ImplGlfw_NewFrame();
+    // GLFW queries the window size live, so a resize landing after the surface was
+    // configured above makes ImGui lay out (and scissor) for a framebuffer the
+    // renderer does not have yet. Pin ImGui to the configured surface; the next
+    // frame picks up the new size.
+    const ImVec2 s = io.DisplayFramebufferScale;
+    if (s.x > 0.0f && s.y > 0.0f)
+      io.DisplaySize = ImVec2(float(renderer_->width()) / s.x, float(renderer_->height()) / s.y);
   } else {
     io.DisplaySize = ImVec2(float(renderer_->width()), float(renderer_->height()));
     io.DeltaTime = dt_;
