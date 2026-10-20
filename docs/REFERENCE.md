@@ -68,12 +68,12 @@ clamping the limits the driver advertises to its own internal cap
 (`NormalizeLimits`), once per device, whatever a client asks for. Nothing here
 binds with dynamic offsets, so the warning is harmless.
 
-Python module (`rillfacet`, pybind11):
+Python module (`rillfacet`, nanobind):
 
 ```bash
-pip install pybind11                         # CMake finds it through the interpreter
+pip install nanobind                         # CMake finds it through the interpreter
 cmake -S . -B build -G Ninja -DRILLFACET_BUILD_PYTHON=ON \
-      -DPython3_EXECUTABLE=$(which python) && cmake --build build
+      -DPython_EXECUTABLE=$(which python) && cmake --build build
 PYTHONPATH=python python -m pytest tests -q  # headless checks (numpy, websockets, pytest)
 ```
 
@@ -418,7 +418,7 @@ src/rillfacet/
 shaders/
   styles/{studio,matcap,pbr,technical}.wgsl   one `shade()` each: edit these to restyle
   mesh, points, curves, arrows, grid, ssao, composite, overlay_*, env_prefilter .wgsl
-src/python/module.cpp   pybind11 module `_rillfacet` (+ `rillfacet.imgui`)
+src/python/module.cpp   nanobind module `_rillfacet` (+ `rillfacet.imgui`)
 python/rillfacet/        Python package
   scene_api.py          backend-neutral scene (+ materials, lights, camera sensors)
   assets.py             glTF / OBJ visual meshes, merge_bodies
@@ -447,5 +447,5 @@ directly; simulator data is copied through the CPU each frame.
 ## License
 
 MIT (`LICENSE`). Wheels also contain Dawn (BSD-3-Clause), GLFW (zlib), Dear ImGui and
-ImPlot (MIT), pybind11, and the Inter and JetBrains Mono fonts (OFL-1.1); their
+ImPlot (MIT), nanobind, and the Inter and JetBrains Mono fonts (OFL-1.1); their
 licenses are in `THIRD_PARTY_LICENSES.txt` and `assets/fonts/`.

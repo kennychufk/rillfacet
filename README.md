@@ -106,4 +106,4 @@ You need GCC 13 or newer (or Clang), CMake 3.24 or newer, Ninja and git. Full de
 
 ## License
 
-MIT. Wheels also bundle Dawn, GLFW, Dear ImGui, ImPlot, pybind11 and fonts under their own licenses; see `THIRD_PARTY_LICENSES.txt`.
+MIT. Wheels also bundle Dawn, GLFW, Dear ImGui, ImPlot, nanobind and fonts under their own licenses; see `THIRD_PARTY_LICENSES.txt`.

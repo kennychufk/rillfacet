@@ -368,6 +368,11 @@ class VectorSet : public Structure {
 
 class Scene {
  public:
+  Scene() = default;
+  // Owns its structures through unique_ptr (std::vector would still claim to be copyable).
+  Scene(const Scene&) = delete;
+  Scene& operator=(const Scene&) = delete;
+
   SurfaceMesh& add_mesh(const std::string& name);
   PointCloud& add_points(const std::string& name);
   CurveNetwork& add_curves(const std::string& name);

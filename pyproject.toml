@@ -5,7 +5,7 @@
 # thing in a clean container. For development, build with plain CMake instead
 # (docs/REFERENCE.md) and use PYTHONPATH=python.
 [build-system]
-requires = ["scikit-build-core>=0.11", "pybind11>=2.10"]
+requires = ["scikit-build-core>=0.11", "nanobind>=2.9"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -47,10 +47,10 @@ Repository = "https://github.com/kennychufk/rillfacet"
 Issues = "https://github.com/kennychufk/rillfacet/issues"
 
 [project.optional-dependencies]
-# Needed to build the _rillfacet extension (CMake finds pybind11 through
-# `python -m pybind11 --cmakedir`); cmake/ninja only if the system's are older
+# Needed to build the _rillfacet extension (CMake finds nanobind through
+# `python -m nanobind --cmake_dir`); cmake/ninja only if the system's are older
 # than CMake 3.24 or missing.
-build = ["pybind11", "cmake>=3.24", "ninja", "scikit-build-core>=0.11"]
+build = ["nanobind>=2.9", "cmake>=3.24", "ninja", "scikit-build-core>=0.11"]
 test = ["pytest"]
 # web/tools/golden.py (native-vs-browser frame diff).
 tools = ["pillow", "matplotlib"]
@@ -66,3 +66,5 @@ cmake.version = ">=3.24"
 cmake.build-type = "Release"
 build-dir = "build/skbuild/{wheel_tag}"
 wheel.packages = ["python/rillfacet"]
+# Python >= 3.12: one abi3 wheel (cp312-abi3) for all later versions; 3.10 and 3.11 get their own.
+wheel.py-api = "cp312"

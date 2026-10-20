@@ -24,7 +24,7 @@ COPY . .
 RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -e ".[build,test]"
 ENV PATH=/venv/bin:$PATH
 RUN cmake -S . -B build -G Ninja -DRILLFACET_BUILD_PYTHON=ON \
-          -DPython3_EXECUTABLE=/venv/bin/python \
+          -DPython_EXECUTABLE=/venv/bin/python \
     && cmake --build build
 
 # Running needs a Vulkan driver; Mesa's software one (lavapipe) stands in for a GPU.
@@ -57,7 +57,7 @@ RUN scripts/build_dawn.sh
 
 FROM manylinux-dawn AS manylinux-wheel
 COPY . .
-RUN set -e; for v in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do \
+RUN set -e; for v in cp310-cp310 cp311-cp311 cp312-cp312; do \
       /opt/python/$v/bin/pip wheel --no-deps -w /raw . ; done; \
     for w in /raw/*.whl; do auditwheel repair --plat manylinux_2_28_x86_64 -w /dist $w; done; \
     ls -l /dist

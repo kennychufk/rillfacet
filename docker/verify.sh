@@ -7,7 +7,7 @@
 #   e.g. docker/verify.sh fedora:latest+clang   (+clang: Clang instead of GCC)
 #   docker/verify.sh --wheel [BASE_IMAGE...]   # instead: build the wheel, install it in a clean image, run the tests
 #   docker/verify.sh --manylinux [BASE_IMAGE...]   # same with the auditwheel-repaired manylinux_2_28 wheels
-#                                                  # (one per CPython 3.10-3.14); default bases ubuntu:24.04 debian:13 fedora:latest
+#                                                  # (cp310, cp311 and one abi3 wheel for CPython 3.12+); default bases ubuntu:24.04 debian:13 fedora:latest
 #   DOCKER="sudo docker" docker/verify.sh   # if your user is not in the docker group
 set -euo pipefail
 cd "$(dirname "$0")/.."

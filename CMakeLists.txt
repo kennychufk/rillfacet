@@ -90,11 +90,12 @@ if(SKBUILD)
   set(RILLFACET_BUILD_PYTHON ON)
 endif()
 if(RILLFACET_BUILD_PYTHON)
-  find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
-  execute_process(COMMAND ${Python3_EXECUTABLE} -m pybind11 --cmakedir
-                  OUTPUT_VARIABLE pybind11_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
-  find_package(pybind11 CONFIG REQUIRED)
-  pybind11_add_module(_rillfacet src/python/module.cpp src/python/camera_raster_bindings.cpp)
+  find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Module Development.SABIModule)
+  execute_process(COMMAND ${Python_EXECUTABLE} -m nanobind --cmake_dir
+                  OUTPUT_VARIABLE nanobind_ROOT OUTPUT_STRIP_TRAILING_WHITESPACE)
+  find_package(nanobind CONFIG REQUIRED)
+  # STABLE_ABI: one abi3 module for every Python >= 3.12 (older ones get a version-specific one).
+  nanobind_add_module(_rillfacet STABLE_ABI src/python/module.cpp src/python/camera_raster_bindings.cpp)
   target_link_libraries(_rillfacet PRIVATE rillfacet)
   if(SKBUILD)
     set_target_properties(_rillfacet PROPERTIES INSTALL_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path,$ORIGIN>")

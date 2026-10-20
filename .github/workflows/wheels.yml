@@ -1,4 +1,4 @@
-# Builds the manylinux_2_28 wheels (CPython 3.10-3.14) in Docker, tests them in
+# Builds the manylinux_2_28 wheels (cp310, cp311, and cp312-abi3 for 3.12+) in Docker, tests them in
 # clean Ubuntu / Debian / Fedora images, builds the macOS arm64 wheels (macOS 12+,
 # Metal) and Windows x64 wheels (Windows 10+, D3D12) with cibuildwheel, and
 # publishes them all to TestPyPI.
@@ -55,7 +55,7 @@ jobs:
         run: test -f third_party/dawn/lib/cmake/Dawn/DawnConfig.cmake || scripts/build_dawn.sh
       - uses: pypa/cibuildwheel@v3.2.1
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-* cp311-* cp312-*"
           CIBW_ARCHS_MACOS: arm64
           # No GPU on hosted runners: only check that the wheel imports.
           CIBW_TEST_COMMAND: python -c "import rillfacet"
@@ -82,7 +82,7 @@ jobs:
         run: test -f third_party/dawn/lib/cmake/Dawn/DawnConfig.cmake || scripts/build_dawn.sh
       - uses: pypa/cibuildwheel@v3.2.1
         env:
-          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_BUILD: "cp310-* cp311-* cp312-*"
           CIBW_ARCHS_WINDOWS: AMD64
           CIBW_TEST_COMMAND: python -c "import rillfacet"
       - uses: actions/upload-artifact@v4

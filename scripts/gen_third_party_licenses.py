@@ -3,7 +3,7 @@
 the wheel: statically linked libraries, libwebgpu_dawn.so (Dawn, Tint and the
 parts of abseil / SPIRV-Tools it links, plus the Khronos headers) and the fonts.
 
-    scripts/gen_third_party_licenses.py [PYBIND11_LICENSE]
+    scripts/gen_third_party_licenses.py [NANOBIND_LICENSE]
 
 Needs third_party/dawn-src (scripts/build_dawn.sh) and a configured build/ tree
 (cmake/deps.cmake fetches GLFW, GLM, ImGui, ImPlot, stb into build/_deps).
@@ -17,15 +17,15 @@ DAWN = ROOT / "third_party/dawn-src"
 DEPS = ROOT / "build/_deps"
 
 
-def pybind11_license() -> pathlib.Path:
+def nanobind_license() -> pathlib.Path:
     if len(sys.argv) > 1:
         return pathlib.Path(sys.argv[1])
     import importlib.metadata as md
 
-    for f in md.files("pybind11") or []:
+    for f in md.files("nanobind") or []:
         if f.name == "LICENSE":
             return pathlib.Path(f.locate())
-    sys.exit("pybind11 LICENSE not found; pass its path")
+    sys.exit("nanobind LICENSE not found; pass its path")
 
 
 COMPONENTS = [
@@ -40,7 +40,7 @@ COMPONENTS = [
     ("ImPlot", "MIT", DEPS / "implot-src/LICENSE"),
     ("GLM", "MIT (or Happy Bunny)", DEPS / "glm-src/copying.txt"),
     ("stb", "MIT (or public domain)", DEPS / "stb-src/LICENSE"),
-    ("pybind11", "BSD-3-Clause", None),
+    ("nanobind", "BSD-3-Clause", None),
     ("Inter font (assets/fonts, and the 3D-label atlas derived from it)", "OFL-1.1", ROOT / "assets/fonts/Inter-LICENSE.txt"),
     ("JetBrains Mono font (assets/fonts)", "OFL-1.1", ROOT / "assets/fonts/JetBrainsMono-LICENSE.txt"),
 ]
@@ -51,7 +51,7 @@ out = [
     "scripts/gen_third_party_licenses.py.\n"
 ]
 for name, spdx, path in COMPONENTS:
-    path = path or pybind11_license()
+    path = path or nanobind_license()
     out.append("=" * 78 + f"\n{name}\nLicense: {spdx}\n" + "=" * 78 + "\n")
     out.append(path.read_text(encoding="utf-8").strip("\n") + "\n")
 (ROOT / "THIRD_PARTY_LICENSES.txt").write_text("\n".join(out), encoding="utf-8")
