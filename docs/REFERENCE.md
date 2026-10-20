@@ -351,7 +351,7 @@ client in a real Chromium window over CDP (headless Chromium may have no
 WebGPU adapter) and evaluates `EXPR` (`window.__rillfacet` holds the stream
 stats).
 
-Dragging: with `v.drag_enabled = True`, Ctrl+LMB grabs the element under the
+Dragging: with `v.drag_enabled = True`, Ctrl+LMB (Cmd+LMB on macOS) grabs the element under the
 cursor (mesh face, tet, curve edge or point) of any structure whose
 `draggable` is true, and `v.drag` reports it every frame: `phase`
 (`Started` / `Held` / `Released` / `Idle`, Started and Released lasting one
@@ -365,6 +365,8 @@ and `end_drag()` script one without the mouse.
 
 ## Controls (Blender style)
 
+On macOS Ctrl and Cmd are swapped, as in ImGui's Mac behavior: Cmd acts as Ctrl, and Ctrl+click is a right-click. Scripted input then injects `ImGuiMod_Super` for Ctrl.
+
 | Action | Input |
 |---|---|
 | Orbit / pan / zoom | MMB drag / Shift+MMB / wheel or Ctrl+MMB (Alt+LMB orbits too) |
@@ -376,7 +378,7 @@ and `end_drag()` script one without the mouse.
 | Hide | H hides selected bodies, Alt+H unhides all; or tick them in Display → Structures → Bodies |
 | Measure | M cycles distance → angle → off; clicks snap to vertices within 12 px |
 | Misc | Alt+A / Esc clear selection, F12 screenshot, F10 start/stop video |
-| Drag | Ctrl+LMB, when the app enables it (`drag_enabled`) |
+| Drag | Ctrl+LMB (Cmd+LMB on macOS), when the app enables it (`drag_enabled`) |
 | Sim demo | Space shoot box, Ctrl+LMB drag body, P pause, → step |
 
 Axis views (numpad or gizmo) switch to orthographic; in the side views the grid

@@ -3,10 +3,15 @@
     PYTHONPATH=python python -m pytest tests -q
 """
 
+import sys
+
 import numpy as np
 import pytest
 
 import rillfacet as viz
+
+# ImGui swaps Ctrl and Cmd on macOS: the key that arrives as Ctrl is injected as Super.
+CTRL = viz.imgui.ImGuiMod_Super if sys.platform == "darwin" else viz.imgui.ImGuiMod_Ctrl
 
 
 @pytest.fixture(scope="module")
@@ -204,7 +209,7 @@ def test_input_injection_and_pick_kind(v):
     io = viz.imgui.GetIO()
     w, h = v.viewport
     x, y, _ = v.camera.project((0.0, 0.0, 0.3), w, h)
-    io.AddKeyEvent(viz.imgui.ImGuiMod_Ctrl, True)
+    io.AddKeyEvent(CTRL, True)
     io.AddMousePosEvent(x, y)
     v.frame()
     io.AddMouseButtonEvent(0, True)
@@ -215,7 +220,7 @@ def test_input_injection_and_pick_kind(v):
     assert hit.valid and hit.kind == viz.Anchor.Kind.Surface and hit.object == m.id
     assert hit.surface.object == m.id
     io.AddMouseButtonEvent(0, False)
-    io.AddKeyEvent(viz.imgui.ImGuiMod_Ctrl, False)
+    io.AddKeyEvent(CTRL, False)
     v.frame()
     v.set_callback(None)
 
@@ -343,7 +348,7 @@ def test_drag_with_mouse(v):
     # ImGui trickles queued input: one kind of event per frame.
     io.AddMousePosEvent(x, y)
     v.frame()
-    io.AddKeyEvent(viz.imgui.ImGuiMod_Ctrl, True)
+    io.AddKeyEvent(CTRL, True)
     v.frame()
     io.AddMouseButtonEvent(0, True)
     v.frame()
@@ -359,7 +364,7 @@ def test_drag_with_mouse(v):
         assert v.drag.phase == viz.Drag.Phase.Released
     finally:
         io.AddMouseButtonEvent(0, False)
-        io.AddKeyEvent(viz.imgui.ImGuiMod_Ctrl, False)
+        io.AddKeyEvent(CTRL, False)
         v.frame()
         v.frame()
         v.set_ui_visible(True)
