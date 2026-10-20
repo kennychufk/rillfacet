@@ -102,6 +102,20 @@ if(RILLFACET_BUILD_PYTHON)
     install(TARGETS _rillfacet LIBRARY DESTINATION rillfacet RUNTIME DESTINATION rillfacet)
     install(IMPORTED_RUNTIME_ARTIFACTS dawn::webgpu_dawn LIBRARY DESTINATION rillfacet
             RUNTIME DESTINATION rillfacet)
+    if(WIN32)
+      # Dawn's D3D12 backend loads d3dcompiler_47.dll with LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, which
+      # fails (error 87) for a bare name: it has to sit next to webgpu_dawn.dll. Ship the Windows
+      # SDK's redistributable copy (newer than the one bundled with older Windows versions).
+      file(TO_CMAKE_PATH "$ENV{WindowsSdkDir}" _sdk_dir)  # trailing backslash would escape the list ';'
+      set(_sdk_dirs "${_sdk_dir}" "$ENV{ProgramFiles} (x86)/Windows Kits/10")
+      find_file(RILLFACET_D3DCOMPILER d3dcompiler_47.dll
+                HINTS ${_sdk_dirs} PATH_SUFFIXES Redist/D3D/x64 NO_DEFAULT_PATH)
+      if(NOT RILLFACET_D3DCOMPILER)
+        message(FATAL_ERROR "d3dcompiler_47.dll (Windows SDK Redist/D3D/x64) not found; "
+                            "set RILLFACET_D3DCOMPILER to its path")
+      endif()
+      install(FILES ${RILLFACET_D3DCOMPILER} DESTINATION rillfacet)
+    endif()
     install(DIRECTORY shaders/ DESTINATION rillfacet/shaders)
     install(DIRECTORY assets/ DESTINATION rillfacet/assets)
   else()
