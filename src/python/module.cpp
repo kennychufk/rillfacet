@@ -161,50 +161,50 @@ NB_MODULE(_rillfacet, m) {
   m.doc() = "rillfacet: real-time scientific viewer (WebGPU)";
 
   // ---- Enums ----
-  nb::enum_<ElementKind>(m, "ElementKind")
+  nb::enum_<ElementKind>(m, "ElementKind", nb::is_arithmetic())
       .value("Vertex", ElementKind::Vertex)
       .value("Edge", ElementKind::Edge)
       .value("Face", ElementKind::Face)
       .value("Segment", ElementKind::Segment)
       .value("Cell", ElementKind::Cell);
-  nb::enum_<QuantityType>(m, "QuantityType")
+  nb::enum_<QuantityType>(m, "QuantityType", nb::is_arithmetic())
       .value("Scalar", QuantityType::Scalar)
       .value("Vector", QuantityType::Vector)
       .value("Color", QuantityType::Color);
-  nb::enum_<ColorSource>(m, "ColorSource")
+  nb::enum_<ColorSource>(m, "ColorSource", nb::is_arithmetic())
       .value("Uniform", ColorSource::Uniform)
       .value("SegmentPalette", ColorSource::SegmentPalette)
       .value("Quantity", ColorSource::Quantity)
       .value("Texture", ColorSource::Texture);
-  nb::enum_<Style>(m, "Style")
+  nb::enum_<Style>(m, "Style", nb::is_arithmetic())
       .value("Studio", Style::Studio)
       .value("MatCap", Style::MatCap)
       .value("EnvironmentPBR", Style::EnvironmentPBR)
       .value("Technical", Style::Technical);
-  nb::enum_<Theme>(m, "Theme").value("Dark", Theme::Dark).value("Light", Theme::Light);
-  nb::enum_<Shading>(m, "Shading").value("Solid", Shading::Solid).value("Wireframe", Shading::Wireframe);
-  nb::enum_<OutlineMode>(m, "OutlineMode")
+  nb::enum_<Theme>(m, "Theme", nb::is_arithmetic()).value("Dark", Theme::Dark).value("Light", Theme::Light);
+  nb::enum_<Shading>(m, "Shading", nb::is_arithmetic()).value("Solid", Shading::Solid).value("Wireframe", Shading::Wireframe);
+  nb::enum_<OutlineMode>(m, "OutlineMode", nb::is_arithmetic())
       .value("Off", OutlineMode::Off)
       .value("Silhouettes", OutlineMode::Silhouettes)
       .value("SilhouettesAndCreases", OutlineMode::SilhouettesAndCreases);
-  nb::enum_<PickMode>(m, "PickMode")
+  nb::enum_<PickMode>(m, "PickMode", nb::is_arithmetic())
       .value("Vertex", PickMode::Vertex)
       .value("Edge", PickMode::Edge)
       .value("Face", PickMode::Face)
       .value("Body", PickMode::Segment);
-  nb::enum_<ViewPreset>(m, "ViewPreset")
+  nb::enum_<ViewPreset>(m, "ViewPreset", nb::is_arithmetic())
       .value("Front", ViewPreset::Front)
       .value("Back", ViewPreset::Back)
       .value("Right", ViewPreset::Right)
       .value("Left", ViewPreset::Left)
       .value("Top", ViewPreset::Top)
       .value("Bottom", ViewPreset::Bottom);
-  nb::enum_<MatcapPreset>(m, "MatcapPreset")
+  nb::enum_<MatcapPreset>(m, "MatcapPreset", nb::is_arithmetic())
       .value("Clay", MatcapPreset::Clay)
       .value("Porcelain", MatcapPreset::Porcelain)
       .value("Chrome", MatcapPreset::Chrome)
       .value("Toon", MatcapPreset::Toon);
-  nb::enum_<EnvironmentPreset>(m, "EnvironmentPreset")
+  nb::enum_<EnvironmentPreset>(m, "EnvironmentPreset", nb::is_arithmetic())
       .value("Studio", EnvironmentPreset::Studio)
       .value("Sky", EnvironmentPreset::Sky)
       .value("Soft", EnvironmentPreset::Soft);
@@ -521,7 +521,7 @@ NB_MODULE(_rillfacet, m) {
       .def("toggle", [](Selection& s, uint32_t object, uint32_t index) { s.toggle({object, index}); });
 
   nb::class_<Anchor> anchor(m, "Anchor", "A point that follows moving geometry.");
-  nb::enum_<Anchor::Kind>(anchor, "Kind")
+  nb::enum_<Anchor::Kind>(anchor, "Kind", nb::is_arithmetic())
       .value("Vertex", Anchor::Vertex)
       .value("Surface", Anchor::Surface)
       .value("Ground", Anchor::Ground)
@@ -549,7 +549,7 @@ NB_MODULE(_rillfacet, m) {
       .def_prop_ro("index", [](const Hit& h) { return h.surface.index; });
 
   nb::class_<Drag> drag(m, "Drag", "Ctrl+LMB drag state (Viewer.drag). Started and Released last one frame.");
-  nb::enum_<Drag::Phase>(drag, "Phase")
+  nb::enum_<Drag::Phase>(drag, "Phase", nb::is_arithmetic())
       .value("Idle", Drag::Idle)
       .value("Started", Drag::Started)
       .value("Held", Drag::Held)
