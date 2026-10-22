@@ -78,8 +78,11 @@ class CameraRaster {
   // y), RGBA16F half bits: GGX scale and bias (F0 * x + y), Burley diffuse.
   bool set_brdf_lut(uint32_t n, const uint16_t* data);
   // [envs, slots, 8]: linear base color, roughness, metallic, texture layer
-  // (-1 = none), 0, 0.
+  // (-1 = none), solid texture row (-1 = none), its bump (0 / 1).
   bool set_materials(const float* m, uint32_t envs, uint32_t slots);
+  // [n, 32]: solid (3D) texture parameter rows (rillfacet.solid_texture's
+  // layout, linear colors; the last float 1 = filter by the footprint).
+  bool set_solid_textures(const float* rows, uint32_t n);
   // [envs, 8]: gain rgb, vignetting, shot noise, read noise, 0, 0.
   bool set_lens(const float* l, uint32_t envs);
   // The frame uniform (lights, shadow box, environment), kFrameFloats floats.
@@ -144,8 +147,8 @@ class CameraRaster {
   wgpu::BindGroupLayout render_layout_, shadow_layout_, compute_layout_;
   wgpu::RenderPipeline shadow_pipe_, main_pipe_[3];   // rgb, geometry, both
   wgpu::ComputePipeline remap_pipe_;
-  wgpu::Buffer frame_, vbuf_, ibuf_, mats_, lens_;
-  uint64_t mats_size_ = 0, lens_size_ = 0;
+  wgpu::Buffer frame_, vbuf_, ibuf_, mats_, lens_, solid_;
+  uint64_t mats_size_ = 0, lens_size_ = 0, solid_size_ = 128;
   std::vector<uint32_t> first_index_, index_count_;
   uint32_t bodies_ = 0;
   wgpu::Texture base_tex_, env_tex_, brdf_lut_;

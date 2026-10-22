@@ -78,6 +78,11 @@ void bind_camera_raster(nb::module_& m) {
           throw std::invalid_argument("CameraRaster.set_brdf_lut: [n, n, 4]");
         return r.set_brdf_lut(uint32_t(a.shape(0)), a.data());
       })
+      .def("set_solid_textures", [](CameraRaster& r, nb::handle rows) {
+        auto a = checked<float>(rows, 2, "solid texture rows");
+        if (a.shape(1) != 32) throw std::invalid_argument("CameraRaster.set_solid_textures: [n, 32]");
+        return r.set_solid_textures(a.data(), uint32_t(a.shape(0)));
+      })
       .def("set_materials", [](CameraRaster& r, nb::handle m) {
         auto a = checked<float>(m, 3, "materials");
         return r.set_materials(a.data(), uint32_t(a.shape(0)), uint32_t(a.shape(1)));

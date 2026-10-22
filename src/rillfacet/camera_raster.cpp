@@ -3,10 +3,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
-#include <sstream>
 
 #include "rillfacet/resources.h"
+#include "rillfacet/shader_library.h"
 
 namespace rillfacet {
 
@@ -190,6 +189,8 @@ CameraRaster::CameraRaster(bool zero_copy) {
   gpu_.queue.WriteBuffer(frame_, 0, zero.data(), kFrameFloats * 4);
   mats_ = gpu_.create_buffer(32, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, "raster mats");
   lens_ = gpu_.create_buffer(32, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, "raster lens");
+  solid_ = gpu_.create_buffer(128, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                              "raster solid textures");
   ok_ = make_pipelines();
 }
 
@@ -208,14 +209,11 @@ std::string CameraRaster::info() const {
 
 bool CameraRaster::make_pipelines() {
   auto& dev = gpu_.device;
-  std::ifstream in(shader_dir() + "/camera_raster.wgsl");
-  if (!in) {
-    std::fprintf(stderr, "[rillfacet] camera_raster.wgsl not found in %s\n", shader_dir().c_str());
+  std::string code, error;
+  if (!ShaderLibrary(shader_dir()).source("camera_raster.wgsl", {}, code, &error)) {
+    std::fprintf(stderr, "[rillfacet] %s\n", error.c_str());
     return false;
   }
-  std::stringstream ss;
-  ss << in.rdbuf();
-  std::string code = ss.str();
   auto subst = [&code](const std::string& key, const std::string& value) {
     for (size_t p = code.find(key); p != std::string::npos; p = code.find(key, p + value.size()))
       code.replace(p, key.size(), value);
@@ -239,7 +237,7 @@ bool CameraRaster::make_pipelines() {
       {3, V::Fragment, Entry::Storage}, {4, V::Fragment, Entry::Depth, A},
       {5, V::Fragment, Entry::Cmp}, {6, V::Fragment, Entry::Tex, A},
       {7, V::Fragment, Entry::Filt}, {8, V::Fragment, Entry::Tex}, {9, V::Fragment, Entry::Filt},
-      {19, V::Fragment, Entry::Tex}});
+      {19, V::Fragment, Entry::Tex}, {20, V::Fragment, Entry::Storage}});
   // The shadow pass writes the shadow maps: its group must not bind them.
   shadow_layout_ = make_layout(dev, "raster shadow", {
       {0, VF, Entry::Uniform}, {1, VF, Entry::Uniform}, {2, VF, Entry::UnfTex}});
@@ -412,6 +410,18 @@ bool CameraRaster::set_materials(const float* m, uint32_t envs, uint32_t slots) 
   return true;
 }
 
+bool CameraRaster::set_solid_textures(const float* rows, uint32_t n) {
+  uint64_t size = uint64_t(n) * 128;
+  if (size > solid_size_) {
+    solid_ = gpu_.create_buffer(size, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                                "raster solid textures");
+    solid_size_ = size;
+    groups_dirty_ = true;
+  }
+  if (size) gpu_.queue.WriteBuffer(solid_, 0, rows, size);
+  return true;
+}
+
 bool CameraRaster::set_lens(const float* l, uint32_t envs) {
   uint64_t size = uint64_t(envs) * 32;
   if (size > lens_size_) {
@@ -541,7 +551,7 @@ void CameraRaster::make_groups(View& v) {
         buf(0, frame_), buf(1, s.uniform), tex(2, pose_view), buf(3, mats_),
         tex(4, array_view(v.shadow ? v.shadow : dummy_shadow_)), smp(5, cmp_),
         tex(6, array_view(base_tex_)), smp(7, repeat_), tex(8, env_tex_.CreateView()), smp(9, clamp_),
-        tex(19, brdf_lut_.CreateView())};
+        tex(19, brdf_lut_.CreateView()), buf(20, solid_)};
     wgpu::BindGroupDescriptor d{};
     d.layout = render_layout_;
     d.entryCount = r.size();

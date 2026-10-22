@@ -372,30 +372,146 @@ def test_envmap_matches_mitsuba(tmp_path):
     np.testing.assert_allclose(res[0], res[1], atol=0.02)
 
 
-def test_solid_texture_drawn_in_its_first_color():
-    """Solid (3D) textures are not rasterized yet: a solid-texture slot
-    renders like an ordinary material of its rows' c0 and rough0."""
+# ---- solid (3D) textures ----------------------------------------------------
+
+#: 1 cm pixels on the plane at z = 2 (finer than the patterns' detail).
+K_FINE = np.array([[200.0, 0, 31.5], [0, 200.0, 23.5], [0, 0, 1]])
+
+
+def _solid_plane(renderer, rows, half=3.0, light=("ambient", dict(intensity=1.0)),
+                 bump=False, materials=None, Kc=K):
+    """One textured plane at z = 2 facing the camera per env (body pose =
+    identity, so body-local = world)."""
     from rillfacet import solid_texture as sx
-    rows = sx.sample_params(np.random.default_rng(0), (2, 1))
-    P = sx.PARAM
-    rows[:, 0, P["c0"]:P["c0"] + 3] = [(1, 0.2, 0.1), (0.1, 0.9, 0.3)]
-    imgs = []
-    for solid in (False, True):
-        r = RasterRenderer(chunk=2)
-        sc = Scene(r)
-        m = rigid(sc, "m", [box((0.0, 0.0, 1.5), (0.4, 0.4, 0.2))], 2,
-                  materials=[Material("a", solid_texture=solid)])
-        m.set_poses(identity_poses(2, 1))
-        sc.light("sky", "ambient", intensity=0.5)
-        sc.camera_sensor("c", W, H, K, instances=2, local_pose=IDENTITY)
-        if solid:
-            m.set_materials(solid_texture=rows)
-            with pytest.warns(UserWarning, match="solid textures"):
-                imgs.append(r.render("c", outputs=("linear",))["linear"])
-        else:
-            m.set_materials(base_color=rows[..., P["c0"]:P["c0"] + 3],
-                            roughness=rows[..., P["rough0"]])
-            imgs.append(r.render("c", outputs=("linear",))["linear"])
+    I = len(rows)
+    sc = Scene(renderer)
+    m = rigid(sc, "m", [quad(2.0, half)], I, materials=materials or [
+        Material("a", solid_texture=True, bump=bump)])
+    m.set_poses(identity_poses(I, 1))
+    if m.material_solid_texture is not None:
+        m.set_materials(solid_texture=np.asarray(rows)[:, None])
+    sc.light("l", light[0], **light[1])
+    sc.camera_sensor("c", W, H, Kc, instances=I, local_pose=IDENTITY, far=10)
+    return sc, m
+
+
+def _plane_points(z=2.0, Kc=K):
+    """Body-local points of the pixel centers on the plane z (no distortion)."""
+    v, u = np.mgrid[0:H, 0:W].astype(np.float32)
+    x = (u - Kc[0, 2]) / Kc[0, 0] * z
+    y = (v - Kc[1, 2]) / Kc[1, 1] * z
+    return np.stack([x, y, np.full_like(x, z)], -1)
+
+
+def test_solid_texture_matches_the_reference():
+    """Unfiltered, every family: the base color the raster shades with
+    (recovered from renders of black and white plain materials under the
+    sky alone) is the torch reference's at the pixel's body-local point."""
+    from rillfacet import solid_texture as sx
+    rng = np.random.default_rng(0)
+    fams = sx.FAMILIES
+    rows = sx.sample_params(rng, len(fams) * 2, families=fams, scale=(0.8, 1.5))
+    rows[:, sx.PARAM["family"]] = np.repeat(np.arange(len(fams)), 2)
+    rows[:, sx.PARAM["rough1"]] = rows[:, sx.PARAM["rough0"]] = 0.6
+    out = []
+    for kind in ("solid", "black", "white"):
+        r = RasterRenderer(chunk=4, supersample=1, solid_texture_filter=False)
+        mats = None if kind == "solid" else [Material(
+            "a", (0, 0, 0) if kind == "black" else (1, 1, 1), roughness=0.6)]
+        _solid_plane(r, rows, materials=mats)
+        out.append(r.render("c", outputs=("linear",))["linear"].double())
         r.close()
-    assert torch.equal(imgs[0], imgs[1])
-    assert float((imgs[1][0] - imgs[1][1]).abs().max()) > 0.1    # per env
+    L, Lb, Lw = out
+    base = ((L - Lb) / (Lw - Lb)).cpu()
+    pts = torch.as_tensor(_plane_points()).reshape(-1, 3)
+    for e in range(len(rows)):
+        _, want = sx.evaluate(pts, torch.as_tensor(rows[e]).expand(len(pts), sx.K))
+        err = (base[e].reshape(-1, 3) - want).abs().max(-1).values
+        # fp16 output, bilinear proxy taps; checker / granite cell edges
+        assert float(err.median()) < 3e-3, fams[e // 2]
+        assert float((err > 0.03).float().mean()) < 0.03, fams[e // 2]
+
+
+def test_solid_texture_bump_follows_the_height():
+    """A bumped white plane under a tilted sun, unfiltered: radiance bumped
+    / flat follows the cosine ratio of the reference's height gradient, and
+    not its mirror image."""
+    from rillfacet import solid_texture as sx
+    amp, scale, eps = 0.02, 3.0, 0.02
+    row = sx.make_params("stone", colors=((0.7, 0.7, 0.7),), scale=scale,
+                         offset=(11, 23, 5), roughness=1.0, bump=amp, eps=eps)
+    d = np.array([0.5, 0.3, 1.0])                  # the sun travels along +z
+    out = []
+    for a in (amp, 0.0):
+        row[sx.PARAM["bump"]] = a
+        r = RasterRenderer(chunk=1, supersample=1, shadow_resolution=0,
+                           solid_texture_filter=False)
+        _solid_plane(r, [row], bump=True, Kc=K_FINE,
+                     light=("directional", dict(direction=tuple(d), intensity=3.0)))
+        out.append(r.render("c", outputs=("linear",))["linear"][0].mean(-1).cpu())
+        r.close()
+    pts = torch.as_tensor(_plane_points(Kc=K_FINE)).reshape(-1, 3)
+    rows = torch.as_tensor(row).expand(len(pts), sx.K)
+    e = eps / scale
+    h0, _ = sx.evaluate(pts, rows)
+    # one-sided differences along the shader's tangents of N = -z
+    # (solid_bump: -y, then -x), so the prediction is not shifted by e
+    gx = (h0 - sx.evaluate(pts - torch.tensor([e, 0, 0]), rows)[0]) / e
+    gy = (h0 - sx.evaluate(pts - torch.tensor([0, e, 0]), rows)[0]) / e
+    L = -torch.as_tensor(d / np.linalg.norm(d), dtype=torch.float32)
+
+    def cos_ratio(sign):
+        n = torch.stack([-sign * amp * gx, -sign * amp * gy, -torch.ones_like(gx)], -1)
+        n = n / n.norm(dim=-1, keepdim=True)
+        return (n @ L).clamp(min=0) / -L[2]
+
+    ratio = (out[0] / out[1].clamp(min=1e-4)).reshape(-1)
+    corr = lambda x: float(torch.corrcoef(torch.stack([ratio, x]))[0, 1])  # noqa: E731
+    assert float(ratio.std()) > 0.03
+    assert corr(cos_ratio(1.0)) > 0.9
+    assert corr(cos_ratio(-1.0)) < 0.0
+
+
+def test_solid_texture_filter_removes_aliasing():
+    """A checker of cells far below a pixel: unfiltered, pixels are either
+    color (aliasing); filtered, every pixel is the mean."""
+    from rillfacet import solid_texture as sx
+    row = sx.make_params("checker", colors=((1, 1, 1), (0, 0, 0)), scale=400.0,
+                         rotation=(0.3, 0.2, 0.1, 0.9), roughness=0.6)
+    res = {}
+    for filt in (False, True):
+        r = RasterRenderer(chunk=1, solid_texture_filter=filt)
+        _solid_plane(r, [row])
+        res[filt] = r.render("c", outputs=("linear",))["linear"][0, 8:40, 8:56].float()
+        r.close()
+    assert float(res[False].std((0, 1)).mean()) > 0.1
+    assert float(res[True].std((0, 1)).mean()) < 0.01
+    # resolved detail: the filter keeps a checker's mean (it only blends
+    # the cells' edges) and barely touches smooth noise
+    stone = sx.make_params("stone", colors=((0.8, 0.7, 0.6), (0.2, 0.3, 0.4)),
+                           scale=1.0, roughness=0.6)
+    row[sx.PARAM["scale"]] = 2.0
+    for filt in (False, True):
+        r = RasterRenderer(chunk=2, solid_texture_filter=filt)
+        _solid_plane(r, [row, stone])
+        res[filt] = r.render("c", outputs=("linear",))["linear"].float()
+        r.close()
+    a, b = res[False], res[True]
+    assert float((a[0].mean((0, 1)) - b[0].mean((0, 1))).abs().max()) < 0.01
+    assert float(((a[1] - b[1]).abs().amax(-1) > 0.02).float().mean()) < 0.05
+
+
+def test_solid_texture_matches_mitsuba():
+    """Random rows of every family under the sun, against Mitsuba's direct
+    integrator: the same images up to anti-aliasing."""
+    from rillfacet import solid_texture as sx
+    rows = sx.sample_params(np.random.default_rng(1), 6, families=sx.FAMILIES[1:],
+                            scale=(0.8, 1.5), bump=(0.0, 0.002))
+    imgs = []
+    for R in (RasterRenderer(chunk=6, shadow_resolution=0), _mitsuba()):
+        _solid_plane(R, rows, bump=True, Kc=K_FINE,
+                     light=("directional", dict(direction=(0.2, 0.1, 1.0), intensity=2.0)))
+        imgs.append(R.render("c", outputs=("linear",))["linear"].float().cpu())
+    d = (imgs[0] - imgs[1]).abs().amax(-1)
+    assert float(d.median()) < 0.01
+    assert float((d > 0.05).float().mean()) < 0.03

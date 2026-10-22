@@ -144,8 +144,9 @@ class Material:
     instance shows the plain family in ``base_color`` and ``roughness``;
     after, those two are not used. ``bump`` also perturbs the shading
     normal by the solid texture's height (the parameters' ``bump``
-    amplitude), at about three times the shading cost. Renderers without
-    solid textures draw the parameters' first color ``c0``."""
+    amplitude), at about twice the shading cost of a solid texture without
+    it. Mitsuba and the raster backend render solid textures; the Cycles
+    backend draws ``base_color``."""
 
     def __init__(self, name, base_color=(0.8, 0.8, 0.8), metallic=0.0,
                  roughness=0.5, base_color_texture=None, solid_texture=False,

@@ -5,8 +5,13 @@
 //   cs_remap                      proxy -> distorted output + background + sensor
 // Instances are body * n + env (n = envs in the chunk); env e's tile is row
 // e % T of layer e / T. SEG_FORMAT / SEG_NONE are substituted at load
-// (r16uint / 0xffffu, or r32uint / 0xffffffffu).
+// (r16uint / 0xffffu, or r32uint / 0xffffffffu). Solid (3D) textures:
+// common/solid_texture.wgsl, evaluated at the interpolated body-local
+// position.
 enable clip_distances;
+
+#include "common/noise.wgsl"
+#include "common/solid_texture.wgsl"
 
 const PI: f32 = 3.14159265358979;
 const NONE: u32 = SEG_NONE;    // label of "nothing"
@@ -40,8 +45,12 @@ struct View {
 // Per env (row): per body (pos, visible), quat xyzw; the camera last.
 @group(0) @binding(2) var poses: texture_2d<f32>;
 
-struct Mat { c: vec4f, p: vec4f };    // linear base color, roughness; metallic, texture layer
+// Linear base color, roughness; metallic, texture layer (-1 = none), solid
+// texture row (-1 = none), its bump (0 / 1).
+struct Mat { c: vec4f, p: vec4f };
 @group(0) @binding(3) var<storage, read> mats: array<Mat>;
+// Solid texture parameter rows (linear colors), [envs * solid slots].
+@group(0) @binding(20) var<storage, read> solid_rows: array<SolidRow>;
 @group(0) @binding(4) var shadow_tex: texture_depth_2d_array;
 @group(0) @binding(5) var shadow_cmp: sampler_comparison;
 @group(0) @binding(6) var base_tex: texture_2d_array<f32>;
@@ -137,6 +146,8 @@ struct VOut {
   @location(3) z: f32,
   @location(4) @interpolate(flat) ids: vec4u,   // slot, env (in chunk), body
   @location(5) @interpolate(flat) cam: vec3f,
+  @location(6) lp: vec3f,                        // body-local position
+  @location(7) @interpolate(flat) bq: vec4f,     // body rotation
 };
 
 @vertex fn vs_main(v: VIn, @builtin(instance_index) inst: u32) -> VOut {
@@ -165,6 +176,8 @@ struct VOut {
   o.z = c.z;
   o.ids = vec4u(v.slot, e, b, 0u);
   o.cam = cb.p.xyz;
+  o.lp = v.p;
+  o.bq = bp.q;
   return o;
 }
 
@@ -177,6 +190,8 @@ struct FIn {
   @location(3) z: f32,
   @location(4) @interpolate(flat) ids: vec4u,
   @location(5) @interpolate(flat) cam: vec3f,
+  @location(6) lp: vec3f,
+  @location(7) @interpolate(flat) bq: vec4f,
 };
 
 // Fraction of light 0 reaching p (3x3 PCF in the env's shadow tile).
@@ -229,6 +244,22 @@ fn schlick_weight(c: f32) -> f32 {
   return m * m * m * m * m;
 }
 
+// The solid texture's bumped normal: finite differences of its height h
+// along two tangents of N (as Mitsuba's backend: N - grad h * bump; there
+// the tangents are the triangle's edges), body-local through the body's
+// rotation q.
+fn solid_bump(r: SolidRow, p: vec3f, fl: f32, h0: f32, N: vec3f, q: vec4f) -> vec3f {
+  let a = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), abs(N.x) > 0.9);
+  let t1 = normalize(cross(N, a));
+  let t2 = cross(N, t1);
+  let qi = vec4f(-q.xyz, q.w);
+  let eps = sp(r, ST_EPS) / sp(r, ST_SCALE);
+  let h1 = solid_texture(r, p + eps * qrot(qi, t1), fl).x;
+  let h2 = solid_texture(r, p + eps * qrot(qi, t2), fl).x;
+  let g = (t1 * (h1 - h0) + t2 * (h2 - h0)) * (sp(r, ST_BUMP) / eps);
+  return normalize(N - g);
+}
+
 // Linear radiance toward the camera under the directional lights (light 0
 // shadowed), the uniform sky and the environment. The BRDF is Mitsuba's
 // principled one without sheen / clearcoat / transmission: Burley diffuse
@@ -238,13 +269,24 @@ fn shade(i: FIn) -> vec3f {
   let m = mats[(view.chunk.x + i.ids.y) * view.chunk.w + i.ids.x];
   let layer = i32(m.p.y);
   let tex = textureSample(base_tex, repeat_lin, i.uv, max(layer, 0));
-  let base = select(m.c.rgb, m.c.rgb * tex.rgb, layer >= 0);
-  let rough = clamp(m.c.a, 0.03, 1.0);
+  var base = select(m.c.rgb, m.c.rgb * tex.rgb, layer >= 0);
+  var rough = clamp(m.c.a, 0.03, 1.0);
   let metal = m.p.x;
   let V = normalize(i.cam - i.wp);
   let face = cross(dpdx(i.wp), dpdy(i.wp));                 // flat shading without normals
+  // a proxy pixel's body-local footprint (m), for the solid texture's
+  // filtering (derivatives: before any non-uniform branch)
+  let fl = max(length(dpdx(i.lp)), length(dpdy(i.lp)));
   var N = select(normalize(face), normalize(i.n), dot(i.n, i.n) > 1e-12);
   N = select(N, -N, dot(N, V) < 0.0);                        // two-sided
+  let srow = i32(m.p.z);
+  if (srow >= 0) {
+    let r = solid_rows[u32(srow)];
+    let s = solid_texture(r, i.lp, fl);
+    base = s.yzw;
+    rough = clamp(nz_lerp(sp(r, ST_ROUGH0), sp(r, ST_ROUGH1), s.x), 0.03, 1.0);
+    if (m.p.w > 0.0) { N = solid_bump(r, i.lp, fl, s.x, N, i.bq); }
+  }
   let NdV = max(dot(N, V), 1e-4);
   let F0 = mix(vec3f(0.04), base, metal);
   let a2 = rough * rough * rough * rough;

@@ -21,9 +21,12 @@ on the GPU) a frame never waits on the CPU. How it maps the scene, and why
   with its own GPU random numbers) and writes the outputs.
 - Shading: forward PBR with Mitsuba's principled BRDF (Burley diffuse,
   GGX with separable Smith masking; glTF metallic-roughness, base color
-  textures times the per-env base color) under up to 4 directional lights,
-  the first one casting shadows (a ``shadow_resolution``\\ :sup:`2` map per
-  env over the scene's bounding box or ahead of the camera, 3x3 PCF), plus
+  textures times the per-env base color, solid (3D) textures of
+  :mod:`rillfacet.solid_texture` evaluated at the interpolated body-local
+  position, ``shaders/common/solid_texture.wgsl``) under up to 4
+  directional lights, the first one casting shadows (a
+  ``shadow_resolution``\\ :sup:`2` map per env over the scene's bounding
+  box or ahead of the camera, 3x3 PCF), plus
   the uniform sky (``ambient``; the BRDF's exact directional albedo,
   :func:`brdf_lut`) and an ``envmap`` (diffuse from 9 spherical harmonics,
   specular from its mip chain). No depth of field, motion blur,
@@ -217,12 +220,15 @@ class RasterRenderer(Renderer):
     casts into it; receivers outside it are lit). ``zero_copy``: share
     poses and images with CUDA (needs torch with CUDA; falls back to host
     copies when unavailable). ``seed`` seeds the sensor noise.
+    ``solid_texture_filter``: fade the solid textures' detail finer than a
+    proxy pixel to its mean (the rasterizer shades one point per pixel,
+    so it would alias; Mitsuba averages over its samples instead).
     """
 
     def __init__(self, *, chunk=256, double_buffer=True, supersample=2,
                  oversample=1.0, shadow_resolution=512, shadow_box=None,
                  shadow_extent=None, texture_size=1024, zero_copy=True,
-                 seed=0):
+                 seed=0, solid_texture_filter=True):
         super().__init__(env_spacing=np.inf, seed=seed)
         from .. import _rillfacet
         import torch
@@ -247,6 +253,7 @@ class RasterRenderer(Renderer):
         self.shadow_resolution = int(shadow_resolution)
         self.shadow_extent = shadow_extent
         self.texture_size = int(texture_size)
+        self.solid_texture_filter = bool(solid_texture_filter)
         self._shadow_box = None if shadow_box is None else (
             np.asarray(shadow_box[0], np.float64), float(shadow_box[1]))
         self._shadow_box_fixed = shadow_box is not None
@@ -254,7 +261,8 @@ class RasterRenderer(Renderer):
         self._frame = np.zeros(_rillfacet.CameraRaster.FRAME_FLOATS, np.float32)
         self._bases: dict = {}             # mesh name -> first global body
         self._slot_bases: dict = {}        # mesh name -> first material slot
-        self._nb = self._slots = 0
+        self._solid: dict = {}             # mesh name -> (first row, slots)
+        self._nb = self._slots = self._solid_rows = 0
         self._mats = None
         self._visible = {}                 # mesh name -> [I, B] float
         self._body_spheres = None          # [NB, 4] local center, radius
@@ -276,8 +284,8 @@ class RasterRenderer(Renderer):
     def _build(self):
         verts, idx, ranges, spheres = [], [], [], []
         tex_layers, tex_index = [], {}
-        nb = slots = nv = nt = 0
-        self._bases, self._slot_bases = {}, {}
+        nb = slots = nv = nt = rows = 0
+        self._bases, self._slot_bases, self._solid = {}, {}, {}
         for m in self.meshes.values():
             B = m.num_bodies
             self._bases[m.name], self._slot_bases[m.name] = nb, slots
@@ -314,9 +322,11 @@ class RasterRenderer(Renderer):
                     spheres.append([*(lo + hi) / 2, np.linalg.norm(hi - lo) / 2])
                 else:
                     spheres.append([0, 0, 0, -1])
-            if any(mat.solid_texture for mat in m.materials):
-                warnings.warn(f"rigid mesh {m.name!r}: solid textures are "
-                              "drawn in their first color (c0)")
+            solid = [s for s, mat in enumerate(m.materials)
+                     if mat.solid_texture]
+            if solid:
+                self._solid[m.name] = (rows, solid)
+                rows += len(solid)
             for s, mat in enumerate(m.materials):
                 if mat.base_color_texture is None:
                     continue
@@ -330,7 +340,7 @@ class RasterRenderer(Renderer):
             slots += M
             nv += V
             nt += len(tris)
-        self._nb, self._slots = nb, slots
+        self._nb, self._slots, self._solid_rows = nb, slots, rows
         self._tex_index = tex_index
         verts = np.concatenate(verts) if verts else np.zeros((0, 9), np.float32)
         idx = (np.concatenate(idx).ravel() if idx
@@ -480,7 +490,11 @@ class RasterRenderer(Renderer):
 
     def _write_materials(self, I):
         mats = np.zeros((I, max(self._slots, 1), 8), np.float32)
-        mats[..., 5] = -1.0
+        mats[..., 5:7] = -1.0
+        NS = self._solid_rows
+        if NS:
+            from ..solid_texture import linearize
+            rows = np.zeros((I, NS, 32), np.float32)
         for m in self.meshes.values():
             s0 = self._slot_bases[m.name]
             if m.materials:
@@ -488,16 +502,15 @@ class RasterRenderer(Renderer):
                 mats[:, s0:s0 + M, :3] = srgb_to_linear(m.material_base_color)
                 mats[:, s0:s0 + M, 3] = m.material_roughness
                 mats[:, s0:s0 + M, 4] = m.material_metallic
-                if m.material_solid_texture is not None:
-                    # not rendered here yet: each slot's first color
-                    from ..solid_texture import PARAM
-                    solid = [s for s, mat in enumerate(m.materials)
-                            if mat.solid_texture]
-                    rows = m.material_solid_texture[:, solid]
-                    c0, r0 = PARAM["c0"], PARAM["rough0"]
-                    mats[:, s0 + np.array(solid), :3] = srgb_to_linear(
-                        rows[..., c0:c0 + 3])
-                    mats[:, s0 + np.array(solid), 3] = rows[..., r0]
+                if m.name in self._solid:
+                    r0, solid = self._solid[m.name]
+                    rows[:, r0:r0 + len(solid)] = linearize(
+                        m.material_solid_texture[:, solid])
+                    k = np.arange(len(solid))
+                    mats[:, s0 + np.array(solid), 6] = (
+                        np.arange(I)[:, None] * NS + r0 + k[None])
+                    mats[:, s0 + np.array(solid), 7] = [
+                        float(m.materials[s].bump) for s in solid]
                 for s in range(M):
                     layer = self._tex_index.get((m.name, s))
                     if layer is not None:
@@ -507,6 +520,9 @@ class RasterRenderer(Renderer):
                 mats[:, s0:s0 + B, :3] = srgb_to_linear(
                     m.segment_colors.reshape(I, B, 3))
                 mats[:, s0:s0 + B, 3] = 0.5
+        if NS:
+            rows[..., 31] = float(self.solid_texture_filter)
+            self._r.set_solid_textures(rows.reshape(-1, 32))
         self._r.set_materials(mats)
 
     def _poses(self, cam):

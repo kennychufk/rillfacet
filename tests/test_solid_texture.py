@@ -112,6 +112,26 @@ def test_reference_families():
         assert h.std() > 0.05, f
 
 
+def test_filtering_fades_to_the_mean():
+    """A footprint far above every feature leaves each family's spatial
+    mean; a tiny one changes (almost) nothing."""
+    torch = pytest.importorskip("torch")
+    rng = np.random.default_rng(6)
+    n = 200000
+    pts = torch.as_tensor(rng.uniform(-2, 2, (n, 3)), dtype=torch.float32)
+    for f in sx.FAMILIES[1:]:
+        rows = torch.as_tensor(sx.sample_params(rng, 1, families=(f,))
+                               ).expand(n, sx.K)
+        h, rgb = sx.evaluate(pts, rows)
+        hf, cf = sx.evaluate(pts[:1000], rows[:1000], footprint=2.0)
+        assert float(hf.std()) < 1e-3 and float(cf.std(0).max()) < 1e-3, f
+        assert abs(float(hf.mean() - h.mean())) < 0.01, f
+        assert float((cf.mean(0) - rgb.mean(0)).abs().max()) < 0.015, f
+        hs, cs = sx.evaluate(pts[:20000], rows[:20000], footprint=1e-5)
+        far = ((cs - rgb[:20000]).abs().max(-1).values > 1e-3).float().mean()
+        assert float(far) < 0.01, f                      # checker edges
+
+
 def scene_with(materials, instances=2):
     sc = Scene()
     v, t = box_mesh([[0, 0, 0], [1, 0, 0]], [[0.5, 0.5, 0.5], [1.5, 0.5, 0.5]])

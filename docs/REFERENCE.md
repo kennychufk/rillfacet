@@ -177,9 +177,13 @@ pattern's low / high end, bump amplitude); `solid_texture.sample_params(rng,
 `bump=True` on the material also perturbs the shading normal by the
 pattern's height. The noise and the families are written once over an
 ops layer, run in Dr.Jit by Mitsuba and in torch by
-`solid_texture.evaluate` (the reference the tests check Mitsuba against).
-Only Mitsuba renders them so far; the raster backend draws each slot's
-first color `c0` (with a warning).
+`solid_texture.evaluate` (the reference the tests check the renderers
+against); the raster backend runs a line-by-line WGSL port
+(`shaders/common/noise.wgsl`, `shaders/common/solid_texture.wgsl`), which
+fades detail finer than a pixel to its mean (`solid_texture_filter`; it
+shades one point per pixel, where Mitsuba averages over its samples). The
+Cycles backend does not render them yet: it draws the material's
+`base_color`.
 `scene.light(...)` adds lights shared by all envs (`directional`,
 `ambient`, `envmap`); `scene.camera_sensor(...)` adds a camera per env with
 OpenCV intrinsics and distortion (`K`, `dist`; camera frame x right, y down,
@@ -265,7 +269,8 @@ x `supersample` taps), adding the background (the ambient light, the
 envmap) and the shared sensor stage (same model, its own GPU random
 numbers, drawn per env so images do not depend on the chunking). Shading is
 forward with Mitsuba's principled BRDF (Burley diffuse, GGX with separable
-Smith masking; base color textures times the per-env color) under up to 4
+Smith masking; base color textures times the per-env color; solid
+textures at the interpolated body-local position) under up to 4
 directional lights, the first casting shadows (`shadow_resolution`^2 per
 env, 3x3 PCF), plus the uniform sky (the BRDF's exact directional albedo,
 a table `brdf_lut()` computes once) and the envmap (9 SH coefficients for
@@ -281,7 +286,10 @@ unblocked (no occlusion of the sky), so surfaces that see the table or the
 oven instead of the sky are brighter (up to 1.5x on the oven-grasp scene
 with its 0.5 sky). No depth of field (a warning), motion blur or
 interreflections. Geometry agrees with Mitsuba's (labels on all pixels away
-from edges, z-depth to 1e-5; tests/test_render_raster.py).
+from edges, z-depth to 1e-5; tests/test_render_raster.py). Solid textures
+match the torch reference unfiltered and Mitsuba's images up to
+anti-aliasing; with every slot solid, 4096 envs at 224x224 take 55 ms
+instead of 35 (96 ms with bump).
 
 On Linux + Vulkan + NVIDIA the poses and images never leave the GPU
 (`src/rillfacet/cuda_share.h`): the shared textures are allocated on our own
@@ -439,6 +447,7 @@ src/rillfacet/
 shaders/
   styles/{studio,matcap,pbr,technical}.wgsl   one `shade()` each: edit these to restyle
   mesh, points, curves, arrows, grid, ssao, composite, overlay_*, env_prefilter .wgsl
+  camera_raster.wgsl (+ common/noise.wgsl, common/solid_texture.wgsl)   RasterRenderer
 src/python/module.cpp   nanobind module `_rillfacet` (+ `rillfacet.imgui`)
 python/rillfacet/        Python package
   scene_api.py          backend-neutral scene (+ materials, lights, camera sensors)

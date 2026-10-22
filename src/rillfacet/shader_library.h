@@ -22,6 +22,13 @@ class ShaderLibrary {
                              const std::map<std::string, std::string>& aliases,
                              std::string* error);
 
+  // The source of `path` with its includes expanded (for callers that edit
+  // it before compiling). False on failure, with `error` filled.
+  bool source(const std::string& path, const std::map<std::string, std::string>& aliases,
+              std::string& out, std::string* error) {
+    return expand(path, aliases, out, error, 0);
+  }
+
   // Returns true (at most every 250 ms) when any loaded file changed on disk.
   bool poll_changes();
 

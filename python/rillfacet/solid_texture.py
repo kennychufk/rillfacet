@@ -45,13 +45,24 @@ is ``q = R @ (scale * p)``.
 The noise and the families are written once over an array-ops layer:
 :class:`DrOps` runs them in Dr.Jit (inside Mitsuba's kernels,
 :mod:`rillfacet.render.mitsuba`) and :class:`TorchOps` in torch
-(:func:`evaluate`, the reference the renderers are tested against). The
-hash is PCG3D (Jarzynski & Olano 2020, "Hash Functions for GPU
-Rendering"), uint32 only so that it ports to shading languages without
-64-bit integers; gradient noise is improved Perlin noise (quintic fade, 16
-edge gradients), cellular noise Worley F1/F2 over 27 cells.
+(:func:`evaluate`, the reference the renderers are tested against); the
+raster backend's WGSL (``shaders/common/noise.wgsl``,
+``shaders/common/solid_texture.wgsl``) is a line-by-line port. The hash
+is PCG3D (Jarzynski & Olano 2020, "Hash Functions for GPU Rendering"),
+uint32 only so that it ports to shading languages without 64-bit
+integers; gradient noise is improved Perlin noise (quintic fade, 16 edge
+gradients), cellular noise Worley F1/F2 over 27 cells.
+
+Filtering: a renderer that shades one point per pixel (raster) passes the
+pixel's footprint ``fw`` (pattern units). Every feature whose period
+falls below 4 footprints (an fBm octave, the wood rings, marble bands,
+granite grains) fades toward its mean, fully at 2; the checker is box
+filtered exactly. ``fw = 0`` (Mitsuba, which averages over its samples)
+evaluates the unfiltered pattern.
 """
 from __future__ import annotations
+
+import math
 
 import numpy as np
 
@@ -64,6 +75,11 @@ PARAM = dict(family=0, scale=1, offset=2, R=5, c0=14, c1=17, c2=20, a=23,
              rough0=27, rough1=28, bump=29, eps=30)
 FAMILIES = ("plain", "wood", "marble", "granite", "stone", "checker")
 OCTAVES = 4          # compile-time octave count of every fBm
+# means of filtered-out features (over space)
+TURB_MEAN = 0.2198   # |perlin|
+RING_MEAN = 13 / 35  # the wood ring profile
+EDGE_MEAN = 0.785    # granite grain boundary term
+SPOT_MEAN = 0.0891   # stone spot term
 DEFAULT_KNOBS = dict(plain=(0, 0, 0, 0), wood=(3.0, 0.3, 0.0, 0.25),
                      marble=(2.0, 0.7, 0.5, 0), granite=(15.0, 0.35, 0.15, 0),
                      stone=(1.0, 1.0, 0, 0), checker=(0, 0, 0, 0))
@@ -252,6 +268,7 @@ class DrOps:
     def sin(self, x): return self.dr.sin(x)
     def abs(self, x): return self.dr.abs(x)
     def minimum(self, a, b): return self.dr.minimum(a, b)
+    def maximum(self, a, b): return self.dr.maximum(a, b)
     def clip(self, x, lo, hi): return self.dr.clip(x, lo, hi)
     def zeros_like(self, x): return self.dr.zeros(self.F, self.dr.width(x))
     def full_like(self, x, v): return self.dr.full(self.F, v, self.dr.width(x))
@@ -301,6 +318,10 @@ class TorchOps:
     def minimum(self, a, b):
         return (self.t.minimum(a, b) if isinstance(b, self.t.Tensor)
                 else self.t.clamp(a, max=b))
+
+    def maximum(self, a, b):
+        return (self.t.maximum(a, b) if isinstance(b, self.t.Tensor)
+                else self.t.clamp(a, min=b))
 
     def clip(self, x, lo, hi): return self.t.clamp(x, lo, hi)
     def zeros_like(self, x): return self.t.zeros_like(x)
@@ -357,13 +378,26 @@ def perlin(o, p):
     return _lerp(_lerp(x00, x10, w[1]), _lerp(x01, x11, w[1]), w[2])
 
 
-def fbm(o, p, gain=0.5, lac=2.0, octaves=OCTAVES, turbulence=False):
-    """Normalized fractal sum: about -1..1 (turbulence: 0..1)."""
+def _unfiltered(fw):
+    return isinstance(fw, (int, float)) and fw == 0
+
+
+def _fade(o, f):
+    """Weight of a feature whose period is 1 / f footprints: 1 down to 4,
+    0 from 2."""
+    return o.clip(2.0 - 4.0 * f, 0.0, 1.0)
+
+
+def fbm(o, p, gain=0.5, lac=2.0, octaves=OCTAVES, turbulence=False, fw=0.0):
+    """Normalized fractal sum: about -1..1 (turbulence: 0..1). ``fw``:
+    footprint in units of ``p``."""
     tot, amp, norm, s = None, 1.0, 0.0, 1.0
     for _ in range(octaves):
         n = perlin(o, tuple(c * s for c in p))
         if turbulence:
             n = o.abs(n)
+        if not _unfiltered(fw):
+            n = _lerp(TURB_MEAN if turbulence else 0.0, n, _fade(o, fw * s))
         tot = n * amp if tot is None else tot + n * amp
         norm += amp
         amp *= gain
@@ -397,8 +431,9 @@ def worley(o, p):
 
 
 # ---------------------------------------------------------------- families
-# Each takes the pattern point q and a parameter accessor P(k) (k an index
-# into the row, colors already linear), and returns (h in 0..1, linear rgb).
+# Each takes the pattern point q, a parameter accessor P(k) (k an index
+# into the row, colors already linear) and the footprint fw (pattern
+# units), and returns (h in 0..1, linear rgb).
 
 def _c(P, name):
     k = PARAM[name]
@@ -411,70 +446,102 @@ def _off(q, P, k=1.0):
     return tuple(c * k + P(PARAM["offset"] + i) for i, c in enumerate(q))
 
 
-def fam_plain(o, q, P):
+def fam_plain(o, q, P, fw=0.0):
     return o.zeros_like(q[0]), _c(P, "c0")
 
 
-def fam_wood(o, q, P):
+def fam_wood(o, q, P, fw=0.0):
     a0, a1, a2, a3 = (P(PARAM["a"] + k) for k in range(4))
     x = q[0] + a2
     r = o.sqrt(x * x + q[1] * q[1])
     qo = _off(q, P)
-    warp = fbm(o, (qo[0] * 0.8, qo[1] * 0.8, qo[2] * 0.12), octaves=3)
+    warp = fbm(o, (qo[0] * 0.8, qo[1] * 0.8, qo[2] * 0.12), octaves=3,
+               fw=fw * 0.8)
     t = _fract(o, (r + a1 * warp) * a0)
     ring = _smooth(o, 0.0, 0.85, t) * (1.0 - _smooth(o, 0.85, 1.0, t))
     ring = ring * ring
-    fib = fbm(o, (qo[0] * 14.0, qo[1] * 14.0, qo[2] * 0.7), octaves=2)
+    if not _unfiltered(fw):
+        ring = _lerp(RING_MEAN, ring, _fade(o, fw * a0))
+    fib = fbm(o, (qo[0] * 14.0, qo[1] * 14.0, qo[2] * 0.7), octaves=2,
+              fw=fw * 14.0)
     h = o.clip(ring * (1.0 - a3) + (fib * 0.5 + 0.5) * a3, 0.0, 1.0)
     return h, _lerp3(_c(P, "c0"), _c(P, "c1"), h)
 
 
-def fam_marble(o, q, P):
+def fam_marble(o, q, P, fw=0.0):
     a0, a1, a2 = (P(PARAM["a"] + k) for k in range(3))
     qo = _off(q, P)
-    turb = fbm(o, qo, turbulence=True)
+    turb = fbm(o, qo, turbulence=True, fw=fw)
     s = 0.5 + 0.5 * o.sin(q[0] * a0 + a1 * turb * 6.0)
     v = o.clip(1.0 - s, 0.0, 1.0)
     v2 = v * v
     vein = v2 * v2 * v2 * a2 + v2 * (1.0 - a2)
+    if not _unfiltered(fw):    # mean over the band phase: E[v^6], E[v^2]
+        vein = _lerp(0.2256 * a2 + 0.375 * (1.0 - a2), vein,
+                     _fade(o, fw * a0 * (0.5 / math.pi)))
     tint = fbm(o, (qo[0] * 0.5 + 7.0, qo[1] * 0.5, qo[2] * 0.5),
-               octaves=2) * 0.5 + 0.5
+               octaves=2, fw=fw * 0.5) * 0.5 + 0.5
     base = _lerp3(_c(P, "c0"), _c(P, "c2"), tint * 0.35)
     return vein, _lerp3(base, _c(P, "c1"), vein)
 
 
-def fam_granite(o, q, P):
+def fam_granite(o, q, P, fw=0.0):
     a0, a1, a2 = (P(PARAM["a"] + k) for k in range(3))
     F1, F2, cid = worley(o, _off(q, P, a0))
     u = o.unit(cid)
-    col = _c(P, "c0")
-    col = tuple(o.select(u < a1, b, a) for a, b in zip(col, _c(P, "c1")))
-    col = tuple(o.select(u > 1.0 - a2, b, a) for a, b in zip(col, _c(P, "c2")))
+    c0, c1, c2 = _c(P, "c0"), _c(P, "c1"), _c(P, "c2")
+    col = tuple(o.select(u < a1, b, a) for a, b in zip(c0, c1))
+    col = tuple(o.select(u > 1.0 - a2, b, a) for a, b in zip(col, c2))
     edge = _smooth(o, 0.0, 0.12, F2 - F1)            # dark grain boundaries
     shade = 0.75 + 0.25 * edge
-    return 1.0 - edge, tuple(c * shade for c in col)
+    h, col = 1.0 - edge, tuple(c * shade for c in col)
+    if not _unfiltered(fw):    # grains below the footprint: their mean
+        w = _fade(o, fw * a0)
+        ms = 0.75 + 0.25 * EDGE_MEAN
+        mean = tuple((x * (1.0 - a1 - a2) + y * a1 + z * a2) * ms
+                     for x, y, z in zip(c0, c1, c2))
+        h = _lerp(1.0 - EDGE_MEAN, h, w)
+        col = _lerp3(mean, col, w)
+    return h, col
 
 
-def fam_stone(o, q, P):
+def fam_stone(o, q, P, fw=0.0):
     a0, a1 = P(PARAM["a"]), P(PARAM["a"] + 1)
     q = _off(q, P)
-    w = (fbm(o, (q[0] + 1.7, q[1] + 9.2, q[2]), octaves=3),
-         fbm(o, (q[0] + 8.3, q[1] + 2.8, q[2] + 4.1), octaves=3),
-         fbm(o, (q[0] + 4.4, q[1] + 6.6, q[2] + 1.3), octaves=3))
-    n = fbm(o, tuple(c + a0 * d for c, d in zip(q, w)))
+    w = (fbm(o, (q[0] + 1.7, q[1] + 9.2, q[2]), octaves=3, fw=fw),
+         fbm(o, (q[0] + 8.3, q[1] + 2.8, q[2] + 4.1), octaves=3, fw=fw),
+         fbm(o, (q[0] + 4.4, q[1] + 6.6, q[2] + 1.3), octaves=3, fw=fw))
+    n = fbm(o, tuple(c + a0 * d for c, d in zip(q, w)), fw=fw)
     h = o.clip(0.5 + a1 * n, 0.0, 1.0)
     col = _lerp3(_c(P, "c0"), _c(P, "c1"), h)
     spot = _smooth(o, 0.55, 0.75, fbm(o, (q[0] * 3.0, q[1] * 3.0, q[2] * 3.0),
-                                      octaves=2) * 0.5 + 0.5)
+                                      octaves=2, fw=fw * 3.0) * 0.5 + 0.5)
+    if not _unfiltered(fw):    # a threshold of a faded fBm: fade it too
+        spot = _lerp(SPOT_MEAN, spot, _fade(o, fw * 3.0))
     return h, _lerp3(col, _c(P, "c2"), spot * 0.6)
 
 
-def fam_checker(o, q, P):
+def _square_box(o, x, w):
+    """+-1 square wave of period 2 (+1 on even cells), box filtered over
+    width w: the difference of its integral, a triangle wave."""
+    def tri(y):
+        g = 2.0 * _fract(o, y * 0.5)
+        return o.minimum(g, 2.0 - g)
+    return (tri(x + 0.5 * w) - tri(x - 0.5 * w)) / w
+
+
+def fam_checker(o, q, P, fw=0.0):
+    c0, c1 = _c(P, "c0"), _c(P, "c1")
+    if not _unfiltered(fw):    # box filtered: product of filtered waves
+        w = o.maximum(fw, 1e-3)     # below: cancellation; sharp anyway
+        prod = (_square_box(o, q[0], w) * _square_box(o, q[1], w)
+                * _square_box(o, q[2], w))
+        h = 0.5 - 0.5 * prod
+        return h, _lerp3(c0, c1, h)
     s = o.floor(q[0]) + o.floor(q[1]) + o.floor(q[2])
     odd = (s - 2.0 * o.floor(s * 0.5)) > 0.5
     h = o.select(odd, o.full_like(q[0], 1.0), o.zeros_like(q[0]))
-    return h, tuple(o.select(odd, b, a)
-                    for a, b in zip(_c(P, "c0"), _c(P, "c1")))
+    return h, tuple(o.select(odd, b, a) for a, b in zip(c0, c1))
 
 
 FAMILY_FNS = (fam_plain, fam_wood, fam_marble, fam_granite, fam_stone,
@@ -490,11 +557,12 @@ def pattern_point(o, p, P):
                  for r in range(3))
 
 
-def evaluate(points, params):
+def evaluate(points, params, footprint=0.0):
     """The torch reference: ``points`` ``[N, 3]`` body-local (m) and their
     rows ``params`` ``[N, K]`` (as stored: sRGB) -> ``(h [N], linear rgb
     [N, 3])``. Each point's own family is evaluated (all families are
-    computed, then selected)."""
+    computed, then selected). ``footprint`` (m, a number or ``[N]``): the
+    filter width (0 = unfiltered)."""
     import torch
     o = TorchOps(torch)
     p = tuple(points[:, i].float() for i in range(3))
@@ -502,12 +570,15 @@ def evaluate(points, params):
     P = lambda k: rows[:, k]                                  # noqa: E731
     fam = rows[:, PARAM["family"]].round().long().clamp(0, len(FAMILIES) - 1)
     q = pattern_point(o, p, P)
+    fw = footprint
+    if not _unfiltered(fw):
+        fw = torch.as_tensor(fw, device=p[0].device).float() * P(PARAM["scale"])
     h = torch.zeros_like(p[0])
     rgb = torch.zeros(len(h), 3, device=h.device)
     for f, fn in enumerate(FAMILY_FNS):
         m = fam == f
         if bool(m.any()):
-            hf, cf = fn(o, q, P)
+            hf, cf = fn(o, q, P, fw)
             h = torch.where(m, hf, h)
             rgb = torch.where(m[:, None], torch.stack(cf, -1), rgb)
     return h, rgb
