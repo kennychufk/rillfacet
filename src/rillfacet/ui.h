@@ -13,6 +13,13 @@ struct ImFont;
 
 namespace rillfacet::ui {
 
+// UI scale: window units per 100%-scale pixel (2 at a 200% desktop scale on
+// X11 and Windows; 1 on macOS, where window units are already points). Every
+// hard-coded size in the panels is multiplied by it.
+void set_scale(float scale);
+float scale();
+
+// Resets the style for `theme` and scales its sizes and fonts by scale().
 void apply_theme(Theme theme);
 
 // "Display": shading mode and style, lighting toggles, per-structure

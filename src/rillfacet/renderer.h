@@ -120,8 +120,9 @@ class Renderer {
   ~Renderer();
   bool init(std::string* error);
   void resize(uint32_t width, uint32_t height);
-  // Scales the pixel sizes of overlay labels (HiDPI: 2 on a Retina display).
-  void set_label_scale(float scale) { label_scale_ = scale; }
+  // Scales the pixel sizes of overlay labels, lines and dots: framebuffer pixels
+  // per 100%-scale pixel (2 on a Retina display or a 200% desktop scale).
+  void set_overlay_scale(float scale) { overlay_scale_ = scale; }
   uint32_t width() const { return width_; }
   uint32_t height() const { return height_; }
 
@@ -175,7 +176,7 @@ class Renderer {
   Gpu& gpu_;
   ShaderLibrary& shaders_;
   uint32_t width_ = 0, height_ = 0;
-  float label_scale_ = 1.0f;
+  float overlay_scale_ = 1.0f;
   std::string shader_error_;
   Style built_style_ = Style::Count;
   bool keep_scene_ = false;

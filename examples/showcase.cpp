@@ -379,7 +379,8 @@ int main(int argc, char** argv) {
 
   viewer.set_callback([&]() {
     if (!no_ui) {
-      ImGui::SetNextWindowPos(ImVec2(12, 80), ImGuiCond_FirstUseEver);
+      const float k = viewer.ui_scale();
+      ImGui::SetNextWindowPos(ImVec2(12 * k, 80 * k), ImGuiCond_FirstUseEver);
       ImGui::Begin("Showcase");
       ImGui::Checkbox("Animate", &animate);
       ImGui::TextDisabled("t = %.2f s", t);

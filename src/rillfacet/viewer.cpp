@@ -43,14 +43,14 @@ Viewer::Viewer(const ViewerOptions& options) : options_(options) {
   renderer_ = std::make_unique<Renderer>(*gpu_, *shaders_);
 
   uint32_t w = uint32_t(options.width), h = uint32_t(options.height);
-  float content_scale = 1.0f;
-  float fb_ratio = 1.0f;  // framebuffer pixels per window unit (2 on Retina, 1 on X11)
   if (!options.headless) {
     if (!glfwInit()) {
       std::fprintf(stderr, "[rillfacet] glfwInit failed (no display?)\n");
       return;
     }
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    // Size the window in 100%-scale pixels, like other apps (no-op on macOS).
+    glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
     window_ = glfwCreateWindow(options.width, options.height, options.title.c_str(), nullptr, nullptr);
     if (!window_) return;
 #if defined(__APPLE__)
@@ -78,15 +78,8 @@ Viewer::Viewer(const ViewerOptions& options) : options_(options) {
     glfwGetFramebufferSize(window_, &fw, &fh);
     w = uint32_t(fw);
     h = uint32_t(fh);
-    float sx, sy;
-    glfwGetWindowContentScale(window_, &sx, &sy);
-    content_scale = sx;
-    int ww, wh;
-    glfwGetWindowSize(window_, &ww, &wh);
-    if (ww > 0) fb_ratio = float(fw) / float(ww);
   }
   renderer_->resize(w, h);
-  renderer_->set_label_scale(content_scale);
   std::string error;
   if (!renderer_->init(&error)) {
     std::fprintf(stderr, "[rillfacet] renderer init failed: %s\n", error.c_str());
@@ -100,13 +93,9 @@ Viewer::Viewer(const ViewerOptions& options) : options_(options) {
   io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
   io.IniFilename = nullptr;
   std::string fonts = asset_dir() + "/fonts/";
-  // ImGui sizes are in window units: with a Retina-style framebuffer (ratio 2) the
-  // size stays 15 and the glyphs are rasterized at twice the density instead.
-  const float ui_scale = content_scale / fb_ratio;
-  ImFontConfig font_cfg;
-  font_cfg.RasterizerDensity = fb_ratio;
-  ui_font_ = io.Fonts->AddFontFromFileTTF((fonts + "Inter-Medium.ttf").c_str(), 15.0f * ui_scale, &font_cfg);
-  mono_font_ = io.Fonts->AddFontFromFileTTF((fonts + "JetBrainsMono-Regular.ttf").c_str(), 14.0f * ui_scale, &font_cfg);
+  // Sizes at 100% scale; update_scale() scales the style and fonts.
+  ui_font_ = io.Fonts->AddFontFromFileTTF((fonts + "Inter-Medium.ttf").c_str(), 15.0f);
+  mono_font_ = io.Fonts->AddFontFromFileTTF((fonts + "JetBrainsMono-Regular.ttf").c_str(), 14.0f);
   if (window_) ImGui_ImplGlfw_InitForOther(window_, true);
   ImGui_ImplWGPU_InitInfo info;
   info.Device = gpu_->device.Get();
@@ -142,6 +131,28 @@ Viewer::~Viewer() {
 void Viewer::apply_theme() {
   ui::apply_theme(settings_.theme);
   applied_theme_ = int(settings_.theme);
+}
+
+// Follows the desktop scale (and, on macOS, the framebuffer density), which can
+// change while running: a settings change or a move to another monitor.
+void Viewer::update_scale() {
+  float content_scale = 1.0f;
+  float fb_ratio = 1.0f;  // framebuffer pixels per window unit (2 on Retina, 1 on X11 and Windows)
+  if (window_) {
+    float sy;
+    glfwGetWindowContentScale(window_, &content_scale, &sy);
+    int ww, wh, fw, fh;
+    glfwGetWindowSize(window_, &ww, &wh);
+    glfwGetFramebufferSize(window_, &fw, &fh);
+    if (ww > 0 && fw > 0) fb_ratio = float(fw) / float(ww);
+  }
+  if (content_scale == content_scale_ && fb_ratio == fb_ratio_) return;
+  content_scale_ = content_scale;
+  fb_ratio_ = fb_ratio;
+  // Overlays are drawn in framebuffer pixels, ImGui in window units.
+  renderer_->set_overlay_scale(content_scale);
+  ui::set_scale(content_scale / fb_ratio);
+  applied_theme_ = -1;  // rebuild the style at the new scale
 }
 
 // ---- Frame loop ---------------------------------------------------------------
@@ -188,6 +199,7 @@ bool Viewer::frame() {
   double t = now_seconds();
   dt_ = float(std::clamp(t - last_time_, 1e-4, 0.25));
   last_time_ = t;
+  update_scale();
   if (int(settings_.theme) != applied_theme_) apply_theme();
 
   ImGuiIO& io = ImGui::GetIO();
@@ -237,6 +249,8 @@ bool Viewer::frame() {
   gpu_->instance.ProcessEvents();
   return true;
 }
+
+float Viewer::ui_scale() const { return ui::scale(); }
 
 void Viewer::set_vsync(bool on) {
   if (on == options_.vsync) return;
@@ -525,7 +539,8 @@ void Viewer::handle_input() {
   }
   if (lmb_down_) {
     if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-      if (!box_active_ && measure_tool_ == MeasureTool::Off && glm::length(m - press_pos_) > 5.0f) box_active_ = true;
+      if (!box_active_ && measure_tool_ == MeasureTool::Off && glm::length(m - press_pos_) > 5.0f * ui::scale())
+        box_active_ = true;
       if (box_active_) {
         ImDrawList* dl = ImGui::GetForegroundDrawList();
         ImVec2 a(std::min(press_pos_.x, m.x), std::min(press_pos_.y, m.y));
@@ -699,11 +714,13 @@ void Viewer::build_overlays() {
     };
     const double tu = camera_.target[gp.u], tv = camera_.target[gp.v];
     double px = camera_.pixel_size_at(at(tu, tv), vp.y);
-    double step = ui::nice_step(px * 90.0);
+    double step = ui::nice_step(px * 90.0 * content_scale_);
     auto on_screen = [&](const glm::vec3& p, glm::vec2& s) {
       glm::vec3 q = camera_.project(p, vp.x, vp.y);
       s = {q.x, q.y};
-      return (camera_.ortho || q.z < 0) && s.x > 8 && s.y > 8 && s.x < vp.x - 8 && s.y < vp.y - 8;
+      const float margin = 8.0f * content_scale_;
+      return (camera_.ortho || q.z < 0) && s.x > margin && s.y > margin && s.x < vp.x - margin &&
+             s.y < vp.y - margin;
     };
     const glm::vec4 axis_colors[3] = {dark ? srgba(0.98f, 0.66f, 0.70f) : srgba(0.70f, 0.14f, 0.20f),
                                       dark ? srgba(0.74f, 0.90f, 0.56f) : srgba(0.28f, 0.50f, 0.08f),
@@ -725,7 +742,7 @@ void Viewer::build_overlays() {
           double v = (std::round(center / step) + k) * step;
           glm::vec3 p = axis == 0 ? at(v, line) : at(line, v);
           if (!on_screen(p, s)) continue;
-          if (glm::length(s - last) < 44.0f) break;
+          if (glm::length(s - last) < 44.0f * content_scale_) break;
           last = s;
           if (k == 0) first = s;
           if (std::abs(v) < 1e-9 * step && axis == 1) continue;  // origin labelled once
@@ -900,20 +917,21 @@ void Viewer::capture_panel() {
   } else if (ImGui::Button("Stop")) {
     stop_recording();
   }
-  ImGui::SetNextItemWidth(-110);
+  ImGui::SetNextItemWidth(-110 * ui::scale());
   ImGui::InputText("File", path, sizeof path);
-  ImGui::SetNextItemWidth(-110);
+  ImGui::SetNextItemWidth(-110 * ui::scale());
   ImGui::SliderInt("Frame rate", &fps, 10, 60);
   ImGui::End();
 
   if (recording()) {
     const ImGuiIO& io = ImGui::GetIO();
     ImDrawList* dl = ImGui::GetForegroundDrawList();
-    ImVec2 c(io.DisplaySize.x * 0.5f - 60, 20);
-    dl->AddCircleFilled(c, 6, IM_COL32(230, 40, 40, 255));
+    const float k = ui::scale();
+    ImVec2 c(io.DisplaySize.x * 0.5f - 60 * k, 20 * k);
+    dl->AddCircleFilled(c, 6 * k, IM_COL32(230, 40, 40, 255));
     char text[64];
     std::snprintf(text, sizeof text, "REC  %d frames", video_frames_);
-    dl->AddText(ImVec2(c.x + 12, c.y - 8), IM_COL32(255, 255, 255, 230), text);
+    dl->AddText(ImVec2(c.x + 12 * k, c.y - ImGui::GetFontSize() * 0.5f), IM_COL32(255, 255, 255, 230), text);
   }
 }
 

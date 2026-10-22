@@ -141,6 +141,12 @@ subset (`BeginPlot`/`SetupAxis`/`PlotLine`/`SetAxes`), and `imgui.GetIO()` can
 inject input (`AddKeyEvent`, `AddMousePosEvent`, `AddMouseButtonEvent`) so a
 viewer app can be driven headlessly from a test.
 
+HiDPI: the viewer follows the desktop scale (e.g. 200% on GNOME or Windows,
+Retina on macOS). The window size, built-in panels, fonts and overlay labels
+scale with it; sizes and positions you hard-code in your own ImGui calls should
+be multiplied by `v.ui_scale` (2 at 200%), e.g.
+`imgui.SetNextWindowPos((12 * v.ui_scale, 80 * v.ui_scale))`.
+
 Backend-neutral scenes: `rillfacet.scene_api.Scene` describes what to show,
 split by how often it changes: rigid meshes (body-local vertices once, one
 pose per instance and body per frame), boxes, points, polylines, labels

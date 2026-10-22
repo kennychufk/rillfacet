@@ -1134,17 +1134,21 @@ void Renderer::render(const Scene& scene, const Camera& camera, const RenderSett
   // Overlay geometry.
   std::vector<GlyphInstance> glyphs;
   for (const TextLabel& l : overlay.labels) {
-    float size_px = l.size_px * label_scale_;
+    float size_px = l.size_px * overlay_scale_;
     if (l.world_height > 0.0f) {
       if (!camera.ortho && glm::dot(l.anchor - camera.eye(), camera.forward()) <= camera.near_plane()) continue;
       size_px = l.world_height / std::max(camera.pixel_size_at(l.anchor, float(height_)), 1e-12f);
-      if (size_px < l.min_px * label_scale_) continue;
+      if (size_px < l.min_px * overlay_scale_) continue;
     }
-    font_.layout(l.text, l.anchor, size_px, l.align, l.offset * label_scale_, l.color, l.halo, l.halo_px * label_scale_,
-                 l.hidden_alpha,
-                 l.ignore_depth, glyphs);
+    font_.layout(l.text, l.anchor, size_px, l.align, l.offset * overlay_scale_, l.color, l.halo,
+                 l.halo_px * overlay_scale_, l.hidden_alpha, l.ignore_depth, glyphs);
   }
-  if (lines_buffer_.upload(gpu_, overlay.lines.data(), std::max<size_t>(overlay.lines.size() * sizeof(OverlayLine), 256),
+  std::vector<OverlayLine> lines = overlay.lines;
+  for (OverlayLine& l : lines) {
+    l.a.w *= overlay_scale_;
+    l.border.a *= overlay_scale_;
+  }
+  if (lines_buffer_.upload(gpu_, lines.data(), std::max<size_t>(lines.size() * sizeof(OverlayLine), 256),
                            BU::Storage, "overlay lines") || !lines_storage_group_)
     lines_storage_group_ = make_group(gpu_, storage_layout_, {{0, lines_buffer_.buffer}});
   if (text_buffer_.upload(gpu_, glyphs.data(), std::max<size_t>(glyphs.size() * sizeof(GlyphInstance), 256),

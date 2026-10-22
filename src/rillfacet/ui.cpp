@@ -15,8 +15,18 @@ static ImVec4 rgb(int hex, float a = 1.0f) {
   return ImVec4(((hex >> 16) & 255) / 255.0f, ((hex >> 8) & 255) / 255.0f, (hex & 255) / 255.0f, a);
 }
 
+static float g_scale = 1.0f;
+
+void set_scale(float scale) { g_scale = scale; }
+float scale() { return g_scale; }
+
+// A size given at 100% scale, in window units.
+static float px(float v) { return v * g_scale; }
+static ImVec2 px(float x, float y) { return ImVec2(x * g_scale, y * g_scale); }
+
 void apply_theme(Theme theme) {
   ImGuiStyle& st = ImGui::GetStyle();
+  st = ImGuiStyle();
   if (theme == Theme::Dark)
     ImGui::StyleColorsDark();
   else
@@ -37,6 +47,8 @@ void apply_theme(Theme theme) {
   st.ScrollbarSize = 12.0f;
   st.GrabMinSize = 10.0f;
   st.SeparatorTextBorderSize = 1.0f;
+  st.ScaleAllSizes(g_scale);
+  st.FontScaleDpi = g_scale;
 
   ImVec4* c = st.Colors;
   const ImVec4 accent = rgb(0x4772b3);
@@ -141,7 +153,7 @@ static std::string fmt3(const glm::vec3& v) {
 static int button_row(const char* const* labels, int n, int current, float width) {
   int chosen = current;
   for (int i = 0; i < n; ++i) {
-    if (i) ImGui::SameLine(0, 4);
+    if (i) ImGui::SameLine(0, px(4));
     bool on = i == current;
     if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
     if (ImGui::Button(labels[i], ImVec2(width, 0))) chosen = i;
@@ -169,7 +181,7 @@ static void body_list(SurfaceMesh& m, Selection& sel) {
     if (ImGui::SmallButton("Show all (Alt+H)")) m.unhide_all_by_user();
   }
   float row_h = ImGui::GetFrameHeightWithSpacing();
-  ImGui::BeginChild("##bodies", ImVec2(0, std::min(rows.size(), size_t(9)) * row_h + 4), ImGuiChildFlags_Borders);
+  ImGui::BeginChild("##bodies", ImVec2(0, std::min(rows.size(), size_t(9)) * row_h + px(4)), ImGuiChildFlags_Borders);
   ImGuiListClipper clipper;
   clipper.Begin(int(rows.size()));
   while (clipper.Step())
@@ -293,17 +305,17 @@ static void appearance(QuantityStructure& q, RenderSettings& s, Selection& selec
 
 void display_panel(Scene& scene, RenderSettings& s, Selection& selection) {
   const ImGuiViewport* vp = ImGui::GetMainViewport();
-  ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 350, vp->WorkPos.y + 150),
+  ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - px(350), vp->WorkPos.y + px(150)),
                           ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize(ImVec2(340, 470), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(px(340, 470), ImGuiCond_FirstUseEver);
   if (!ImGui::Begin("Display")) {
     ImGui::End();
     return;
   }
   const char* shading_labels[] = {"Solid", "Wireframe"};
-  float half = (ImGui::GetContentRegionAvail().x - 4) * 0.5f;
+  float half = (ImGui::GetContentRegionAvail().x - px(4)) * 0.5f;
   s.shading = Shading(button_row(shading_labels, 2, int(s.shading), half));
-  ImGui::PushItemWidth(-110);
+  ImGui::PushItemWidth(-px(110));
   if (s.shading == Shading::Solid) {
     int style = int(s.style);
     if (ImGui::Combo("Style", &style, "Studio\0MatCap\0Environment PBR\0Technical\0"))
@@ -346,7 +358,7 @@ void display_panel(Scene& scene, RenderSettings& s, Selection& selection) {
   } else {
     int colors = s.wire_object_colors ? 1 : 0;
     ImGui::TextUnformatted("Wire color");
-    ImGui::SameLine(ImGui::GetContentRegionAvail().x - 150);
+    ImGui::SameLine(ImGui::GetContentRegionAvail().x - px(150));
     ImGui::RadioButton("Theme", &colors, 0);
     ImGui::SameLine();
     ImGui::RadioButton("Object", &colors, 1);
@@ -357,7 +369,7 @@ void display_panel(Scene& scene, RenderSettings& s, Selection& selection) {
   }
   int theme = int(s.theme);
   ImGui::TextUnformatted("Theme");
-  ImGui::SameLine(ImGui::GetContentRegionAvail().x - 150);
+  ImGui::SameLine(ImGui::GetContentRegionAvail().x - px(150));
   ImGui::RadioButton("Dark", &theme, 0);
   ImGui::SameLine();
   ImGui::RadioButton("Light", &theme, 1);
@@ -567,9 +579,9 @@ void element_rows(Table& table, const QuantityStructure& q, ElementKind k, uint3
 void inspector_panel(Scene& scene, Selection& sel, std::vector<Measurement>& measurements, MeasureTool& tool,
                      bool& xray, ImFont* mono) {
   const ImGuiViewport* vp = ImGui::GetMainViewport();
-  ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 350, vp->WorkPos.y + 630),
+  ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - px(350), vp->WorkPos.y + px(630)),
                           ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize(ImVec2(340, 320), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(px(340, 320), ImGuiCond_FirstUseEver);
   if (!ImGui::Begin("Inspect")) {
     ImGui::End();
     return;
@@ -579,7 +591,7 @@ void inspector_panel(Scene& scene, Selection& sel, std::vector<Measurement>& mea
     bool active = int(sel.mode()) == m;
     if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
     std::string label = std::string(pick_mode_name(PickMode(m))) + "##mode";
-    if (ImGui::Button(label.c_str(), ImVec2(58, 0))) sel.set_mode(PickMode(m));
+    if (ImGui::Button(label.c_str(), ImVec2(px(58), 0))) sel.set_mode(PickMode(m));
     if (active) ImGui::PopStyleColor();
   }
   ImGui::Checkbox("X-ray select (Alt+Z)", &xray);
@@ -690,9 +702,9 @@ void inspector_panel(Scene& scene, Selection& sel, std::vector<Measurement>& mea
 // ---- Navigation gizmo -----------------------------------------------------------
 
 void nav_gizmo(Camera& cam, RenderSettings& settings, const glm::vec2& viewport) {
-  const float R = 46.0f, pad = 10.0f;
-  ImVec2 size(2 * (R + pad) + 20, 2 * (R + pad) + 26);
-  ImGui::SetNextWindowPos(ImVec2(viewport.x - size.x - 8, 8));
+  const float R = px(46), pad = px(10);
+  ImVec2 size(2 * (R + pad) + px(20), 2 * (R + pad) + px(26));
+  ImGui::SetNextWindowPos(ImVec2(viewport.x - size.x - px(8), px(8)));
   ImGui::SetNextWindowSize(size);
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
   ImGui::Begin("##navgizmo", nullptr,
@@ -700,8 +712,8 @@ void nav_gizmo(Camera& cam, RenderSettings& settings, const glm::vec2& viewport)
                    ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove |
                    ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoDocking);
   ImVec2 origin = ImGui::GetCursorScreenPos();
-  ImVec2 c(origin.x + R + pad + 10, origin.y + R + pad);
-  ImGui::SetCursorScreenPos(ImVec2(origin.x + 10, origin.y));
+  ImVec2 c(origin.x + R + pad + px(10), origin.y + R + pad);
+  ImGui::SetCursorScreenPos(ImVec2(origin.x + px(10), origin.y));
   ImGui::InvisibleButton("gizmo", ImVec2(2 * (R + pad), 2 * (R + pad)));
   bool hovered = ImGui::IsItemHovered(), active = ImGui::IsItemActive();
   ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -729,7 +741,7 @@ void nav_gizmo(Camera& cam, RenderSettings& settings, const glm::vec2& viewport)
   std::sort(std::begin(balls), std::end(balls), [](const Ball& a, const Ball& b) { return a.depth < b.depth; });
   ImVec2 mouse = ImGui::GetIO().MousePos;
   int hot = -1;
-  float best = 11.0f;
+  float best = px(11);
   for (int i = 0; i < 6; ++i) {
     float d = std::hypot(mouse.x - balls[i].pos.x, mouse.y - balls[i].pos.y);
     if (hovered && d < best) {
@@ -740,30 +752,30 @@ void nav_gizmo(Camera& cam, RenderSettings& settings, const glm::vec2& viewport)
   for (int i = 0; i < 6; ++i) {
     const Ball& b = balls[i];
     if (b.label) {
-      dl->AddLine(c, b.pos, b.color, 2.0f);
-      dl->AddCircleFilled(b.pos, 9.0f, b.color, 24);
+      dl->AddLine(c, b.pos, b.color, px(2));
+      dl->AddCircleFilled(b.pos, px(9), b.color, 24);
       ImVec2 ts = ImGui::CalcTextSize(b.label);
       dl->AddText(ImVec2(b.pos.x - ts.x * 0.5f, b.pos.y - ts.y * 0.5f), IM_COL32(20, 20, 20, 255), b.label);
     } else {
       ImU32 fill = (b.color & 0x00ffffff) | (70u << 24);
-      dl->AddCircleFilled(b.pos, 7.5f, fill, 24);
-      dl->AddCircle(b.pos, 7.5f, b.color, 24, 1.5f);
+      dl->AddCircleFilled(b.pos, px(7.5f), fill, 24);
+      dl->AddCircle(b.pos, px(7.5f), b.color, 24, px(1.5f));
     }
-    if (i == hot) dl->AddCircle(b.pos, 10.5f, IM_COL32(255, 255, 255, 230), 24, 1.5f);
+    if (i == hot) dl->AddCircle(b.pos, px(10.5f), IM_COL32(255, 255, 255, 230), 24, px(1.5f));
   }
   // Drag the gizmo to orbit; click a ball to align the view with that axis.
   static bool dragged = false;
   if (ImGui::IsItemActivated()) dragged = false;
-  if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f)) {
+  if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, px(2))) {
     ImVec2 d = ImGui::GetIO().MouseDelta;
     cam.orbit(d.x, d.y);
     dragged = true;
   } else if (hot >= 0 && ImGui::IsItemDeactivated() && !dragged) {
     cam.set_view(balls[hot].preset);
   }
-  ImGui::SetCursorScreenPos(ImVec2(c.x - 44, c.y + R + pad + 2));
+  ImGui::SetCursorScreenPos(ImVec2(c.x - px(44), c.y + R + pad + px(2)));
   if (ImGui::SmallButton(cam.ortho ? "Ortho" : "Persp")) cam.ortho = !cam.ortho;
-  ImGui::SameLine(0, 4);
+  ImGui::SameLine(0, px(4));
   bool wire = settings.shading == Shading::Wireframe;
   if (ImGui::SmallButton(wire ? "Wire" : "Solid"))
     settings.shading = wire ? Shading::Solid : Shading::Wireframe;
@@ -799,41 +811,41 @@ void hud(const Camera& cam, const RenderSettings& s, const glm::vec2& vp, float 
   ImU32 text = dark ? IM_COL32(230, 230, 230, 235) : IM_COL32(30, 30, 34, 235);
   ImU32 shadow = dark ? IM_COL32(0, 0, 0, 160) : IM_COL32(255, 255, 255, 170);
   auto label = [&](ImVec2 p, const std::string& t, ImU32 col) {
-    dl->AddText(ImVec2(p.x + 1, p.y + 1), shadow, t.c_str());
+    dl->AddText(ImVec2(p.x + px(1), p.y + px(1)), shadow, t.c_str());
     dl->AddText(p, col, t.c_str());
   };
 
   // Finest grid spacing drawn at the view target: shaders/grid.wgsl fades a
   // line family out once its lines are closer than ~7 px.
   glm::vec3 g(cam.target.x, cam.target.y, s.ground_height);
-  float px = cam.pixel_size_at(g, vp.y);
-  double spacing = std::pow(10.0, std::ceil(std::log10(double(px) * 7.0)));
+  float world_px = cam.pixel_size_at(g, vp.y);
+  double spacing = std::pow(10.0, std::ceil(std::log10(double(world_px) * 7.0)));
   static float fps = 60.0f;
   fps = fps * 0.95f + 0.05f / std::max(dt, 1e-4f);
-  label(ImVec2(14, 10), view_name(cam) + (s.shading == Shading::Wireframe ? "  \xc2\xb7  Wireframe" : ""), text);
+  label(px(14, 10), view_name(cam) + (s.shading == Shading::Wireframe ? "  \xc2\xb7  Wireframe" : ""), text);
   char line[128];
   std::snprintf(line, sizeof line, "Grid %s   %.0f fps", format_length(spacing, spacing).c_str(), fps);
-  label(ImVec2(14, 30), line, dark ? IM_COL32(180, 180, 180, 220) : IM_COL32(80, 80, 86, 220));
+  label(px(14, 30), line, dark ? IM_COL32(180, 180, 180, 220) : IM_COL32(80, 80, 86, 220));
   if (tool != MeasureTool::Off) {
     const char* hint = tool == MeasureTool::Distance ? "Measure distance: click two points (snaps to vertices)"
                                                      : "Measure angle: click three points, the middle is the apex";
-    label(ImVec2(14, 50), hint, IM_COL32(255, 196, 64, 255));
+    label(px(14, 50), hint, IM_COL32(255, 196, 64, 255));
   }
   if (!status.empty()) {
     ImVec2 ts = ImGui::CalcTextSize(status.c_str());
-    label(ImVec2(vp.x * 0.5f - ts.x * 0.5f, vp.y - 60), status, text);
+    label(ImVec2(vp.x * 0.5f - ts.x * 0.5f, vp.y - px(60)), status, text);
   }
 
   // Scale bar at the target depth.
-  double len = nice_step(double(px) * 110.0);
-  float bar = float(len / px);
-  ImVec2 a(20, vp.y - 26), b(20 + bar, vp.y - 26);
-  dl->AddLine(ImVec2(a.x + 1, a.y + 1), ImVec2(b.x + 1, b.y + 1), shadow, 2.0f);
-  dl->AddLine(a, b, text, 2.0f);
-  for (ImVec2 e : {a, b}) dl->AddLine(ImVec2(e.x, e.y - 5), ImVec2(e.x, e.y + 5), text, 2.0f);
+  double len = nice_step(double(world_px) * px(110));
+  float bar = float(len / world_px);
+  ImVec2 a(px(20), vp.y - px(26)), b(px(20) + bar, vp.y - px(26));
+  dl->AddLine(ImVec2(a.x + px(1), a.y + px(1)), ImVec2(b.x + px(1), b.y + px(1)), shadow, px(2));
+  dl->AddLine(a, b, text, px(2));
+  for (ImVec2 e : {a, b}) dl->AddLine(ImVec2(e.x, e.y - px(5)), ImVec2(e.x, e.y + px(5)), text, px(2));
   std::string t = format_length(len, len);
   ImVec2 ts = ImGui::CalcTextSize(t.c_str());
-  label(ImVec2(0.5f * (a.x + b.x) - ts.x * 0.5f, a.y - ts.y - 6), t, text);
+  label(ImVec2(0.5f * (a.x + b.x) - ts.x * 0.5f, a.y - ts.y - px(6)), t, text);
 }
 
 void colorbar(const Scene& scene, const glm::vec2& vp) {
@@ -842,8 +854,8 @@ void colorbar(const Scene& scene, const glm::vec2& vp) {
     const Quantity* q = m && m->visible ? m->coloring_quantity() : nullptr;
     if (!q || q->type == QuantityType::Color) continue;
     glm::vec2 r = m->color_range();
-    const float w = 240, h = 12;
-    ImGui::SetNextWindowPos(ImVec2(vp.x * 0.5f, vp.y - 12), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+    const float w = px(240), h = px(12);
+    ImGui::SetNextWindowPos(ImVec2(vp.x * 0.5f, vp.y - px(12)), ImGuiCond_Always, ImVec2(0.5f, 1.0f));
     ImGui::SetNextWindowBgAlpha(0.75f);
     ImGui::Begin("##colorbar", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
@@ -879,8 +891,8 @@ void colorbar(const Scene& scene, const glm::vec2& vp) {
 
 void shader_error_toast(const std::string& error, const glm::vec2& vp) {
   if (error.empty()) return;
-  ImGui::SetNextWindowPos(ImVec2(vp.x * 0.5f, 12), ImGuiCond_Always, ImVec2(0.5f, 0));
-  ImGui::SetNextWindowSizeConstraints(ImVec2(300, 0), ImVec2(vp.x * 0.6f, vp.y * 0.5f));
+  ImGui::SetNextWindowPos(ImVec2(vp.x * 0.5f, px(12)), ImGuiCond_Always, ImVec2(0.5f, 0));
+  ImGui::SetNextWindowSizeConstraints(ImVec2(px(300), 0), ImVec2(vp.x * 0.6f, vp.y * 0.5f));
   ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.35f, 0.08f, 0.08f, 0.95f));
   ImGui::Begin("##shadererror", nullptr,
                ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |

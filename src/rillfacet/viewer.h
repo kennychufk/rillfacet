@@ -95,6 +95,8 @@ class Viewer {
   // Exact 3D hit under a pixel (reads the last frame's id buffer).
   Hit pick(float x, float y);
   float frame_seconds() const { return dt_; }
+  // Desktop UI scale (2 at 200%): multiply hard-coded ImGui sizes and positions by it.
+  float ui_scale() const;
 
   // Ctrl+LMB drag (off by default). The begin/to/end calls script a drag
   // without the mouse, e.g. for tests or recorded interactions.
@@ -119,6 +121,7 @@ class Viewer {
   void capture_panel();
   void capture_frame();
   void apply_theme();
+  void update_scale();
 
   ViewerOptions options_;
   bool ok_ = false;
@@ -151,6 +154,7 @@ class Viewer {
   double last_time_ = 0, frame_start_ = 0;
   float dt_ = 1.0f / 60.0f;
   int applied_theme_ = -1;
+  float content_scale_ = 0.0f, fb_ratio_ = 0.0f;  // as last applied by update_scale()
   ImFont* ui_font_ = nullptr;
   ImFont* mono_font_ = nullptr;
   int screenshot_counter_ = 0;

@@ -701,7 +701,8 @@ NB_MODULE(_rillfacet, m) {
       .def("drag_to", &Viewer::drag_to, nb::arg("x"), nb::arg("y"), "Move the drag target to pixel (x, y).")
       .def("end_drag", &Viewer::end_drag, "Release: Released, then Idle.")
       .def("cancel_drag", &Viewer::cancel_drag, "Idle at once, no Released (e.g. the scene was rebuilt).")
-      .def_prop_ro("frame_seconds", &Viewer::frame_seconds);
+      .def_prop_ro("frame_seconds", &Viewer::frame_seconds)
+      .def_prop_ro("ui_scale", &Viewer::ui_scale, "Desktop UI scale (2 at 200%) for hard-coded imgui sizes.");
 
   auto im = m.def_submodule("imgui", "Dear ImGui subset, named like polyscope.imgui");
   bind_imgui(im);
