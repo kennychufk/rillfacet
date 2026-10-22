@@ -7,10 +7,12 @@ How it maps the scene onto Mitsuba, and why:
 
 - Each rigid mesh becomes a FEW Mitsuba meshes holding all instances: one
   for its untextured materials (base color, roughness and metallic as
-  per-face attributes, so per-env randomization is a buffer write) and one
-  per textured material. Mitsuba re-traces its kernels on the host every
-  render, at a cost that grows with the number of shapes, so one shape per
-  env (or Mitsuba instancing) would grow quadratically with the env count.
+  per-face attributes, so per-env randomization is a buffer write), one
+  per textured material, and one for its solid-texture materials (one
+  more for those with bump; :mod:`._mitsuba_solid_texture`). Mitsuba
+  re-traces its kernels on the host every render, at a cost that grows
+  with the number of shapes, so one shape per env (or Mitsuba instancing)
+  would grow quadratically with the env count.
 - Poses are applied by skinning the body-local vertices on the GPU (torch)
   into those meshes' vertex buffers; envs sit on a grid ``env_spacing``
   apart so that each camera sees only its own env.
@@ -58,10 +60,14 @@ class _Group:
     """One Mitsuba mesh: a subset of a rigid mesh's triangles, all
     instances."""
 
-    def __init__(self, mesh, sid, tri_idx, slot, torch, dev):
+    def __init__(self, mesh, sid, tri_idx, slot, torch, dev,
+                 solid_texture=False, bump=False):
         tris = mesh.triangles[tri_idx].astype(np.int64)
         gv, inv = np.unique(tris.ravel(), return_inverse=True)
         self.sid, self.slot, self.mesh = sid, slot, mesh
+        # color and roughness from a solid (3D) texture, rillfacet.solid_texture
+        self.solid_texture, self.bump = bool(solid_texture), bool(bump)
+        self.state = None                  # its _mitsuba_solid_texture.State
         self.nv, self.nt = len(gv), len(tri_idx)
         self.faces = inv.reshape(-1, 3)
         T = torch
@@ -128,16 +134,22 @@ class MitsubaRenderer(Renderer):
                     mat.base_color_texture is not None for mat in m.materials):
                 warnings.warn(f"rigid mesh {m.name!r}: textures without UVs "
                               "are drawn untextured")
+            solid = [[i for i, mat in enumerate(m.materials)
+                     if mat.solid_texture and mat.bump == bump]
+                    for bump in (False, True)]
             tri_slot = (m.triangle_material if m.triangle_material is not None
                         else np.zeros(len(m.triangles), np.int32))
-            flat = np.nonzero(~np.isin(tri_slot, textured))[0]
-            parts = [(flat, None)] if len(flat) else []
-            parts += [(np.nonzero(tri_slot == s)[0], s) for s in textured]
-            for gi, (tri_idx, slot) in enumerate(parts):
+            flat = np.nonzero(~np.isin(tri_slot, textured + sum(solid, [])))[0]
+            parts = [(flat, None, None)] if len(flat) else []
+            parts += [(np.nonzero(np.isin(tri_slot, sl))[0], None, bump)
+                      for bump, sl in zip((False, True), solid) if sl]
+            parts += [(np.nonzero(tri_slot == s)[0], s, None) for s in textured]
+            for gi, (tri_idx, slot, bump) in enumerate(parts):
                 if not len(tri_idx):
                     continue
                 g = _Group(m, f"m{mi_idx}_{_sid(m.name)}_{gi}", tri_idx, slot,
-                           torch, self.dev)
+                           torch, self.dev, solid_texture=bump is not None,
+                           bump=bool(bump))
                 d[g.sid] = self._make_mesh(g, m, bases[m.name])
                 groups.append(g)
             self._groups[m.name] = groups
@@ -165,10 +177,19 @@ class MitsubaRenderer(Renderer):
         faces = (g.faces[None] + g.nv * np.arange(I)[:, None, None]).ravel()
         seg = np.tile(label_base + g.tri_body, I).astype(np.float32)
         mesh.add_attribute("face_seg", 1, seg)
-        if g.slot is None:
-            mesh.add_attribute("face_color", 3, np.zeros(3 * I * g.nt,
-                                                         np.float32))
-        mesh.add_attribute("face_rough", 1, np.zeros(I * g.nt, np.float32))
+        if g.solid_texture:
+            local = g.local.cpu().numpy()
+            mesh.add_attribute("vertex_plocal", 3,
+                               np.tile(local, (I, 1)).ravel())
+            for k in (1, 2):    # body-local edges, for the bump's tangents
+                e = local[g.faces[:, k]] - local[g.faces[:, 0]]
+                mesh.add_attribute(f"face_le{k}", 3,
+                                   np.tile(e, (I, 1)).ravel())
+        else:
+            if g.slot is None:
+                mesh.add_attribute("face_color", 3,
+                                   np.zeros(3 * I * g.nt, np.float32))
+            mesh.add_attribute("face_rough", 1, np.zeros(I * g.nt, np.float32))
         mesh.add_attribute("face_metal", 1, np.zeros(I * g.nt, np.float32))
         p = mi.traverse(mesh)
         p["vertex_positions"] = mi.Float(np.tile(
@@ -181,6 +202,9 @@ class MitsubaRenderer(Renderer):
             p["vertex_texcoords"] = mi.Float(np.tile(
                 g.uvs, (I, 1)).astype(np.float32).ravel())
         p.update()
+        if g.solid_texture:
+            mesh.set_bsdf(self._solid_texture_bsdf(g, m))
+            return mesh
         if g.slot is None:
             base = {"type": "mesh_attribute", "name": "face_color"}
         else:
@@ -192,6 +216,21 @@ class MitsubaRenderer(Renderer):
             "roughness": {"type": "mesh_attribute", "name": "face_rough"},
             "metallic": {"type": "mesh_attribute", "name": "face_metal"}}}))
         return mesh
+
+    def _solid_texture_bsdf(self, g, m):
+        from ._mitsuba_solid_texture import plugins
+        mi = self.mi
+        State, texture, scope = plugins(mi)
+        g.state = State(g.nt, g.tri_slot, len(m.materials))
+        bsdf = {"type": "principled",
+                "base_color": texture(g.state, "color"),
+                "roughness": texture(g.state, "rough"),
+                "metallic": {"type": "mesh_attribute", "name": "face_metal"}}
+        if g.bump:
+            bsdf = {"type": "normalmap", "bsdf": bsdf,
+                    "normalmap": texture(g.state, "normal")}
+        return scope(g.state, mi.load_dict({"type": "twosided",
+                                            "bsdf": bsdf}))
 
     def _texture(self, m, slot):
         """Linear float bitmap of a slot's texture times its base color."""
@@ -293,11 +332,15 @@ class MitsubaRenderer(Renderer):
             rough = np.full((I, g.nt), 0.5, np.float32)
             metal = np.zeros((I, g.nt), np.float32)
         p = self._params
-        if g.slot is None:
-            p[self._key(g.sid, "face_color")] = mi.Float(
-                srgb_to_linear(color).astype(np.float32).ravel())
-        p[self._key(g.sid, "face_rough")] = mi.Float(
-            np.ascontiguousarray(rough, np.float32).ravel())
+        if g.solid_texture:
+            from ..solid_texture import linearize
+            g.state.set_params(linearize(m.material_solid_texture))
+        else:
+            if g.slot is None:
+                p[self._key(g.sid, "face_color")] = mi.Float(
+                    srgb_to_linear(color).astype(np.float32).ravel())
+            p[self._key(g.sid, "face_rough")] = mi.Float(
+                np.ascontiguousarray(rough, np.float32).ravel())
         p[self._key(g.sid, "face_metal")] = mi.Float(
             np.ascontiguousarray(metal, np.float32).ravel())
 

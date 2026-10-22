@@ -163,6 +163,23 @@ scene also carries what viewers ignore. Rigid meshes take `normals`, `uvs`,
 texture) and `triangle_material`; each instance (env) has its own copy of
 every material's parameters, so domain randomization is an array write
 (`set_materials(base_color=[E, M, 3], roughness=[E, M], metallic=...)`).
+A material with `solid_texture=True` takes its base color and roughness
+from a procedural SOLID (3D) texture instead (`rillfacet.solid_texture`):
+a pattern defined in 3D and evaluated at the body-local position of each
+surface point, so it needs no UVs (convex hulls have none), has no seams
+and moves with its body. Families: plain, wood, marble, granite, stone
+(domain-warped fBm), 3D checker. Each env has a row of 32 parameters per
+slot (`RigidMesh.material_solid_texture` `[E, M, 32]`: family, scale,
+noise offset, rotation, three sRGB colors, family knobs, roughness at the
+pattern's low / high end, bump amplitude); `solid_texture.sample_params(rng,
+(E, M))` draws random rows, `make_params(...)` builds one, and
+`set_materials(solid_texture=rows)` applies them without recompiling.
+`bump=True` on the material also perturbs the shading normal by the
+pattern's height. The noise and the families are written once over an
+ops layer, run in Dr.Jit by Mitsuba and in torch by
+`solid_texture.evaluate` (the reference the tests check Mitsuba against).
+Only Mitsuba renders them so far; the raster backend draws each slot's
+first color `c0` (with a warning).
 `scene.light(...)` adds lights shared by all envs (`directional`,
 `ambient`, `envmap`); `scene.camera_sensor(...)` adds a camera per env with
 OpenCV intrinsics and distortion (`K`, `dist`; camera frame x right, y down,
@@ -217,7 +234,11 @@ chunks of `max_samples`. Measured on an RTX 5070 Ti, 224x224 RGB with depth
 of field plus depth and segmentation, simple scene: 256 envs at 4 spp in
 ~260 ms (`path`, max depth 4) or ~117 ms (`direct`); 1024 envs at 1 spp
 (`direct`) in ~165 ms. The first render compiles kernels (~0.2-0.7 s).
-`denoise=True` runs Mitsuba's OptiX denoiser on the batch.
+`denoise=True` runs Mitsuba's OptiX denoiser on the batch. Solid textures
+are Python Mitsuba plugins (`render/_mitsuba_solid_texture.py`): every
+slot solid, 224x224 at 4 spp, they take ~1.35x the time of plain
+materials (64 envs `direct` 35 vs 25 ms, 256 envs `path` 204 vs 152 ms),
+~2.6x with bump; the first compile of their kernels takes a few seconds.
 
 Blender Cycles is a second backend with the same interface, in the separate
 GPL-3.0 package `rillfacet-cycles` (`from rillfacet_cycles import
@@ -422,8 +443,11 @@ src/python/module.cpp   nanobind module `_rillfacet` (+ `rillfacet.imgui`)
 python/rillfacet/        Python package
   scene_api.py          backend-neutral scene (+ materials, lights, camera sensors)
   assets.py             glTF / OBJ visual meshes, merge_bodies
+  solid_texture.py      procedural solid (3D) textures: parameter rows, sampler,
+                        noise + families (Dr.Jit / torch), torch reference
   render/               camera renderers: camera.py (OpenCV model), sensor.py
                         (gain, vignetting, noise), mitsuba.py
+                        (+ _mitsuba_solid_texture.py plugins), raster.py
   web/                  stream server, recorder, replay, built browser client
 tests/                  headless Python tests (render tests need CUDA + mitsuba)
 ```

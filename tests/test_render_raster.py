@@ -370,3 +370,32 @@ def test_envmap_matches_mitsuba(tmp_path):
         res.append(R.render("c", outputs=("rgb",))["rgb"][:, 3:5, 3:5].mean((1, 2))
                    .cpu().numpy())
     np.testing.assert_allclose(res[0], res[1], atol=0.02)
+
+
+def test_solid_texture_drawn_in_its_first_color():
+    """Solid (3D) textures are not rasterized yet: a solid-texture slot
+    renders like an ordinary material of its rows' c0 and rough0."""
+    from rillfacet import solid_texture as sx
+    rows = sx.sample_params(np.random.default_rng(0), (2, 1))
+    P = sx.PARAM
+    rows[:, 0, P["c0"]:P["c0"] + 3] = [(1, 0.2, 0.1), (0.1, 0.9, 0.3)]
+    imgs = []
+    for solid in (False, True):
+        r = RasterRenderer(chunk=2)
+        sc = Scene(r)
+        m = rigid(sc, "m", [box((0.0, 0.0, 1.5), (0.4, 0.4, 0.2))], 2,
+                  materials=[Material("a", solid_texture=solid)])
+        m.set_poses(identity_poses(2, 1))
+        sc.light("sky", "ambient", intensity=0.5)
+        sc.camera_sensor("c", W, H, K, instances=2, local_pose=IDENTITY)
+        if solid:
+            m.set_materials(solid_texture=rows)
+            with pytest.warns(UserWarning, match="solid textures"):
+                imgs.append(r.render("c", outputs=("linear",))["linear"])
+        else:
+            m.set_materials(base_color=rows[..., P["c0"]:P["c0"] + 3],
+                            roughness=rows[..., P["rough0"]])
+            imgs.append(r.render("c", outputs=("linear",))["linear"])
+        r.close()
+    assert torch.equal(imgs[0], imgs[1])
+    assert float((imgs[1][0] - imgs[1][1]).abs().max()) > 0.1    # per env

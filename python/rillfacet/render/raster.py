@@ -314,6 +314,9 @@ class RasterRenderer(Renderer):
                     spheres.append([*(lo + hi) / 2, np.linalg.norm(hi - lo) / 2])
                 else:
                     spheres.append([0, 0, 0, -1])
+            if any(mat.solid_texture for mat in m.materials):
+                warnings.warn(f"rigid mesh {m.name!r}: solid textures are "
+                              "drawn in their first color (c0)")
             for s, mat in enumerate(m.materials):
                 if mat.base_color_texture is None:
                     continue
@@ -485,6 +488,16 @@ class RasterRenderer(Renderer):
                 mats[:, s0:s0 + M, :3] = srgb_to_linear(m.material_base_color)
                 mats[:, s0:s0 + M, 3] = m.material_roughness
                 mats[:, s0:s0 + M, 4] = m.material_metallic
+                if m.material_solid_texture is not None:
+                    # not rendered here yet: each slot's first color
+                    from ..solid_texture import PARAM
+                    solid = [s for s, mat in enumerate(m.materials)
+                            if mat.solid_texture]
+                    rows = m.material_solid_texture[:, solid]
+                    c0, r0 = PARAM["c0"], PARAM["rough0"]
+                    mats[:, s0 + np.array(solid), :3] = srgb_to_linear(
+                        rows[..., c0:c0 + 3])
+                    mats[:, s0 + np.array(solid), 3] = rows[..., r0]
                 for s in range(M):
                     layer = self._tex_index.get((m.name, s))
                     if layer is not None:

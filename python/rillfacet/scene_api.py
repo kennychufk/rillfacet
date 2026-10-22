@@ -133,26 +133,48 @@ class Material:
     sRGB, ``metallic`` and ``roughness`` in 0..1, and an optional
     ``base_color_texture`` (an image path or an ``[H, W, 3|4]`` sRGB array,
     uint8 or 0..1 float) sampled at the mesh UVs (origin top-left, glTF's
-    convention). The texture is multiplied by ``base_color``, as in glTF."""
+    convention). The texture is multiplied by ``base_color``, as in glTF.
+
+    ``solid_texture``: the base color and roughness come from a procedural
+    SOLID (3D) texture evaluated at the body-local position instead of UVs
+    (:mod:`rillfacet.solid_texture`: wood, marble, granite, ...; no UVs
+    needed), with per-instance parameters
+    :attr:`RigidMesh.material_solid_texture`
+    (``set_materials(solid_texture=...)``). Until they are set, every
+    instance shows the plain family in ``base_color`` and ``roughness``;
+    after, those two are not used. ``bump`` also perturbs the shading
+    normal by the solid texture's height (the parameters' ``bump``
+    amplitude), at about three times the shading cost. Renderers without
+    solid textures draw the parameters' first color ``c0``."""
 
     def __init__(self, name, base_color=(0.8, 0.8, 0.8), metallic=0.0,
-                 roughness=0.5, base_color_texture=None):
+                 roughness=0.5, base_color_texture=None, solid_texture=False,
+                 bump=False):
         self.name = str(name)
         self.base_color = _rgb(base_color)
         self.metallic, self.roughness = float(metallic), float(roughness)
         self.base_color_texture = base_color_texture
+        self.solid_texture, self.bump = bool(solid_texture), bool(bump)
+        if self.solid_texture and base_color_texture is not None:
+            raise ValueError("Material: solid_texture or "
+                             "base_color_texture, not both")
+        if self.bump and not self.solid_texture:
+            raise ValueError("Material: bump needs solid_texture=True")
 
     def state(self) -> dict:
         tex = self.base_color_texture
         return dict(name=self.name, base_color=self.base_color,
                     metallic=self.metallic, roughness=self.roughness,
                     texture=(tex if isinstance(tex, str)
-                             else None if tex is None else "<array>"))
+                             else None if tex is None else "<array>"),
+                    solid_texture=self.solid_texture, bump=self.bump)
 
     def __repr__(self):
+        kind = (", textured" if self.base_color_texture is not None
+                else ", solid texture" + (" + bump" if self.bump else "")
+                if self.solid_texture else "")
         return (f"Material({self.name!r}, base_color={self.base_color}, "
-                f"metallic={self.metallic}, roughness={self.roughness}"
-                f"{', textured' if self.base_color_texture is not None else ''})")
+                f"metallic={self.metallic}, roughness={self.roughness}{kind})")
 
 
 class RigidMesh(_Object):
@@ -172,8 +194,10 @@ class RigidMesh(_Object):
     :class:`Material`) with ``triangle_material`` ``[T]`` the material slot
     of each triangle. Each instance has its own copy of every slot's
     parameters (:meth:`set_materials`), so appearance is randomized per env
-    by writing arrays. Without materials, renderers shade each segment with
-    its segment color (roughness 0.5, not metallic)."""
+    by writing arrays; solid-texture materials have a row of solid texture
+    parameters per instance (:attr:`material_solid_texture`). Without
+    materials, renderers shade each segment with its segment color
+    (roughness 0.5, not metallic)."""
     kind = "rigid_mesh"
 
     def __init__(self, scene, name, local_vertices, vertex_body, triangles,
@@ -229,6 +253,13 @@ class RigidMesh(_Object):
             [m.metallic for m in self.materials], np.float32), (I, 1))
         self.material_roughness = np.tile(np.asarray(
             [m.roughness for m in self.materials], np.float32), (I, 1))
+        #: ``[instances, M, K]`` solid texture parameters (rows of every
+        #: slot; read for the solid-texture ones), None without
+        #: solid-texture materials
+        self.material_solid_texture = None
+        if any(m.solid_texture for m in self.materials):
+            from .solid_texture import default_params
+            self.material_solid_texture = default_params(self.materials, I)
 
     @property
     def num_segments(self) -> int:
@@ -266,14 +297,22 @@ class RigidMesh(_Object):
         raise KeyError(f"RigidMesh {self.name!r}: no material {name!r}")
 
     def set_materials(self, base_color=None, metallic=None,
-                      roughness=None) -> None:
+                      roughness=None, solid_texture=None) -> None:
         """Per-instance material parameters: ``base_color`` broadcasts to
         ``[instances, M, 3]`` (sRGB), ``metallic`` / ``roughness`` to
-        ``[instances, M]``; None keeps the current values. E.g.
-        ``base_color=rng.uniform(0, 1, (E, M, 3))`` randomizes every slot of
-        every env; write a slice of :attr:`material_base_color` and pass it
-        back to change a few."""
+        ``[instances, M]``, ``solid_texture`` (parameter rows of
+        :mod:`rillfacet.solid_texture`, e.g. ``solid_texture.sample_params(
+        rng, (E, M))``) to ``[instances, M, K]``; None keeps the current values.
+        E.g. ``base_color=rng.uniform(0, 1, (E, M, 3))`` randomizes every
+        slot of every env; write a slice of :attr:`material_base_color` and
+        pass it back to change a few."""
         I, M = self.instances, len(self.materials)
+        if solid_texture is not None:
+            if self.material_solid_texture is None:
+                raise ValueError(f"RigidMesh {self.name!r}: no "
+                                 "solid-texture material")
+            self.material_solid_texture = np.ascontiguousarray(np.broadcast_to(
+                _host(solid_texture), self.material_solid_texture.shape))
         if base_color is not None:
             self.material_base_color = np.ascontiguousarray(np.broadcast_to(
                 _host(base_color), (I, M, 3)))
@@ -308,6 +347,8 @@ class RigidMesh(_Object):
                           material_base_color=self.material_base_color,
                           material_metallic=self.material_metallic,
                           material_roughness=self.material_roughness)
+            if self.material_solid_texture is not None:
+                arrays["material_solid_texture"] = self.material_solid_texture
         return attrs, arrays
 
 
