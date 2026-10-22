@@ -145,8 +145,8 @@ class Material:
     after, those two are not used. ``bump`` also perturbs the shading
     normal by the solid texture's height (the parameters' ``bump``
     amplitude), at about twice the shading cost of a solid texture without
-    it. Mitsuba and the raster backend render solid textures; the Cycles
-    backend draws ``base_color``."""
+    it. Mitsuba, the raster backend and the Cycles backend (OSL: on OptiX
+    and the CPU) render solid textures."""
 
     def __init__(self, name, base_color=(0.8, 0.8, 0.8), metallic=0.0,
                  roughness=0.5, base_color_texture=None, solid_texture=False,

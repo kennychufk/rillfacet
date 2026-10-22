@@ -181,9 +181,9 @@ ops layer, run in Dr.Jit by Mitsuba and in torch by
 against); the raster backend runs a line-by-line WGSL port
 (`shaders/common/noise.wgsl`, `shaders/common/solid_texture.wgsl`), which
 fades detail finer than a pixel to its mean (`solid_texture_filter`; it
-shades one point per pixel, where Mitsuba averages over its samples). The
-Cycles backend does not render them yet: it draws the material's
-`base_color`.
+shades one point per pixel, where Mitsuba averages over its samples); the
+Cycles backend (`rillfacet-cycles`) runs an OSL port, unfiltered as
+Mitsuba (OptiX and CPU only; Cycles has no OSL on CUDA).
 `scene.light(...)` adds lights shared by all envs (`directional`,
 `ambient`, `envmap`); `scene.camera_sensor(...)` adds a camera per env with
 OpenCV intrinsics and distortion (`K`, `dist`; camera frame x right, y down,
