@@ -33,10 +33,10 @@ jobs:
           git ls-files -z --cached --others --exclude-standard | tar --null -T - -cf "$RUNNER_TEMP/ctx.tar"
           docker build --target manylinux-dist --output dist -f docker/Dockerfile - < "$RUNNER_TEMP/ctx.tar"
           ls -l dist
+      # The publish jobs download every artifact named wheels*.
       - uses: actions/upload-artifact@v4
         with:
-          pattern: wheels*
-          merge-multiple: true
+          name: wheels-linux
           path: dist/*.whl
           if-no-files-found: error
 
