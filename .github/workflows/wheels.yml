@@ -4,7 +4,8 @@
 # publishes them all to TestPyPI.
 #   - every push / PR: build + test, wheels kept as a workflow artifact
 #   - tag v*, or "Run workflow" by hand: also upload to TestPyPI
-#   - tag v* only: then upload to PyPI, after TestPyPI succeeded
+#   - tag v* only: then upload to PyPI, after TestPyPI succeeded, and create a
+#     GitHub release for the tag with the same wheels
 # Both indexes use trusted publishing (no token): this repository, the workflow
 # file (wheels.yml) and the environment (testpypi / pypi) are registered as a
 # publisher at https://test.pypi.org/manage/account/publishing/ and
@@ -123,3 +124,21 @@ jobs:
           merge-multiple: true
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # A GitHub release for the tag with the same wheels, once they are on PyPI.
+  github-release:
+    needs: publish-pypi
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels*
+          merge-multiple: true
+          path: dist
+      - name: Create the GitHub release with the wheels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.whl --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
