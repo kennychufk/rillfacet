@@ -29,9 +29,12 @@ __all__ = ["apply", "radius2"]
 
 def radius2(K, width, height, device=None):
     """``[H, W]`` squared normalized distance ``r^2`` of each pixel center
-    from the principal point (``r = 1`` at the farthest image corner)."""
+    from the principal point (``r = 1`` at the farthest image corner);
+    ``[I, H, W]`` for per-instance intrinsics ``K`` ``[I, 3, 3]``."""
     import torch
     K = np.asarray(K, np.float64)
+    if K.ndim == 3:
+        return torch.stack([radius2(k, width, height, device) for k in K])
     cx, cy = K[0, 2], K[1, 2]
     corners = np.array([[-0.5, -0.5], [width - 0.5, -0.5],
                         [-0.5, height - 0.5], [width - 0.5, height - 0.5]])

@@ -196,7 +196,12 @@ OpenCV intrinsics and distortion (`K`, `dist`; camera frame x right, y down,
 z forward), mounted on a body (`mount`, `body`, `local_pose`), with
 per-env lens and sensor values (`aperture_radius`, `focus_distance` for
 depth of field; `gain` for exposure / white balance; `vignetting`,
-`shot_noise`, `read_noise`; all settable later with `set_lens`). A
+`shot_noise`, `read_noise`; all settable later with `set_lens`). The
+intrinsics can be per env too, for lens randomization (e.g. a
+focus-dependent calibration evaluated at a random lens position per env):
+`K` `[envs, 3, 3]` and `dist` `[envs, n]` (`per_instance_intrinsics`,
+`intrinsics(i)`; raster and Mitsuba; the raster renderer keeps one remap
+table per env behind one shared pinhole proxy, Cycles refuses them). A
 `Renderer` is a scene backend whose `render(camera, outputs)` returns every
 env's images as torch tensors; each env is rendered in its own world (envs
 sit `env_spacing` apart, beyond the cameras' `far`).

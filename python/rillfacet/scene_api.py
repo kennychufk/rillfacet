@@ -518,7 +518,12 @@ class CameraSensor(_Object):
     image (pixel centers at integers) and optional distortion ``dist``
     (OpenCV order k1 k2 p1 p2 [k3 [k4 k5 k6 [s1 s2 s3 s4]]], tilt not
     supported). The camera frame is OpenCV's too: x right, y down, z
-    forward.
+    forward. Per-instance intrinsics (domain randomization of the lens,
+    e.g. a focus-dependent calibration): ``K`` ``[instances, 3, 3]`` and
+    ``dist`` ``[instances, n]``; :attr:`per_instance_intrinsics` is then
+    True, ``K`` / ``dist`` keep that shape and :meth:`intrinsics` gives
+    one instance's. Not every renderer supports them (raster and Mitsuba
+    do).
 
     ``mount`` (a :class:`RigidMesh` or its name) and ``body`` attach the
     camera to a body: its pose is that body's pose times ``local_pose``
@@ -546,13 +551,6 @@ class CameraSensor(_Object):
                  shot_noise=0.0, read_noise=0.0):
         super().__init__(scene, name)
         self.width, self.height = int(width), int(height)
-        self.K = np.asarray(K, np.float64).reshape(3, 3)
-        d = None if dist is None else np.asarray(dist, np.float64).ravel()
-        self.dist = None if d is None or not np.any(d) else d
-        if self.dist is not None and len(self.dist) > 12 and np.any(
-                self.dist[12:]):
-            raise ValueError("CameraSensor: tilted sensors (tau_x, tau_y) "
-                             "are not supported")
         self.mount = (None if mount is None
                       else mount if isinstance(mount, str) else mount.name)
         self.body = int(body)
@@ -568,6 +566,7 @@ class CameraSensor(_Object):
         elif instances is None:
             raise ValueError("CameraSensor: give a mount or instances")
         self.instances = int(instances)
+        self._set_intrinsics(K, dist)
         self.near, self.far = float(near), float(far)
         self.local_pose = None
         self.set_local_pose(local_pose, _notify=False)
@@ -577,6 +576,34 @@ class CameraSensor(_Object):
                       focus_distance=focus_distance, gain=gain,
                       vignetting=vignetting, shot_noise=shot_noise,
                       read_noise=read_noise, _notify=False)
+
+    def _set_intrinsics(self, K, dist) -> None:
+        K = np.asarray(K, np.float64)
+        per = K.ndim == 3 or (dist is not None
+                              and np.asarray(dist).ndim == 2)
+        I = self.instances
+        if per:
+            K = np.broadcast_to(K.reshape(-1, 3, 3), (I, 3, 3)).copy()
+        else:
+            K = K.reshape(3, 3)
+        d = None if dist is None else np.asarray(dist, np.float64)
+        if d is not None:
+            d = (np.broadcast_to(d.reshape(-1, d.shape[-1]),
+                                 (I, d.shape[-1])).copy() if per
+                 else d.ravel())
+            if not np.any(d):
+                d = None
+            elif d.shape[-1] > 12 and np.any(d[..., 12:]):
+                raise ValueError("CameraSensor: tilted sensors (tau_x, "
+                                 "tau_y) are not supported")
+        self.per_instance_intrinsics = bool(per)
+        self.K, self.dist = K, d
+
+    def intrinsics(self, i=0):
+        """``(K [3, 3], dist [n] | None)`` of instance ``i``."""
+        if not self.per_instance_intrinsics:
+            return self.K, self.dist
+        return self.K[i], None if self.dist is None else self.dist[i]
 
     def set_local_pose(self, pose, _notify=True) -> None:
         """``[7]`` or ``[instances, 7]``: the camera in its mount body's

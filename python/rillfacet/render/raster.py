@@ -163,34 +163,44 @@ class _View:
 
     def __init__(self, r, cam, bits, chunk, sets, shadow_res, supersample,
                  oversample):
-        rays = PixelRays(cam.K, cam.width, cam.height, cam.dist, device="cpu")
-        if rays.max_residual > 0.05:
+        # One remap table per instance with per-instance intrinsics (the
+        # proxy is shared: it covers every instance's rays), else one.
+        n = cam.instances if cam.per_instance_intrinsics else 1
+        intr = [cam.intrinsics(i) for i in range(n)]
+        rays = [PixelRays(K, cam.width, cam.height, dist, device="cpu")
+                for K, dist in intr]
+        residual = max(ry.max_residual for ry in rays)
+        outside = max(ry.outside for ry in rays)
+        if residual > 0.05:
             warnings.warn(f"camera {cam.name!r}: undistortion residual "
-                          f"{rays.max_residual:.3f} px")
-        if rays.outside > 0:
-            warnings.warn(f"camera {cam.name!r}: {100 * rays.outside:.2f}% of "
+                          f"{residual:.3f} px")
+        if outside > 0:
+            warnings.warn(f"camera {cam.name!r}: {100 * outside:.2f}% of "
                           "the image lies beyond the distortion model's fold "
                           "(drawn with its edge rays)")
-        c = rays.corners.reshape(-1, 2).numpy()
+        c = np.concatenate([ry.corners.reshape(-1, 2).numpy() for ry in rays])
         tx, ty = float(np.abs(c[:, 0]).max()), float(np.abs(c[:, 1]).max())
         if max(tx, ty) > MAX_TAN:
             raise ValueError(
                 f"camera {cam.name!r}: its rays reach "
                 f"{np.degrees(np.arctan(max(tx, ty))):.0f} degrees off axis, "
                 "beyond what a pinhole proxy covers")
-        K = cam.K
-        self.f = float(oversample) * max(K[0, 0], K[1, 1])
+        self.f = float(oversample) * max(max(K[0, 0], K[1, 1])
+                                         for K, _ in intr)
         self.pw = 2 * int(np.ceil(self.f * tx + 1.0))
         self.ph = 2 * int(np.ceil(self.f * ty + 1.0))
         self.cx, self.cy = (self.pw - 1) / 2, (self.ph - 1) / 2
         f = self.f
-        center = rays.center.numpy()
-        remap = np.zeros((cam.width * cam.height, 8), np.float32)
-        remap[:, 0] = f * center[:, 0] + self.cx
-        remap[:, 1] = f * center[:, 1] + self.cy
-        remap[:, 2:4] = f * rays.d_du.numpy()
-        remap[:, 4:6] = f * rays.d_dv.numpy()
-        remap[:, 6] = radius2(cam.K, cam.width, cam.height).numpy().ravel()
+        P = cam.width * cam.height
+        remap = np.zeros((n * P, 8), np.float32)
+        for i, ((K, _), ry) in enumerate(zip(intr, rays)):
+            m = remap[i * P:(i + 1) * P]
+            center = ry.center.numpy()
+            m[:, 0] = f * center[:, 0] + self.cx
+            m[:, 1] = f * center[:, 1] + self.cy
+            m[:, 2:4] = f * ry.d_du.numpy()
+            m[:, 4:6] = f * ry.d_dv.numpy()
+            m[:, 6] = radius2(K, cam.width, cam.height).numpy().ravel()
         self.bits, self.chunk, self.sets = bits, chunk, sets
         self.id = r.add_view(cam.width, cam.height, self.pw, self.ph, self.f,
                              self.cx, self.cy, cam.near, cam.far, chunk, sets,
@@ -268,6 +278,10 @@ class RasterRenderer(Renderer):
         self._body_spheres = None          # [NB, 4] local center, radius
         self._renders = 0
         self._warned = set()
+
+    def reseed(self, seed=None) -> None:
+        super().reseed(seed)
+        self._renders = 0              # the noise seed of a render
 
     @property
     def info(self) -> str:
@@ -551,7 +565,7 @@ class RasterRenderer(Renderer):
         return P if self.zero_copy else P.numpy()
 
     def _view(self, cam, bits):
-        key = (cam.width, cam.height, cam.K.tobytes(),
+        key = (cam.width, cam.height, cam.instances, cam.K.tobytes(),
                None if cam.dist is None else cam.dist.tobytes(), cam.near,
                cam.far, self._nb)
         hit = self._views.get(cam.name)

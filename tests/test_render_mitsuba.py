@@ -94,6 +94,27 @@ def test_depth_is_z_depth_and_far_clips():
     assert int(out["segmentation"].max()) == -1
 
 
+
+def test_per_instance_intrinsics():
+    """Each instance projects through its own K / dist (a marker's
+    centroid lands where OpenCV puts it), shared rays stay shared."""
+    W, H = 160, 120
+    X = np.array([0.3, -0.2, 1.0]) * 2.0           # normalized (0.3, -0.2)
+    Ks = np.array([[[100.0, 0, 79.5], [0, 100.0, 59.5], [0, 0, 1]],
+                   [[120.0, 0, 85.0], [0, 118.0, 55.0], [0, 0, 1]]])
+    dists = np.array([[0.0, 0.0, 0.0, 0.0], [-0.2, 0.05, 0.001, 0.0]])
+    sc, r = setup()
+    rigid(sc, "marker", [quad(X, 0.04)], instances=2)
+    rigid(sc, "wall", [quad([0, 0, 4.0], 20.0)], instances=2)
+    sc.camera_sensor("cam", W, H, Ks, dist=dists, instances=2,
+                     local_pose=IDENTITY)
+    seg = r.render("cam", outputs=("segmentation",))["segmentation"]
+    for i in range(2):
+        xd, yd = distort(np.array(0.3), np.array(-0.2), dists[i])
+        u, v = Ks[i][0, 0] * xd + Ks[i][0, 2], Ks[i][1, 1] * yd + Ks[i][1, 2]
+        cu, cv = centroid(seg[i] == 0)
+        assert abs(cu - u) < 0.5 and abs(cv - v) < 0.5, i
+
 def two_env_scene(**kw):
     """Two instances: a floor and a cube body each, camera looking down."""
     sc, r = setup(**kw)

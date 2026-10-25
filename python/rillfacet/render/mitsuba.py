@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 import warnings
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -117,6 +118,12 @@ class MitsubaRenderer(Renderer):
         self._rays: dict = {}                  # camera name -> (key, PixelRays)
         self._denoiser = None
         self._warned_tint = set()
+
+    def reseed(self, seed=None) -> None:
+        super().reseed(seed)
+        s = self._sensor_seed if seed is None else int(seed)
+        self._gen.manual_seed(s)
+        self._seed = s * 7919
 
     # -- build ----------------------------------------------------------------
 
@@ -347,19 +354,32 @@ class MitsubaRenderer(Renderer):
     # -- rays -----------------------------------------------------------------
 
     def _pixel_rays(self, cam):
-        key = (cam.width, cam.height, cam.K.tobytes(),
+        """The camera's :class:`PixelRays`; with per-instance intrinsics an
+        object whose ``center`` / ``d_du`` / ``d_dv`` are ``[I, P, 2]``."""
+        key = (cam.width, cam.height, cam.instances, cam.K.tobytes(),
                None if cam.dist is None else cam.dist.tobytes())
         hit = self._rays.get(cam.name)
         if hit is None or hit[0] != key:
-            rays = PixelRays(cam.K, cam.width, cam.height, cam.dist,
-                             device=self.dev)
-            if rays.max_residual > 0.05:
+            n = cam.instances if cam.per_instance_intrinsics else 1
+            rays = [PixelRays(K, cam.width, cam.height, dist,
+                              device=self.dev)
+                    for K, dist in map(cam.intrinsics, range(n))]
+            residual = max(r.max_residual for r in rays)
+            outside = max(r.outside for r in rays)
+            if residual > 0.05:
                 warnings.warn(f"camera {cam.name!r}: undistortion residual "
-                              f"{rays.max_residual:.3f} px")
-            if rays.outside > 0:
-                warnings.warn(f"camera {cam.name!r}: {100 * rays.outside:.2f}"
+                              f"{residual:.3f} px")
+            if outside > 0:
+                warnings.warn(f"camera {cam.name!r}: {100 * outside:.2f}"
                               "% of the image lies beyond the distortion "
                               "model's fold (drawn with its edge rays)")
+            if n == 1:
+                rays = rays[0]
+            else:
+                torch = self.torch
+                rays = SimpleNamespace(**{
+                    a: torch.stack([getattr(r, a) for r in rays])
+                    for a in ("center", "d_du", "d_dv")})
             hit = self._rays[cam.name] = (key, rays)
         return hit[1]
 
@@ -374,13 +394,17 @@ class MitsubaRenderer(Renderer):
         torch = self.torch
         ne, P = e1 - e0, cam.width * cam.height
         shape = (ne, P, spp)
-        c = pix_rays.center[None, :, None]                   # [1, P, 1, 2]
+        def rows(t):            # [1 | ne, P, 1, 2]: shared or per instance
+            return (t[None, :, None] if t.dim() == 2
+                    else t[e0:e1, :, None])
+
+        c = rows(pix_rays.center)
         x, y = c[..., 0], c[..., 1]
         if lens:
             j = torch.rand(*shape, 2, device=self.dev,
                            generator=self._gen) - 0.5
-            du = pix_rays.d_du[None, :, None]
-            dv = pix_rays.d_dv[None, :, None]
+            du = rows(pix_rays.d_du)
+            dv = rows(pix_rays.d_dv)
             x = x + j[..., 0] * du[..., 0] + j[..., 1] * dv[..., 0]
             y = y + j[..., 0] * du[..., 1] + j[..., 1] * dv[..., 1]
         x, y = x.expand(shape), y.expand(shape)

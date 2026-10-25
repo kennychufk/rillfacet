@@ -52,6 +52,7 @@ struct RasterViewConfig {
   uint32_t shadow_res = 512;
   uint32_t outputs = kRasterRgb;
   uint32_t supersample = 2;                  // S x S radiance taps per output pixel
+  uint32_t remaps = 1;                       // remap tables: 1 shared, or one per env
 };
 
 class CameraRaster {
@@ -89,9 +90,11 @@ class CameraRaster {
   static constexpr size_t kFrameFloats = 92;
   bool set_frame(const float* f);
 
-  // A camera configuration with its own buffers. remap [height * width, 8]:
-  // proxy pixel position of each output pixel's center ray (x, y), its
-  // derivatives along output u (x, y) and v (x, y), r^2 (vignetting), 0.
+  // A camera configuration with its own buffers. remap [remaps, height *
+  // width, 8]: proxy pixel position of each output pixel's center ray (x,
+  // y), its derivatives along output u (x, y) and v (x, y), r^2
+  // (vignetting), 0. One table shared by every env (remaps = 1) or one per
+  // env (per-env intrinsics; launches then need e0 + n <= remaps).
   int add_view(const RasterViewConfig& c, const float* remap);
   void remove_view(int view);
   // Envs [e0, e0 + n) (n <= chunk) into buffer set `set`. Poses: rows of

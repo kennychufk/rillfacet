@@ -36,7 +36,7 @@ struct View {
   proxy: vec4f,           // proxy W, H, f, 0
   tiles: vec4u,           // proxy tiles per layer T, shadow tiles per layer Ts, shadow res, outputs
   chunk: vec4u,           // e0, n, bodies, material slots
-  rng: vec4u,             // seed
+  rng: vec4u,             // seed, per-env remap tables (0 / 1)
   pc: vec4f,              // proxy principal point (cx, cy)
 };
 
@@ -349,7 +349,7 @@ struct FAll { @location(0) c: vec4f, @location(1) z: f32, @location(2) s: u32 };
 struct Lens { g: vec4f, n: vec4f };   // gain rgb, vignetting; shot, read
 @group(0) @binding(10) var<storage, read> lens: array<Lens>;
 // Per output pixel: proxy position of the center ray (x, y), d/du (x, y);
-// d/dv (x, y), r^2, 0.
+// d/dv (x, y), r^2, 0. One table, or one per env (view.rng.y = 1).
 @group(0) @binding(11) var<storage, read> remap: array<vec4f>;
 @group(0) @binding(12) var proxy_rad: texture_2d_array<f32>;
 @group(0) @binding(13) var proxy_depth: texture_2d_array<f32>;
@@ -389,8 +389,9 @@ fn cs_remap(@builtin(global_invocation_id) g: vec3u) {
   let e = g.z;
   if (g.x >= W || g.y >= H || e >= view.chunk.y) { return; }
   let pix = g.y * W + g.x;
-  let m0 = remap[2u * pix];
-  let m1 = remap[2u * pix + 1u];
+  let r = pix + select(0u, (view.chunk.x + e) * W * H, view.rng.y != 0u);
+  let m0 = remap[2u * r];
+  let m1 = remap[2u * r + 1u];
   let PW = view.proxy.x;
   let PH = view.proxy.y;
   let T = view.tiles.x;

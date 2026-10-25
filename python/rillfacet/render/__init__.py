@@ -145,6 +145,15 @@ class Renderer(Backend):
                              f"below env_spacing ({self.env_spacing} m)")
         return cam
 
+    def reseed(self, seed=None) -> None:
+        """Restart the renderer's random streams (sensor noise, and the
+        backend's own sampling where it has one) from ``seed`` (default:
+        the construction seed), so a rollout re-run from the same state
+        draws the same noise."""
+        if seed is not None:
+            self._sensor_seed = int(seed)
+        self._sensor_gen = None
+
     def sensor_image(self, cam, radiance):
         """The camera's linear image from the linear ``radiance`` a backend
         rendered (``[I, H, W, 3]`` torch): gain, vignetting and sensor

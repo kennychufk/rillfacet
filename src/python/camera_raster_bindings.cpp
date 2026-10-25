@@ -103,14 +103,17 @@ void bind_camera_raster(nb::module_& m) {
                           uint32_t chunk, uint32_t sets, uint32_t shadow_res, uint32_t outputs,
                           uint32_t supersample, nb::handle remap) {
         auto a = checked<float>(remap, 2, "remap");
-        if (a.shape(0) != size_t(width) * height || a.shape(1) != 8)
-          throw std::invalid_argument("CameraRaster.add_view: remap must be [height * width, 8]");
+        const size_t P = size_t(width) * height;
+        if (a.shape(0) == 0 || a.shape(0) % P != 0 || a.shape(1) != 8)
+          throw std::invalid_argument(
+              "CameraRaster.add_view: remap must be [k * height * width, 8] (k tables)");
         RasterViewConfig c;
         c.width = width; c.height = height;
         c.proxy_width = proxy_width; c.proxy_height = proxy_height;
         c.f = f; c.cx = cx; c.cy = cy; c.near = near; c.far = far;
         c.chunk = chunk; c.sets = sets; c.shadow_res = shadow_res;
         c.outputs = outputs; c.supersample = supersample;
+        c.remaps = uint32_t(a.shape(0) / P);
         return r.add_view(c, a.data());
       }, nb::arg("width"), nb::arg("height"), nb::arg("proxy_width"), nb::arg("proxy_height"),
          nb::arg("f"), nb::arg("cx"), nb::arg("cy"), nb::arg("near"), nb::arg("far"),

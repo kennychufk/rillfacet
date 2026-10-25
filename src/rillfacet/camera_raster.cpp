@@ -509,9 +509,11 @@ int CameraRaster::add_view(const RasterViewConfig& c, const float* remap) {
     v.shadow = make_texture(dev, wgpu::TextureFormat::Depth32Float, S, v.Ts * S, v.Ls, RA, "shadow maps");
     v.shadow_v = layer_views(v.shadow, v.Ls);
   }
-  v.remap = gpu_.create_buffer(uint64_t(c.width) * c.height * 32,
-                               wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, "raster remap");
-  gpu_.queue.WriteBuffer(v.remap, 0, remap, uint64_t(c.width) * c.height * 32);
+  v.c.remaps = std::max(c.remaps, 1u);
+  const uint64_t remap_bytes = uint64_t(c.width) * c.height * 32 * v.c.remaps;
+  v.remap = gpu_.create_buffer(remap_bytes, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                               "raster remap");
+  gpu_.queue.WriteBuffer(v.remap, 0, remap, remap_bytes);
 
   v.sets.resize(v.c.sets);
   bool made = true;
@@ -583,6 +585,7 @@ bool CameraRaster::launch(int view, int set, uint32_t e0, uint32_t n, uint64_t p
   View& v = it->second;
   if (set < 0 || set >= int(v.sets.size()) || n == 0 || n > v.c.chunk || v.bodies != bodies_)
     return false;
+  if (v.c.remaps > 1 && uint64_t(e0) + n > v.c.remaps) return false;
   if (groups_dirty_) {
     for (auto& [id, w] : views_) make_groups(w);
     groups_dirty_ = false;
@@ -609,6 +612,7 @@ bool CameraRaster::launch(int view, int set, uint32_t e0, uint32_t n, uint64_t p
   U[16] = v.T; U[17] = v.Ts; U[18] = c.shadow_res; U[19] = outputs;
   U[20] = e0; U[21] = n; U[22] = v.bodies; U[23] = slots_;
   U[24] = seed;
+  U[25] = c.remaps > 1 ? 1u : 0u;   // per-env remap tables
   F[28] = c.cx; F[29] = c.cy;
   gpu_.queue.WriteBuffer(s.uniform, 0, U, sizeof(U));
 

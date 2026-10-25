@@ -157,6 +157,18 @@ def test_sensor_noise_statistics():
     assert not torch.equal(lin[1], lin[2] / 2)
 
 
+
+def test_reseed_restarts_the_noise():
+    r = RasterRenderer(seed=4)
+    plane_scene(r, I=2, shot_noise=1e-2, read_noise=1e-2)
+    a = r.render("c", outputs=("linear",))["linear"].cpu()
+    b = r.render("c", outputs=("linear",))["linear"].cpu()
+    assert not torch.equal(a, b)
+    r.reseed()
+    assert torch.equal(r.render("c", outputs=("linear",))["linear"].cpu(), a)
+    r.reseed(5)
+    assert not torch.equal(r.render("c", outputs=("linear",))["linear"].cpu(), a)
+
 def test_chunking_zero_copy_and_render_chunks_agree():
     """Double buffering and the host (no zero-copy) path are bit-identical;
     another chunk size puts envs in other atlas tiles, which may round a
@@ -198,6 +210,76 @@ def test_chunking_zero_copy_and_render_chunks_agree():
                            outs[0]["segmentation"][e0:e1].cpu())
     assert seen == [(0, 4), (4, 8), (8, 10)]
 
+
+
+def per_instance_intrinsics():
+    """Three instances' (K, dist): the shared test camera, its principal
+    point moved, its focal length 10% longer (all different distortion)."""
+    K1 = K.copy()
+    K1[0, 2] += 3.0
+    K1[1, 2] -= 2.0
+    K2 = K.copy()
+    K2[0, 0] *= 1.1
+    K2[1, 1] *= 1.1
+    return np.stack([K, K1, K2]), np.stack([DIST, 0.5 * DIST, 0.0 * DIST])
+
+
+def test_per_instance_intrinsics_match_shared_cameras():
+    """Every instance of a camera with per-instance K / dist renders as a
+    camera with that instance's K / dist for all, chunk boundaries
+    included (the shared proxy is matched with ``oversample``)."""
+    I = 3
+    Ks, dists = per_instance_intrinsics()
+    f = max(k[0, 0] for k in Ks)
+    poses = identity_poses(I, 2)
+    poses[:, 1, 0] = np.linspace(-0.2, 0.2, I)
+    outputs = ("rgb", "depth", "segmentation")
+
+    def render(K_, dist_, oversample=1.0):
+        r = RasterRenderer(chunk=2, oversample=oversample)
+        sc = Scene(r)
+        m = rigid(sc, "m", [quad(2.0, 1.0),
+                            box((0.3, 0.2, 1.5), (0.2, 0.2, 0.2))], I)
+        m.set_poses(poses)
+        sc.light("sky", "ambient", intensity=0.5)
+        sc.light("sun", "directional", direction=(0.2, 0.1, 1.0), intensity=2.0)
+        cam = sc.camera_sensor("c", W, H, K_, dist=dist_, instances=I,
+                               local_pose=IDENTITY, near=0.05, far=10.0,
+                               vignetting=0.5)
+        out = {k: v.cpu() for k, v in r.render("c", outputs=outputs).items()}
+        r.close()
+        return cam, out
+
+    cam, got = render(Ks, dists)
+    assert cam.per_instance_intrinsics and cam.K.shape == (I, 3, 3)
+    k1, d1 = cam.intrinsics(1)
+    assert np.array_equal(k1, Ks[1]) and np.array_equal(d1, dists[1])
+    for i in range(I):
+        _, want = render(Ks[i], dists[i], oversample=f / Ks[i][0, 0])
+        assert torch.equal(got["segmentation"][i], want["segmentation"][i]), i
+        for k, tol in (("rgb", 1.5 / 255), ("depth", 1e-6)):
+            diff = (got[k][i] - want[k][i]).abs()
+            assert float(diff.max()) < tol, (i, k)
+    # the instances really differ
+    assert not torch.equal(got["segmentation"][0], got["segmentation"][1])
+
+
+def test_per_instance_vignetting_follows_the_principal_point():
+    I = 3
+    Ks, _ = per_instance_intrinsics()
+    r = RasterRenderer(chunk=2)
+    sc = Scene(r)
+    m = rigid(sc, "m", [quad(50.0, 0.1)], I)      # beyond far: background only
+    m.set_poses(identity_poses(I, 1))
+    sc.light("sky", "ambient", intensity=0.4)
+    sc.camera_sensor("c", W, H, Ks, instances=I, local_pose=IDENTITY,
+                     far=10.0, vignetting=0.6)
+    lin = r.render("c", outputs=("linear",))["linear"].cpu().numpy()
+    for i in range(I):
+        fall = (1 - 0.6 * radius2(Ks[i], W, H).numpy())[..., None]
+        np.testing.assert_allclose(lin[i], 0.4 * np.broadcast_to(fall, (H, W, 3)),
+                                   rtol=2e-3, atol=1e-4)
+    assert radius2(Ks, W, H).shape == (I, H, W)
 
 def test_hidden_body_disappears():
     r = RasterRenderer()
