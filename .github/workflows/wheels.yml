@@ -65,7 +65,7 @@ jobs:
         env:
           CIBW_BUILD: "cp310-* cp311-* cp312-*"
           CIBW_ARCHS_MACOS: arm64
-          CIBW_CONFIG_SETTINGS: cmake.define.RILLFACET_WEB_DIST=${{ github.workspace }}/python/rillfacet/web/static
+          CIBW_CONFIG_SETTINGS: cmake.define.RILLFACET_WEB_DIST='${{ github.workspace }}/python/rillfacet/web/static'
           # No GPU on hosted runners: only check that the wheel imports (and has the web client).
           CIBW_TEST_COMMAND: python -c "import rillfacet, pathlib; assert (pathlib.Path(rillfacet.__file__).parent / 'web/static/index.html').is_file()"
       - uses: actions/upload-artifact@v4
@@ -100,7 +100,7 @@ jobs:
         env:
           CIBW_BUILD: "cp310-* cp311-* cp312-*"
           CIBW_ARCHS_WINDOWS: AMD64
-          CIBW_CONFIG_SETTINGS: cmake.define.RILLFACET_WEB_DIST=${{ github.workspace }}/python/rillfacet/web/static
+          CIBW_CONFIG_SETTINGS: cmake.define.RILLFACET_WEB_DIST='${{ github.workspace }}/python/rillfacet/web/static'
           CIBW_TEST_COMMAND: python -c "import rillfacet, pathlib; assert (pathlib.Path(rillfacet.__file__).parent / 'web/static/index.html').is_file()"
       - uses: actions/upload-artifact@v4
         with:
