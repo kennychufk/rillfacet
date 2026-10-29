@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Build rillfacet from scratch inside Docker, once per base image, then the web
-# client. The build context is the tracked + not-ignored files only, so nothing
-# that merely happens to sit in this working tree (third_party/, build/, a
-# stale .so) can leak in.
+# client (the wheel modes build it into the wheels). The build context is the
+# tracked + not-ignored files only, so nothing that merely happens to sit in
+# this working tree (third_party/, build/, a stale .so, a built web client)
+# can leak in.
 #   docker/verify.sh [BASE_IMAGE[+clang]...]   # default: the list below
 #   e.g. docker/verify.sh fedora:latest+clang   (+clang: Clang instead of GCC)
 #   docker/verify.sh --wheel [BASE_IMAGE...]   # instead: build the wheel, install it in a clean image, run the tests

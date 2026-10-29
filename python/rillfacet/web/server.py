@@ -367,9 +367,10 @@ class VizServer:
         if (not full.startswith(os.path.normpath(self.static_dir) + os.sep)
                 or not os.path.isfile(full)):
             if not os.path.isdir(self.static_dir):
-                return conn.respond(503, "rillfacet web client not built: run "
-                                    "`npm install && npm run build` in "
-                                    "rillfacet/web\n")
+                return conn.respond(503, "rillfacet web client not built: "
+                                    "install rillfacet with Node.js (npm) "
+                                    "available, or run `npm ci && npm run "
+                                    "build` in rillfacet/web\n")
             return conn.respond(404, "not found\n")
         with open(full, "rb") as f:
             body = f.read()

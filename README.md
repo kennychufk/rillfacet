@@ -102,7 +102,7 @@ cmake -S . -B build -G Ninja && cmake --build build
 pip install .                                # the Python wheel
 ```
 
-You need GCC 13 or newer (or Clang), CMake 3.24 or newer, Ninja and git. Full details, the complete API notes and the controls table are in [docs/REFERENCE.md](docs/REFERENCE.md).
+You need GCC 13 or newer (or Clang), CMake 3.24 or newer, Ninja and git; `pip install .` also needs Node.js 20.19+ or 22.12+ (npm builds the web client into the wheel). Full details, the complete API notes and the controls table are in [docs/REFERENCE.md](docs/REFERENCE.md).
 
 ## License
 

@@ -122,4 +122,52 @@ if(RILLFACET_BUILD_PYTHON)
     set_target_properties(_rillfacet PROPERTIES
       LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/python/rillfacet)
   endif()
+
+  # The browser client of rillfacet.web (web/, TypeScript) is not committed:
+  # npm builds it, into the wheel under scikit-build-core, else into
+  # python/rillfacet/web/static/ (skipped there without npm). A wheel needs
+  # Node.js >= 20.19 / 22.12, or RILLFACET_WEB_DIST = an already built client
+  # (docker/Dockerfile and the CI build it once for all wheels), or
+  # RILLFACET_WEB=OFF for a wheel without it (the server then answers 503).
+  option(RILLFACET_WEB "Build the web client (web/) with npm" ON)
+  set(RILLFACET_WEB_DIST "" CACHE PATH "An already built web client to ship instead of running npm")
+  if(SKBUILD)
+    set(_web_out ${CMAKE_CURRENT_BINARY_DIR}/web)
+  else()
+    set(_web_out ${CMAKE_CURRENT_SOURCE_DIR}/python/rillfacet/web/static)
+  endif()
+  if(RILLFACET_WEB_DIST)
+    file(TO_CMAKE_PATH "${RILLFACET_WEB_DIST}" _web_out)
+    if(NOT EXISTS ${_web_out}/index.html)
+      message(FATAL_ERROR "RILLFACET_WEB_DIST=${_web_out} has no index.html")
+    endif()
+  elseif(RILLFACET_WEB)
+    find_program(RILLFACET_NPM NAMES npm.cmd npm)
+    if(RILLFACET_NPM)
+      set(_web ${CMAKE_CURRENT_SOURCE_DIR}/web)
+      file(GLOB_RECURSE _web_src CONFIGURE_DEPENDS ${_web}/src/* ${_web}/public/*
+           ${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.wgsl)
+      # npm's own record of the install (node_modules/.package-lock.json) is the stamp.
+      add_custom_command(OUTPUT ${_web}/node_modules/.package-lock.json
+        COMMAND ${RILLFACET_NPM} ci --no-audit --no-fund
+        COMMAND ${CMAKE_COMMAND} -E touch ${_web}/node_modules/.package-lock.json
+        DEPENDS ${_web}/package.json ${_web}/package-lock.json
+        WORKING_DIRECTORY ${_web} VERBATIM)
+      add_custom_command(OUTPUT ${_web_out}/index.html
+        COMMAND ${RILLFACET_NPM} run build -- --outDir ${_web_out}
+        DEPENDS ${_web}/node_modules/.package-lock.json ${_web_src} ${_web}/index.html
+                ${_web}/vite.config.ts ${_web}/tsconfig.json
+        WORKING_DIRECTORY ${_web} VERBATIM)
+      add_custom_target(rillfacet_web ALL DEPENDS ${_web_out}/index.html)
+    elseif(SKBUILD)
+      message(FATAL_ERROR "npm not found: the wheel's web client (web/) needs Node.js >= 20.19 "
+                          "or >= 22.12. Or pass -C cmake.define.RILLFACET_WEB_DIST=<built client> "
+                          "or -C cmake.define.RILLFACET_WEB=OFF (no web client)")
+    else()
+      message(STATUS "rillfacet: npm not found, the web client is not built")
+    endif()
+  endif()
+  if(SKBUILD AND (RILLFACET_WEB_DIST OR TARGET rillfacet_web))
+    install(DIRECTORY ${_web_out}/ DESTINATION rillfacet/web/static)
+  endif()
 endif()

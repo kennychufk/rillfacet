@@ -28,7 +28,7 @@ Fedora (dnf):
 | Windows (GLFW, Dawn X11 surfaces) | X11 development headers | `libx11-dev libx11-xcb-dev libxcb1-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev` | `libX11-devel libxcb-devel libXrandr-devel libXinerama-devel libXcursor-devel libXi-devel` |
 | Python module | Python >= 3.10 with headers and venv | `python3-dev python3-venv` | `python3-devel` |
 | Running | a Vulkan driver (a GPU's, or Mesa's software one) | `libvulkan1 mesa-vulkan-drivers` | `vulkan-loader mesa-vulkan-drivers` |
-| Optional | `ffmpeg` (.mp4 capture), Node >= 20.19 or >= 22.12 (only to rebuild `web/`) | | |
+| Optional | `ffmpeg` (.mp4 capture), Node >= 20.19 or >= 22.12 (the web client; required by `pip install .`) | | |
 
 No OpenGL packages are needed. `docker/verify.sh` checks the whole list from
 bare images; it last passed (C++ part, Python module, 33 tests on Mesa's
@@ -375,11 +375,18 @@ select, hiding, measuring, wireframe shading, axis views and the gizmo, and
 the Display and Inspect panels. Web only: double-click shows one env alone
 (Esc: all), and the right panel lists the focused env's channels.
 
-The built client is committed under `python/rillfacet/web/static/`; rebuild it
-after editing `web/`:
+The built client is not committed (`python/rillfacet/web/static/` is
+ignored). `pip install .` / `pip wheel .` build it into the wheel with npm
+(`npm ci`, then `npm run build`; CMakeLists.txt reruns it when `web/` or
+`shaders/` change), and so does a plain CMake build with
+`-DRILLFACET_BUILD_PYTHON=ON` into `python/rillfacet/web/static/` when npm is
+on the PATH. `-DRILLFACET_WEB_DIST=DIR` ships an already built client instead
+(docker/Dockerfile and the CI build it once for all their wheels; with pip:
+`-C cmake.define.RILLFACET_WEB_DIST=DIR`), `-DRILLFACET_WEB=OFF` builds
+without it (the server then answers 503). By hand, for `PYTHONPATH=python`:
 
 ```bash
-cd web && npm install && npm run build     # typecheck + bundle into the package
+cd web && npm ci && npm run build          # typecheck + bundle into python/rillfacet/web/static
 npm run dev                                # dev server, proxies /ws to :8080
 ```
 
