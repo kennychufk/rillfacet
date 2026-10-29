@@ -163,6 +163,15 @@ bodies = sc.rigid_mesh("bodies", local_verts, vertex_body, tris, body_tri_offset
 bodies.set_poses(poses)                 # [4, B, 7] translation + xyzw quaternion
 ```
 
+Every object has display DEFAULTS, `obj.set_display(visible=, opacity=)`:
+the native viewer's Structures list and the web Display panel (a Visible box
+and an Opacity slider per object) start from them and the user changes them
+there.
+They are part of the snapshot (`attrs["display"]`, left out when default),
+not per-frame state, so an overlay that is only sometimes wanted is created
+hidden and costs nothing on screen until ticked. A rigid mesh's segment
+colors changed after creation are streamed (and recorded) with its poses.
+
 Camera rendering (`rillfacet.render`, for vision RL and synthetic data): a
 scene also carries what viewers ignore. Rigid meshes take `normals`, `uvs`,
 `materials` (`Material`: glTF's PBR metallic-roughness, optional base color

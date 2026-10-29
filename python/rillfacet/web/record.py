@@ -44,7 +44,7 @@ _CHUNK = 512
 #: left out of the stored snapshot) and the updates that log the initial
 #: dynamic state.
 _DYNAMIC = {"rigid_mesh": ("poses",), "labels": ("values",)}
-_INITIAL = {"rigid_mesh": ("poses",), "boxes": ("boxes",),
+_INITIAL = {"rigid_mesh": ("poses", "colors"), "boxes": ("boxes",),
             "labels": ("values",), "points": ("points",),
             "polyline": ("points",)}
 
@@ -166,7 +166,8 @@ class Recorder(Backend):
     # -- Backend ------------------------------------------------------------
 
     def update(self, obj, what: str) -> None:
-        if not self.active:
+        # Display defaults are in the snapshot, not per-frame state.
+        if not self.active or what == "display":
             return
         n = obj.name
         if isinstance(obj, RigidMesh):

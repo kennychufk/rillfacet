@@ -160,6 +160,10 @@ def build_scene(scene, snapshot: dict) -> None:
                          color=at["color"], align=at["align"],
                          world_height=at["world_height"],
                          size_px=at["size_px"])
+        else:
+            continue
+        if at.get("display"):
+            scene.objects[n].set_display(**at["display"])
     if snapshot.get("camera"):
         scene.look_at(*snapshot["camera"])
 
@@ -174,6 +178,8 @@ def set_state(scene, record, t: int) -> None:
     for name, o in scene.objects.items():
         if o.kind == "rigid_mesh" and (name, "poses") in at:
             o.set_poses(at[(name, "poses")])
+            if (name, "segment_colors") in at:
+                o.set_segment_colors(at[(name, "segment_colors")])
         elif o.kind == "boxes" and (name, "lo") in at:
             o.set_boxes(at[(name, "lo")], at[(name, "hi")],
                         colors=at.get((name, "colors")))

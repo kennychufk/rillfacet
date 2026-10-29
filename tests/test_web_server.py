@@ -142,6 +142,33 @@ def test_cuda_poses_are_streamed(server):
         assert f["objects"]["bodies"]["poses"][1, 0, 2] == 42
 
 
+def test_recolors_and_display_are_streamed(server):
+    stream = server.stream("overlay")
+    backend = StreamBackend(stream)
+    sc, rm = make_scene(backend)
+    rm.set_display(visible=False, opacity=0.25)
+    with connect(f"ws://127.0.0.1:{server.port}/ws") as ws:
+        recv(ws)
+        ws.send(json.dumps(dict(type="subscribe", stream="overlay",
+                                rate=1000)))
+        while not backend.wanted():
+            time.sleep(0.01)
+        backend.commit(sc, time=0)
+        scene = recv(ws)
+        objs = {o["name"]: o for o in scene["objects"]}
+        assert objs["bodies"]["attrs"]["display"] == {"visible": False,
+                                                      "opacity": 0.25}
+        f = recv(ws)
+        assert "segment_colors" not in f["objects"]["bodies"]   # unchanged
+        ws.send(json.dumps(dict(type="ack", stream="overlay", seq=f["seq"])))
+        rm.set_segment_color(1, (1, 0, 0))
+        while not backend.wanted():
+            time.sleep(0.01)
+        backend.commit(sc, time=1)
+        f = recv(ws)
+        assert f["objects"]["bodies"]["segment_colors"][1].tolist() == [1, 0, 0]
+
+
 def test_port_in_use_moves_on(server):
     other = VizServer("127.0.0.1", server.port, verbose=False)
     try:

@@ -85,6 +85,24 @@ def test_recorder_tracks_initial_state_and_updates():
     assert not rec._tracks
 
 
+def test_recorder_tracks_recolors_and_ignores_display():
+    sc, rm, bars, lab, rec = scene_with_recorder()
+    rm.set_display(visible=False)
+    rec.start(sc, t=0)
+    rec.tick(2)
+    rm.set_segment_colors([(1, 0, 0), (0.5, 0.5, 0.5), (0, 1, 0),
+                           (0.5, 0.5, 0.5)])
+    rm.set_display(opacity=0.5)                # not a track
+    bars.set_display(opacity=0.5)              # nor a boxes update
+    r = rec.finish()
+    t, c = r.track("bodies", "segment_colors")  # initial + the recolor
+    assert t.tolist() == [0, 2] and c[1, 0].tolist() == [1, 0, 0]
+    assert r.track("bars", "lo")[0].tolist() == [0]
+    assert not any(f == "display" for _, f in r.tracks)
+    objs = {o["name"]: o for o in r.snapshot["objects"]}
+    assert objs["bodies"]["attrs"]["display"] == {"visible": False}
+
+
 def test_recorder_copies_cuda_tensors():
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():

@@ -169,6 +169,31 @@ def test_native_boxes_points_labels(v):
     assert "dots" not in v.scene.names
 
 
+def test_display_defaults_in_snapshot_and_native(v):
+    rec = Recorder()
+    sc = Scene(NativeBackend(v), rec)
+    verts, body, tris, offs = two_boxes()
+    ghost = sc.rigid_mesh("ghost", verts, body, tris, offs)
+    sc.boxes("bars", [[0, 0, 0]], [[1, 1, 1]])
+    ghost.set_display(visible=False, opacity=0.3)
+    assert ("update", "ghost", "display") in rec.calls
+    m = v.scene.get("ghost")
+    assert not m.visible and m.opacity == pytest.approx(0.3)
+    assert v.scene.get("bars").visible
+    objs = {o["name"]: o for o in sc.snapshot()["objects"]}
+    assert objs["ghost"]["attrs"]["display"] == {"visible": False,
+                                                 "opacity": 0.3}
+    assert "display" not in objs["bars"]["attrs"]    # defaults: left out
+    # A late native viewer starts from the defaults too.
+    v.scene.clear()
+    sc2 = Scene()
+    sc2.rigid_mesh("ghost", verts, body, tris, offs).set_display(
+        visible=False)
+    sc2.add_backend(NativeBackend(v))
+    assert not v.scene.get("ghost").visible
+    assert v.frame()
+
+
 def test_materials_per_instance():
     verts, body, tris, off = two_boxes()
     mats = [viz_mat("blue", (0, 0, 1)), viz_mat("grey", (0.5, 0.5, 0.5), 0.3)]

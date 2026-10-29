@@ -105,9 +105,9 @@ export function applyStyleDefaults(s: DisplaySettings, style: StyleName) {
   s.outline = d[1];
 }
 
-// Per-object display (Structure::opacity / sliced, QuantityStructure::metallic / roughness).
-export interface ObjectDisplay { opacity: number; sliced: boolean; metallic: number; roughness: number }
-const defaultDisplay = (): ObjectDisplay => ({ opacity: 1, sliced: true, metallic: 0, roughness: 0.45 });
+// Per-object display (Structure::visible / opacity / sliced, QuantityStructure::metallic / roughness).
+export interface ObjectDisplay { visible: boolean; opacity: number; sliced: boolean; metallic: number; roughness: number }
+const defaultDisplay = (): ObjectDisplay => ({ visible: true, opacity: 1, sliced: true, metallic: 0, roughness: 0.45 });
 
 const SUN_DIR: Vec3 = [0.25, -0.35, 1.0];
 export const GROUND = 0;
@@ -194,6 +194,9 @@ export class Renderer {
   settings = defaultSettings();
   // Per scene object, by name (kept across scenes, like a viewer's settings).
   display = new Map<string, ObjectDisplay>();
+  // The scene's display defaults per object (attrs.display: visible,
+  // opacity), what a new or reset ObjectDisplay starts from.
+  private displayDefaults = new Map<string, Partial<ObjectDisplay>>();
   overlay: Overlay = { lines: [], labels: [] };
   private frame = new Float32Array(F.size);
   private frameBuf: GPUBuffer;
@@ -425,7 +428,7 @@ export class Renderer {
 
   displayOf(name: string): ObjectDisplay {
     let d = this.display.get(name);
-    if (!d) this.display.set(name, (d = defaultDisplay()));
+    if (!d) this.display.set(name, (d = { ...defaultDisplay(), ...this.displayDefaults.get(name) }));
     return d;
   }
 
@@ -434,6 +437,8 @@ export class Renderer {
     this.isolated = -1;
     this.selection.clear();
     for (const o of objects) {
+      if (o.attrs?.display) this.displayDefaults.set(o.name, o.attrs.display);
+      else this.displayDefaults.delete(o.name);
       if (o.kind === "rigid_mesh") this.objects.set(o.name, this.makeRigid(o));
       else if (o.kind === "boxes" || o.kind === "points") {
         const id = this.nextId++;
@@ -786,7 +791,8 @@ export class Renderer {
         hi[k] = Math.max(hi[k], p[i + k]);
       }
     };
-    for (const o of this.objects.values()) {
+    for (const [name, o] of this.objects) {
+      if (o.kind !== "labels" && !this.shown(name)) continue;
       if (o.kind === "rigid") {
         const b = this.boundsOf(o);
         if (b && Number.isFinite(b.lo[0])) {
@@ -903,6 +909,11 @@ export class Renderer {
 
   private transparent(name: string) {
     return this.displayOf(name).opacity < 0.999;
+  }
+
+  // Shown at all (the object's Visible box in the Display panel).
+  shown(name: string) {
+    return this.displayOf(name).visible !== false;
   }
 
   // -- overlays -----------------------------------------------------------
@@ -1035,7 +1046,7 @@ export class Renderer {
     const all = which === "Wire" || (which === "Pre" && this.wireMode);
     const wantSeeThrough = which === "Transparent";
     for (const [name, g] of this.objects) {
-      if (g.kind === "labels") continue;
+      if (g.kind === "labels" || !this.shown(name)) continue;
       if (!all && this.transparent(name) !== wantSeeThrough) continue;
       this.drawOne(pass, g, which);
     }
@@ -1069,7 +1080,7 @@ export class Renderer {
     const nLines = lineItems.length / 16;
     if (nLines > this.lineCap) this.lineBuf = this.storageBuffer("line", Math.max(nLines, 2 * this.lineCap));
     if (nLines) this.device.queue.writeBuffer(this.lineBuf, 0, new Float32Array(lineItems));
-    const seeThrough = !wire && [...this.objects].some(([n, o]) => o.kind !== "labels" && this.transparent(n));
+    const seeThrough = !wire && [...this.objects].some(([n, o]) => o.kind !== "labels" && this.shown(n) && this.transparent(n));
     const ground = S.grid || S.groundShadow;
 
     const dev = this.device;

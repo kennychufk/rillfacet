@@ -552,12 +552,24 @@ class StreamBackend(Backend):
     def __init__(self, stream: Stream):
         self.stream = stream
         self._structure_dirty = True
+        # Rigid meshes whose segment colors changed after creation: their
+        # colors ride along in every frame from then on (a frame may be
+        # dropped, the latest one is what a client gets).
+        self._recolored: set = set()
 
     def create(self, obj) -> None:
         self._structure_dirty = True
+        self._recolored.discard(obj.name)
+
+    def update(self, obj, what: str) -> None:
+        if isinstance(obj, RigidMesh) and what == "colors":
+            self._recolored.add(obj.name)
+        elif what == "display":
+            self._structure_dirty = True
 
     def remove(self, name: str) -> None:
         self._structure_dirty = True
+        self._recolored.discard(name)
 
     def look_at(self, eye, target) -> None:
         self._structure_dirty = True
@@ -587,6 +599,8 @@ class StreamBackend(Backend):
                 if o.poses is not None:
                     f["poses"] = _host_copy(o.poses)
                     cuda |= hasattr(f["poses"], "is_pinned")
+                if o.name in self._recolored:
+                    f["segment_colors"] = o.segment_colors.copy()
             elif isinstance(o, Boxes):
                 f.update(lo=o.lo.copy(), hi=o.hi.copy())
                 if o.colors is not None:

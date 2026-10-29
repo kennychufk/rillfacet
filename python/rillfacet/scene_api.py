@@ -19,6 +19,12 @@ The scene is split by how often things change, so streaming stays cheap:
 Handles keep their latest state, so a backend attached later (a browser
 connecting mid-run) can be sent the whole scene.
 
+Every object also carries DISPLAY DEFAULTS (:meth:`_Object.set_display`:
+shown or hidden, opacity) that viewers start from; the user changes them in
+the viewer (the native Structures list, the web Display panel), so they are
+a starting point, not state that is streamed or recorded per frame. An
+overlay that is only sometimes wanted is created hidden.
+
 For camera rendering (``rillfacet.render``) a scene also carries what a
 viewer ignores: PBR materials on rigid meshes (per instance, for domain
 randomization), :class:`Light` s and :class:`CameraSensor` s mounted on
@@ -117,9 +123,30 @@ class _Object:
 
     def __init__(self, scene: "Scene", name: str):
         self.scene, self.name = scene, name
+        self.visible, self.opacity = True, 1.0
 
     def _changed(self, what: str) -> None:
         self.scene._update(self, what)
+
+    def set_display(self, *, visible=None, opacity=None) -> None:
+        """Display defaults: shown (``visible``) and ``opacity`` (0..1, below
+        1 is see-through). Viewers start from them and let the user change
+        them; they are part of the object's snapshot, not of its per-frame
+        state."""
+        if visible is not None:
+            self.visible = bool(visible)
+        if opacity is not None:
+            self.opacity = float(opacity)
+        self._changed("display")
+
+    def display(self) -> dict | None:
+        """The non-default display defaults, or None (snapshot attrs)."""
+        d = {}
+        if not self.visible:
+            d["visible"] = False
+        if self.opacity != 1.0:
+            d["opacity"] = self.opacity
+        return d or None
 
     def state(self) -> tuple:
         """``(attrs, arrays)``: everything needed to rebuild this object,
@@ -284,6 +311,12 @@ class RigidMesh(_Object):
 
     def set_segment_color(self, segment: int, rgb) -> None:
         self.segment_colors[int(segment)] = _rgb(rgb)
+        self._changed("colors")
+
+    def set_segment_colors(self, colors) -> None:
+        """Every segment's color at once, ``[num_segments, 3]`` (one update
+        for a recolor of many segments)."""
+        self.segment_colors[:] = _host(colors).reshape(-1, 3)
         self._changed("colors")
 
     def set_segment_visible(self, segment: int, on: bool) -> None:
@@ -685,8 +718,8 @@ class Backend:
     """What a scene sends its changes to. ``create`` gets a new object,
     ``update`` the object and what changed ("poses", "colors",
     "visibility", "materials", "boxes", "points", "values", "texts",
-    "light", "pose", "lens"), ``remove`` its name. Backends skip the
-    object kinds they do not draw. ``draw_overlay`` is called once per
+    "light", "pose", "lens", "display"), ``remove`` its name. Backends skip
+    the object kinds they do not draw. ``draw_overlay`` is called once per
     frame with every label set (immediate-mode viewers rebuild text each
     frame)."""
 
@@ -727,6 +760,9 @@ class Scene:
         objs = []
         for o in self.objects.values():
             attrs, arrays = o.state()
+            disp = o.display()
+            if disp is not None:
+                attrs = dict(attrs, display=disp)
             objs.append(dict(kind=o.kind, name=o.name, attrs=attrs,
                              arrays=arrays))
         return dict(objects=objs, camera=self.camera,
@@ -809,9 +845,10 @@ class Scene:
 class NativeBackend(Backend):
     """Mirrors a :class:`Scene` into an ``rillfacet.Viewer``: rigid meshes
     and boxes become segmented surface meshes, points and polylines point
-    clouds and curves, labels overlay text. :meth:`structure` returns the
-    viewer structure behind an object for native-only features (picking,
-    the inspector)."""
+    clouds and curves, labels overlay text. Display defaults
+    (:meth:`_Object.set_display`) set the structures' visible / opacity.
+    :meth:`structure` returns the viewer structure behind an object for
+    native-only features (picking, the inspector)."""
 
     def __init__(self, viewer):
         from . import _rillfacet as native
@@ -858,10 +895,19 @@ class NativeBackend(Backend):
             c = sc.add_curves(obj.name)
             c.set_polyline(obj.points, obj.closed)
             c.color, c.radius = obj.color, obj.radius
+        self._display(obj)
+
+    def _display(self, obj) -> None:
+        s = self.structure(obj.name)
+        if s is not None and hasattr(s, "visible"):
+            s.visible, s.opacity = obj.visible, obj.opacity
 
     def update(self, obj, what: str) -> None:
         s = self.structure(obj.name)
         if s is None:
+            return
+        if what == "display":
+            self._display(obj)
             return
         if isinstance(obj, RigidMesh):
             if what == "poses":

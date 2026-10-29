@@ -1,8 +1,8 @@
 // The Display popover, the web counterpart of the native viewer's Display
 // window (ui.cpp display_panel): shading (Solid / Wireframe) with the wire
 // options, style and its knobs, shadows, ambient occlusion, outlines,
-// exposure, grid, the slice plane, and per object
-// opacity (see-through), "cut by the slice plane" and, in Environment PBR,
+// exposure, grid, the slice plane, and per object visibility, opacity
+// (see-through), "cut by the slice plane" and, in Environment PBR,
 // metallic / roughness. Settings are remembered in this browser.
 import { ENVIRONMENTS, MATCAPS, matcapDefaultTint } from "./environment";
 import { applyStyleDefaults, defaultSettings, type DisplaySettings, type ObjectDisplay, type Renderer,
@@ -269,6 +269,7 @@ export class DisplayPanel {
       const box = document.createElement("div");
       box.className = "d-object";
       box.append(Object.assign(document.createElement("div"), { className: "d-name", textContent: name }));
+      box.append(this.check("Visible", () => d.visible, (v) => (d.visible = v)));
       box.append(this.slider("Opacity", () => d.opacity, (v) => (d.opacity = v), 0.05, 1));
       if (sl.enabled) box.append(this.check("Cut by the slice plane", () => d.sliced, (v) => (d.sliced = v)));
       if (s.style === "pbr") {
