@@ -3,6 +3,7 @@
 //   vs_shadow                     depth tile per env from the first directional light
 //   vs_main + fs_rgb/fs_geo/fs_all  the env's pinhole proxy (radiance, z-depth, label)
 //   cs_remap                      proxy -> distorted output + background + sensor
+//                                 (background: the env's panorama, else the sky)
 // Instances are body * n + env (n = envs in the chunk); env e's tile is row
 // e % T of layer e / T. SEG_FORMAT / SEG_NONE are substituted at load
 // (r16uint / 0xffffu, or r32uint / 0xffffffffu). Solid (3D) textures:
@@ -346,8 +347,12 @@ struct FAll { @location(0) c: vec4f, @location(1) z: f32, @location(2) s: u32 };
 
 // ---- remap (compute) --------------------------------------------------------
 
-struct Lens { g: vec4f, n: vec4f };   // gain rgb, vignetting; shot, read
+// Gain rgb, vignetting; shot, read; background panorama layer (-1 = none),
+// its yaw, intensity.
+struct Lens { g: vec4f, n: vec4f, b: vec4f };
 @group(0) @binding(10) var<storage, read> lens: array<Lens>;
+// Background panoramas (equirect, the envmap mapping), seen only.
+@group(0) @binding(21) var bg_tex: texture_2d_array<f32>;
 // Per output pixel: proxy position of the center ray (x, y), d/du (x, y);
 // d/dv (x, y), r^2, 0. One table, or one per env (view.rng.y = 1).
 @group(0) @binding(11) var<storage, read> remap: array<vec4f>;
@@ -358,6 +363,18 @@ struct Lens { g: vec4f, n: vec4f };   // gain rgb, vignetting; shot, read
 @group(0) @binding(16) var out_lin: texture_storage_2d_array<rgba16float, write>;
 @group(0) @binding(17) var out_depth: texture_storage_2d_array<r32float, write>;
 @group(0) @binding(18) var out_seg: texture_storage_2d_array<SEG_FORMAT, write>;
+
+// Panorama b.x rotated by yaw b.y about +z, times b.z, at the mip level of
+// a pixel spanning `footprint` radians (a texel spans 2 pi / width).
+fn panorama(d: vec3f, b: vec4f, footprint: f32) -> vec3f {
+  let c = cos(b.y);
+  let s = sin(b.y);
+  let d0 = vec3f(c * d.x + s * d.y, -s * d.x + c * d.y, d.z);
+  let w = f32(textureDimensions(bg_tex, 0).x);
+  let top = f32(textureNumLevels(bg_tex)) - 1.0;
+  let lod = clamp(log2(max(footprint, 1e-12) * w / (2.0 * PI)), 0.0, top);
+  return textureSampleLevel(bg_tex, clamp_lin, env_uv(d0), i32(b.x), lod).rgb * b.z;
+}
 
 fn pcg(v: u32) -> u32 {
   let s = v * 747796405u + 2891336453u;
@@ -420,8 +437,16 @@ fn cs_remap(@builtin(global_invocation_id) g: vec3u) {
     let env = view.chunk.x + e;
     let cq = textureLoad(poses, vec2u(2u * view.chunk.z + 1u, e), 0);
     let ray = vec3f((m0.xy - view.pc.xy) / view.proxy.z, 1.0);
-    let L = acc.rgb + (1.0 - acc.a) * background(qrot(cq, normalize(ray)));
+    let d = qrot(cq, normalize(ray));
     let ln = lens[env];
+    var bg: vec3f;
+    if (ln.b.x >= 0.0) {
+      // the output pixel's size on the image plane (z = 1)
+      bg = panorama(d, ln.b, max(length(m0.zw), length(m1.xy)) / view.proxy.z);
+    } else {
+      bg = background(d);
+    }
+    let L = acc.rgb + (1.0 - acc.a) * bg;
     var x = ln.g.rgb * (1.0 - ln.g.w * m1.z) * L;
     if (ln.n.x > 0.0 || ln.n.y > 0.0) {
       let v = ln.n.x * max(x, vec3f(0.0)) + ln.n.y * ln.n.y;

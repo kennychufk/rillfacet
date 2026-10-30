@@ -174,6 +174,7 @@ CameraRaster::CameraRaster(bool zero_copy) {
   wgpu::Extent3D one{1, 1, 1};
   gpu_.queue.WriteTexture(&dst, white, 4, &lay, &one);
   env_tex_ = make_texture(dev, wgpu::TextureFormat::RGBA16Float, 1, 1, 1, TB, "raster env");
+  bg_tex_ = make_texture(dev, wgpu::TextureFormat::RGBA16Float, 1, 1, 1, TB, "raster background");
   brdf_lut_ = make_texture(dev, wgpu::TextureFormat::RGBA16Float, 1, 1, 1, TB, "raster brdf lut");
   dummy_rad_ = make_texture(dev, wgpu::TextureFormat::RGBA16Float, 1, 1, 1, TB, "dummy");
   dummy_depth_ = make_texture(dev, wgpu::TextureFormat::R32Float, 1, 1, 1, TB, "dummy");
@@ -188,7 +189,8 @@ CameraRaster::CameraRaster(bool zero_copy) {
   std::vector<float> zero(kFrameFloats, 0.0f);
   gpu_.queue.WriteBuffer(frame_, 0, zero.data(), kFrameFloats * 4);
   mats_ = gpu_.create_buffer(32, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, "raster mats");
-  lens_ = gpu_.create_buffer(32, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, "raster lens");
+  lens_ = gpu_.create_buffer(kLensFloats * 4, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+                             "raster lens");
   solid_ = gpu_.create_buffer(128, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
                               "raster solid textures");
   ok_ = make_pipelines();
@@ -246,7 +248,7 @@ bool CameraRaster::make_pipelines() {
       {2, V::Compute, Entry::UnfTex}, {8, V::Compute, Entry::Tex}, {9, V::Compute, Entry::Filt},
       {10, V::Compute, Entry::Storage}, {11, V::Compute, Entry::Storage},
       {12, V::Compute, Entry::Tex, A}, {13, V::Compute, Entry::UnfTex, A},
-      {14, V::Compute, Entry::UintTex, A},
+      {14, V::Compute, Entry::UintTex, A}, {21, V::Compute, Entry::Tex, A},
       {15, V::Compute, Entry::StoreTex, A, kOutFormats[0]},
       {16, V::Compute, Entry::StoreTex, A, kOutFormats[1]},
       {17, V::Compute, Entry::StoreTex, A, kOutFormats[2]},
@@ -381,6 +383,27 @@ bool CameraRaster::set_envmap(uint32_t w, uint32_t h, const std::vector<const ui
   return true;
 }
 
+bool CameraRaster::set_background(uint32_t w, uint32_t h, uint32_t layers,
+                                  const std::vector<const uint16_t*>& mips) {
+  if (!w || !h || !layers || mips.empty()) return false;
+  bg_tex_ = make_texture(gpu_.device, wgpu::TextureFormat::RGBA16Float, w, h, layers,
+                         wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+                         "raster background", uint32_t(mips.size()));
+  for (uint32_t k = 0; k < mips.size(); ++k) {
+    uint32_t mw = std::max(w >> k, 1u), mh = std::max(h >> k, 1u);
+    wgpu::TexelCopyTextureInfo dst{};
+    dst.texture = bg_tex_;
+    dst.mipLevel = k;
+    wgpu::TexelCopyBufferLayout lay{};
+    lay.bytesPerRow = mw * 8;
+    lay.rowsPerImage = mh;
+    wgpu::Extent3D ex{mw, mh, layers};
+    gpu_.queue.WriteTexture(&dst, mips[k], uint64_t(mw) * mh * 8 * layers, &lay, &ex);
+  }
+  groups_dirty_ = true;
+  return true;
+}
+
 bool CameraRaster::set_brdf_lut(uint32_t n, const uint16_t* data) {
   if (!n) return false;
   brdf_lut_ = make_texture(gpu_.device, wgpu::TextureFormat::RGBA16Float, n, n, 1,
@@ -423,7 +446,7 @@ bool CameraRaster::set_solid_textures(const float* rows, uint32_t n) {
 }
 
 bool CameraRaster::set_lens(const float* l, uint32_t envs) {
-  uint64_t size = uint64_t(envs) * 32;
+  uint64_t size = uint64_t(envs) * kLensFloats * 4;
   if (size > lens_size_) {
     lens_ = gpu_.create_buffer(size, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, "raster lens");
     lens_size_ = size;
@@ -567,7 +590,7 @@ void CameraRaster::make_groups(View& v) {
         smp(9, clamp_), buf(10, lens_), buf(11, v.remap),
         tex(12, array_view(v.rad ? v.rad : dummy_rad_)),
         tex(13, array_view(v.depth ? v.depth : dummy_depth_)),
-        tex(14, array_view(v.seg ? v.seg : dummy_seg_))};
+        tex(14, array_view(v.seg ? v.seg : dummy_seg_)), tex(21, array_view(bg_tex_))};
     for (int k = 0; k < 4; ++k)
       cpt.push_back(tex(15 + k, array_view(s.out[k].tex ? s.out[k].tex : dummy_out_[k])));
     d.layout = compute_layout_;

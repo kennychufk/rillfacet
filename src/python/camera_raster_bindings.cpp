@@ -72,6 +72,18 @@ void bind_camera_raster(nb::module_& m) {
         if (keep.empty()) return false;
         return r.set_envmap(uint32_t(keep[0].shape(1)), uint32_t(keep[0].shape(0)), ptrs);
       })
+      .def("set_background", [](CameraRaster& r, nb::list mips) {
+        std::vector<Arr<uint16_t>> keep;   // [layers, h, w, 4] float16 bits per level
+        std::vector<const uint16_t*> ptrs;
+        keep.reserve(mips.size());
+        for (nb::handle h : mips) {
+          keep.push_back(checked<uint16_t>(h, 4, "background mip"));
+          ptrs.push_back(keep.back().data());
+        }
+        if (keep.empty()) return false;
+        return r.set_background(uint32_t(keep[0].shape(2)), uint32_t(keep[0].shape(1)),
+                                uint32_t(keep[0].shape(0)), ptrs);
+      })
       .def("set_brdf_lut", [](CameraRaster& r, nb::handle lut) {
         auto a = checked<uint16_t>(lut, 3, "brdf lut (float16 bits)");
         if (a.shape(0) != a.shape(1) || a.shape(2) != 4)
@@ -89,6 +101,8 @@ void bind_camera_raster(nb::module_& m) {
       })
       .def("set_lens", [](CameraRaster& r, nb::handle l) {
         auto a = checked<float>(l, 2, "lens");
+        if (size_t(a.shape(1)) != CameraRaster::kLensFloats)
+          throw std::invalid_argument("CameraRaster.set_lens: [envs, LENS_FLOATS]");
         return r.set_lens(a.data(), uint32_t(a.shape(0)));
       })
       .def("set_frame", [](CameraRaster& r, nb::handle f) {
@@ -98,6 +112,7 @@ void bind_camera_raster(nb::module_& m) {
         return r.set_frame(a.data());
       })
       .def_prop_ro_static("FRAME_FLOATS", [](nb::object) { return CameraRaster::kFrameFloats; })
+      .def_prop_ro_static("LENS_FLOATS", [](nb::object) { return CameraRaster::kLensFloats; })
       .def("add_view", [](CameraRaster& r, uint32_t width, uint32_t height, uint32_t proxy_width,
                           uint32_t proxy_height, float f, float cx, float cy, float near, float far,
                           uint32_t chunk, uint32_t sets, uint32_t shadow_res, uint32_t outputs,

@@ -200,7 +200,23 @@ shades one point per pixel, where Mitsuba averages over its samples); the
 Cycles backend (`rillfacet-cycles`) runs an OSL port, unfiltered as
 Mitsuba (OptiX and CPU only; Cycles has no OSL on CUDA).
 `scene.light(...)` adds lights shared by all envs (`directional`,
-`ambient`, `envmap`); `scene.camera_sensor(...)` adds a camera per env with
+`ambient`, `envmap`). `scene.background(name, images, instances=E)` gives
+each env its own panorama, SEEN ONLY (it lights nothing; the lights do):
+a pool of equirect images `[N, H, W, 3]` (linear, HDR; the envmap's z-up
+mapping) and per env `index` (-1 = none: the lights' background), `yaw`
+and `intensity`, changed by `set(...)` at the cost of a buffer write
+(e.g. a new draw per episode). Raster, Mitsuba and Cycles show it where a
+camera ray hits nothing within `far`, mip-filtered to the pixel's size
+(`render.background_mips`, the same chain everywhere): raster looks it up
+in its remap pass (a texture array), Mitsuba replaces the samples whose
+ray `ray_test` misses, Cycles renders that env's beauty pass with a
+transparent film and adds `(1 - alpha)` times the panorama after its
+resample (`render.BackgroundLookup` in torch for both). `rillfacet.sky`
+makes such pools procedurally (`random_skies(rng, n, height)`: a
+horizon-to-zenith gradient, a sun disk and halo, fractal-noise clouds on a
+plane, a skyline of hills or blocks, a ground; palettes day, overcast,
+dusk and surreal; integer-hash noise, the same image on any device;
+tests/test_sky.py). `scene.camera_sensor(...)` adds a camera per env with
 OpenCV intrinsics and distortion (`K`, `dist`; camera frame x right, y down,
 z forward), mounted on a body (`mount`, `body`, `local_pose`), with
 per-env lens and sensor values (`aperture_radius`, `focus_distance` for
@@ -285,8 +301,8 @@ layered atlas by instanced draws (instance = body * n + env) posed in the
 vertex shader from a pose texture, and kept in its tile by clip distances.
 Each env renders a centered pinhole proxy (as the Cycles backend), which a
 compute pass resamples through the exact OpenCV distortion (`supersample`
-x `supersample` taps), adding the background (the ambient light, the
-envmap) and the shared sensor stage (same model, its own GPU random
+x `supersample` taps), adding the background (the env's panorama, else
+the ambient light and the envmap) and the shared sensor stage (same model, its own GPU random
 numbers, drawn per env so images do not depend on the chunking). Shading is
 forward with Mitsuba's principled BRDF (Burley diffuse, GGX with separable
 Smith masking; base color textures times the per-env color; solid
@@ -477,10 +493,12 @@ shaders/
   camera_raster.wgsl (+ common/noise.wgsl, common/solid_texture.wgsl)   RasterRenderer
 src/python/module.cpp   nanobind module `_rillfacet` (+ `rillfacet.imgui`)
 python/rillfacet/        Python package
-  scene_api.py          backend-neutral scene (+ materials, lights, camera sensors)
+  scene_api.py          backend-neutral scene (+ materials, lights, backgrounds,
+                        camera sensors)
   assets.py             glTF / OBJ visual meshes, merge_bodies
   solid_texture.py      procedural solid (3D) textures: parameter rows, sampler,
                         noise + families (Dr.Jit / torch), torch reference
+  sky.py                procedural sky panoramas (background pools)
   render/               camera renderers: camera.py (OpenCV model), sensor.py
                         (gain, vignetting, noise), mitsuba.py
                         (+ _mitsuba_solid_texture.py plugins), raster.py

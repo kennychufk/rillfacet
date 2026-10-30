@@ -23,6 +23,11 @@ How it maps the scene onto Mitsuba, and why:
   Mitsuba's integrator then does the light transport.
 - Lights are shared by all envs: an env's own point light would be picked
   by the light sampling of every other env, wasting samples.
+- A :class:`~rillfacet.scene_api.Background` (per-env panoramas, seen
+  only) is resolved in torch: samples whose camera ray hits nothing
+  (``ray_test``, within ``far``) take their env's panorama
+  (:class:`~rillfacet.render.BackgroundLookup`) instead of the emitters'
+  radiance, which a miss returns; the emitters still light the scene.
 
 Large batches are rendered in chunks of at most ``max_samples`` samples.
 """
@@ -493,6 +498,11 @@ class MitsubaRenderer(Renderer):
         torch, mi = self.torch, self.mi
         I, W, H = cam.instances, cam.width, cam.height
         imgs = []
+        if (self.background is not None
+                and self.background.instances != I):
+            raise ValueError(f"camera {cam.name!r} has {I} instances, "
+                             f"background {self.background.name!r} "
+                             f"{self.background.instances}")
         for e0, e1 in self._chunks(I, H * W * spp):
             o, d, maxt, _ = self._make_rays(cam, pix_rays, *pose, e0, e1, spp,
                                             lens=True)
@@ -502,11 +512,38 @@ class MitsubaRenderer(Renderer):
             L, _, _ = self._integrator.sample(self._scene, self._sampler, ray)
             rgb = torch.stack([L[i].torch() for i in range(3)], -1)
             rgb = torch.nan_to_num(rgb, nan=0.0, posinf=0.0, neginf=0.0)
+            if self.background is not None:
+                rgb = self._with_background(cam, pix_rays, ray, d, rgb,
+                                            e0, e1, spp)
             imgs.append(rgb.view(e1 - e0, H, W, spp, 3).mean(3))
         img = torch.cat(imgs)
         if self.denoise:
             img = self._denoise(img)
         return img
+
+    def _with_background(self, cam, pix_rays, ray, d, rgb, e0, e1, spp):
+        """``rgb`` ``[n]`` samples with the camera misses replaced by their
+        env's panorama (envs with index -1 keep the emitters' radiance)."""
+        torch, mi = self.torch, self.mi
+        import drjit as dr
+        hit = self._scene.ray_test(ray)
+        miss = mi.Float(dr.select(hit, 0.0, 1.0)).torch() > 0.5
+        ne, P = e1 - e0, cam.width * cam.height
+        env = torch.arange(e0, e1, device=self.dev)[:, None, None].expand(
+            ne, P, spp).reshape(-1)
+        fp = torch.maximum(pix_rays.d_du.norm(dim=-1),
+                           pix_rays.d_dv.norm(dim=-1))      # [P] | [I, P]
+        fp = (fp[None] if fp.dim() == 1 else fp[e0:e1])[..., None]
+        fp = fp.expand(ne, P, spp).reshape(-1)
+        idx = torch.nonzero(miss).squeeze(1)
+        if not len(idx):
+            return rgb
+        dirs = torch.stack([a[idx] for a in d], -1)
+        bg, has = self.background_radiance(cam, env[idx], dirs, fp[idx],
+                                           self.dev)
+        rgb = rgb.clone()
+        rgb[idx[has]] = bg[has]
+        return rgb
 
     def _denoise(self, img):
         mi = self.mi

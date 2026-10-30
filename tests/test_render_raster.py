@@ -454,6 +454,151 @@ def test_envmap_matches_mitsuba(tmp_path):
     np.testing.assert_allclose(res[0], res[1], atol=0.02)
 
 
+def _panoramas(n=3, h=32, w=64):
+    """Smooth test panoramas: hue by azimuth and elevation, one per layer."""
+    u = (np.arange(w) + 0.5) / w
+    v = (np.arange(h) + 0.5) / h
+    imgs = np.zeros((n, h, w, 3), np.float32)
+    for k in range(n):
+        imgs[k, ..., 0] = 0.2 + 0.6 * (0.5 + 0.5 * np.cos(2 * np.pi * u))[None]
+        imgs[k, ..., 1] = (0.1 + 0.8 * v)[:, None]
+        imgs[k, ..., 2] = 0.3 * (k + 1)
+    return imgs
+
+
+def _background_reference(R, cam_poses, bg, I):
+    """What the torch lookup (Mitsuba / Cycles path) gives for each pixel's
+    center ray, [I, H, W, 3]."""
+    from rillfacet.render.camera import PixelRays
+    r = PixelRays(K, W, H, None, device="cpu")
+    c = r.center.reshape(-1, 2)
+    d_cam = torch.cat([c, torch.ones(len(c), 1)], 1)
+    d_cam = d_cam / d_cam.norm(dim=1, keepdim=True)
+    fp = torch.maximum(r.d_du.norm(dim=-1), r.d_dv.norm(dim=-1)).reshape(-1)
+    out = []
+    for i in range(I):
+        Rm = torch.as_tensor(_quat_mat(cam_poses[i, 3:]), dtype=torch.float32)
+        d = d_cam @ Rm.T
+        env = torch.full((len(d),), i, dtype=torch.long)
+        rad, has = R.background_radiance(None, env, d, fp, "cpu")
+        out.append(rad.reshape(H, W, 3).numpy() if bool(has.all()) else None)
+    return out
+
+
+def _erode(m, n=2):
+    """``m`` shrunk by ``n`` pixels (and off the image border)."""
+    for _ in range(n):
+        p = np.pad(m, 1, constant_values=False)
+        m = m & p[:-2, 1:-1] & p[2:, 1:-1] & p[1:-1, :-2] & p[1:-1, 2:]
+    return m
+
+
+def _clear_sky(seg):
+    """Pixels that miss, away from any hit (edge pixels blend the two; the
+    image border may blend geometry just outside it)."""
+    return _erode(seg < 0)
+
+
+def test_background_panoramas_per_env():
+    """Each env sees its own panorama (index, yaw, intensity) where nothing
+    is hit; index -1 shows the ambient sky; geometry covers it."""
+    from rillfacet.render.camera import look_at
+    I = 4
+    r = RasterRenderer(chunk=3)
+    sc = Scene(r)
+    m = rigid(sc, "m", [box((0.0, 0.0, 2.0), (0.2, 0.2, 0.2))], I)
+    m.set_poses(identity_poses(I, 1))
+    sc.light("sky", "ambient", intensity=0.25)
+    poses = np.stack([look_at((0, 0, 0), (0, 0, 1), up=(0, -1, 0)),
+                      look_at((0, 0, 0), (0.6, 0.3, 1), up=(0, 0, 1)),
+                      look_at((0, 0, 0), (0, 0, 1), up=(0, -1, 0)),
+                      look_at((0, 0, 0), (-1, 0.2, 0.1), up=(0, 0, 1))])
+    sc.camera_sensor("c", W, H, K, instances=I, local_pose=poses, far=10)
+    bg = sc.background("bg", _panoramas(), instances=I,
+                       index=[0, 2, -1, 1], yaw=[0.0, 1.0, 0.0, -2.5],
+                       intensity=[1.0, 2.0, 1.0, 0.5])
+    out = r.render("c", outputs=("linear", "segmentation"))
+    lin = out["linear"].cpu().numpy()
+    seg = out["segmentation"].cpu().numpy()
+    ref = _background_reference(r, poses, bg, I)
+    for i in range(I):
+        miss = _clear_sky(seg[i])
+        assert miss.mean() > 0.3
+        if ref[i] is None:                         # index -1: the sky
+            np.testing.assert_allclose(lin[i][miss], 0.25, rtol=2e-3)
+        else:
+            np.testing.assert_allclose(lin[i][miss], ref[i][miss], rtol=2e-2,
+                                       atol=2e-3)
+    assert np.all(seg[0][H // 2 - 2:H // 2 + 2, W // 2 - 2:W // 2 + 2] == 0)
+    # a new draw for a few envs is a parameter write
+    bg.set(index=[1, 2, 0, 1], yaw=bg.yaw + 0.5)
+    lin2 = r.render("c", outputs=("linear",))["linear"].cpu().numpy()
+    ref2 = _background_reference(r, poses, bg, I)
+    miss = _clear_sky(seg[2])
+    np.testing.assert_allclose(lin2[2][miss], ref2[2][miss], rtol=2e-2, atol=2e-3)
+    miss = _clear_sky(seg[0])
+    assert not np.allclose(lin2[0][miss], lin[0][miss], atol=1e-2)
+
+
+def test_background_matches_mitsuba():
+    """Raster and Mitsuba agree on each env's panorama (mapping, yaw,
+    intensity, index -1 = the emitters), and Mitsuba keeps it out of the
+    lighting."""
+    from rillfacet.render.camera import look_at
+    I = 3
+    poses = np.stack([look_at((0, 0, 0), (0, 0, 1), up=(0, -1, 0)),
+                      look_at((0, 0, 0), (0.6, 0.3, 1), up=(0, 0, 1)),
+                      look_at((0, 0, 0), (-1, 0.2, 0.1), up=(0, 0, 1))])
+    res = []
+    for R in (RasterRenderer(), _mitsuba()):
+        sc = Scene(R)
+        m = rigid(sc, "m", [box((0.0, 0.0, 2.0), (0.2, 0.2, 0.2))], I)
+        m.set_poses(identity_poses(I, 1))
+        sc.light("sky", "ambient", intensity=0.25)
+        sc.camera_sensor("c", W, H, K, dist=DIST, instances=I, local_pose=poses,
+                         far=10)
+        bg = sc.background("bg", _panoramas(), instances=I, index=[1, 2, -1],
+                           yaw=[0.3, 1.0, 0.0], intensity=[1.0, 2.0, 1.0])
+        out = R.render("c", outputs=("linear", "segmentation"))
+        res.append({k: v.float().cpu().numpy() for k, v in out.items()})
+        # the panoramas light nothing: the box's inside is as without them
+        inside = _erode(res[-1]["segmentation"][0] == 0)
+        assert inside.sum() > 20
+        bg.set(index=-1)
+        plain = R.render("c", outputs=("linear",))["linear"][0].float().cpu().numpy()
+        np.testing.assert_allclose(res[-1]["linear"][0][inside].mean(0),
+                                   plain[inside].mean(0), rtol=0.02)
+    for i in range(I):
+        sky = _clear_sky(res[0]["segmentation"][i]) & _clear_sky(
+            res[1]["segmentation"][i])
+        assert sky.mean() > 0.3
+        np.testing.assert_allclose(res[0]["linear"][i][sky],
+                                   res[1]["linear"][i][sky], rtol=0.03, atol=3e-3)
+
+
+def test_background_mips_follow_the_pixel_size():
+    """A fine checker panorama averages to its mean through the mip chain at
+    a coarse camera (no aliasing), and stays sharp at a fine one."""
+    h, w = 256, 512
+    ck = ((np.arange(h)[:, None] // 2 + np.arange(w)[None] // 2) % 2).astype(np.float32)
+    img = np.repeat(ck[None, ..., None], 3, -1) * 0.8          # [1, h, w, 3]
+    stats = []
+    for f in (12.0, 400.0):
+        r = RasterRenderer(supersample=1)
+        sc = Scene(r)
+        m = rigid(sc, "m", [quad(100.0, 0.01)], 1)
+        m.set_poses(identity_poses(1, 1))
+        sc.light("sky", "ambient", intensity=0.0)
+        sc.camera_sensor("c", W, H, [[f, 0, 31.5], [0, f, 23.5], [0, 0, 1]], instances=1,
+                         local_pose=look_at((0, 0, 0), (1, 0.3, 0.2)), far=10)
+        sc.background("bg", img, instances=1)
+        lin = r.render("c", outputs=("linear",))["linear"][0].cpu().numpy()
+        stats.append((lin.mean(), lin.std()))
+    (mc, sc_), (mf, sf) = stats
+    assert abs(mc - 0.4) < 0.03 and sc_ < 0.03
+    assert sf > 0.25
+
+
 # ---- solid (3D) textures ----------------------------------------------------
 
 #: 1 cm pixels on the plane at z = 2 (finer than the patterns' detail).

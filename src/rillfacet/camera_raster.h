@@ -11,7 +11,8 @@
 //   2. main passes: a centered PINHOLE proxy per env (forward PBR: linear
 //      radiance, camera z-depth, body label);
 //   3. a compute pass resamples each proxy through the OpenCV distortion
-//      (precomputed remap), adds the background, applies the camera sensor
+//      (precomputed remap), adds the background (the env's panorama, or
+//      the ambient light and the envmap), applies the camera sensor
 //      (gain, vignetting, shot / read noise) and writes the outputs: sRGB
 //      RGBA8, linear RGBA16F, z-depth R32F, label R16Uint (R32Uint without
 //      TextureFormatsTier1).
@@ -75,6 +76,11 @@ class CameraRaster {
   // Equirectangular environment, linear RGBA16F (raw half bits), w x h at
   // level 0, halved per level.
   bool set_envmap(uint32_t w, uint32_t h, const std::vector<const uint16_t*>& mips);
+  // Background panoramas (seen where the camera sees nothing), `layers`
+  // equirectangular images, linear RGBA16F (raw half bits), w x h at level
+  // 0, halved per level; mips[k] holds level k of every layer (layer-major).
+  bool set_background(uint32_t w, uint32_t h, uint32_t layers,
+                      const std::vector<const uint16_t*>& mips);
   // Directional albedo of the BRDF, n x n (n_dot_v along x, roughness along
   // y), RGBA16F half bits: GGX scale and bias (F0 * x + y), Burley diffuse.
   bool set_brdf_lut(uint32_t n, const uint16_t* data);
@@ -84,7 +90,10 @@ class CameraRaster {
   // [n, 32]: solid (3D) texture parameter rows (rillfacet.solid_texture's
   // layout, linear colors; the last float 1 = filter by the footprint).
   bool set_solid_textures(const float* rows, uint32_t n);
-  // [envs, 8]: gain rgb, vignetting, shot noise, read noise, 0, 0.
+  // [envs, kLensFloats]: gain rgb, vignetting, shot noise, read noise, 0,
+  // 0, background layer (-1 = none: the ambient light and the envmap), its
+  // yaw (rad), its intensity, 0.
+  static constexpr size_t kLensFloats = 12;
   bool set_lens(const float* l, uint32_t envs);
   // The frame uniform (lights, shadow box, environment), kFrameFloats floats.
   static constexpr size_t kFrameFloats = 92;
@@ -154,7 +163,7 @@ class CameraRaster {
   uint64_t mats_size_ = 0, lens_size_ = 0, solid_size_ = 128;
   std::vector<uint32_t> first_index_, index_count_;
   uint32_t bodies_ = 0;
-  wgpu::Texture base_tex_, env_tex_, brdf_lut_;
+  wgpu::Texture base_tex_, env_tex_, bg_tex_, brdf_lut_;
   wgpu::Sampler cmp_, repeat_, clamp_;
   wgpu::Texture dummy_out_[4], dummy_rad_, dummy_depth_, dummy_seg_, dummy_shadow_;
   bool groups_dirty_ = true, shadows_ = false;

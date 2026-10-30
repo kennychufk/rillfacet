@@ -27,8 +27,8 @@ overlay that is only sometimes wanted is created hidden.
 
 For camera rendering (``rillfacet.render``) a scene also carries what a
 viewer ignores: PBR materials on rigid meshes (per instance, for domain
-randomization), :class:`Light` s and :class:`CameraSensor` s mounted on
-bodies.
+randomization), :class:`Light` s, a :class:`Background` (per-instance
+panoramas the cameras see) and :class:`CameraSensor` s mounted on bodies.
 
 Poses are ``[..., 7]`` = translation xyz + quaternion xyzw. Arrays may be
 numpy or torch (CUDA ok); they are converted where a backend needs host data.
@@ -40,7 +40,7 @@ import numpy as np
 
 __all__ = ["Scene", "Backend", "NativeBackend", "RigidMesh", "Boxes",
            "Points", "Polyline", "Labels", "Material", "Light",
-           "CameraSensor", "box_mesh", "skin", "compose", "as_scene"]
+           "Background", "CameraSensor", "box_mesh", "skin", "compose", "as_scene"]
 
 
 def _host(a, dtype=np.float32) -> np.ndarray:
@@ -544,6 +544,69 @@ class Light(_Object):
                      envmap=self.envmap), {})
 
 
+class Background(_Object):
+    """Per-instance panoramas that the cameras SEE where they see no
+    geometry: SEEN ONLY, they light nothing (the :class:`Light` s still do,
+    shared by every instance), so a backend just looks them up for the
+    camera rays that miss.
+
+    ``images``: a pool of ``N`` equirectangular panoramas ``[N, H, W, 3]``
+    (linear RGB, HDR allowed; numpy or torch), z-up with
+    :class:`Light`'s envmap mapping (e.g. :func:`rillfacet.sky.sky_images`).
+    Each instance shows panorama :attr:`index` (``-1`` = none: the lights'
+    background, the ambient color and the envmap, as without a
+    background), rotated by :attr:`yaw` (radians, counterclockwise about +z
+    seen from above: a feature at azimuth ``a`` in the image is seen at
+    ``a + yaw``) and scaled by :attr:`intensity`. :meth:`set` changes them
+    per instance at the cost of a small buffer write, e.g. a new draw for
+    the envs that start an episode; new images mean a new background
+    (``scene.background`` with the same name). One background per scene."""
+    kind = "background"
+
+    def __init__(self, scene, name, images, *, instances=1, index=None,
+                 yaw=None, intensity=None):
+        super().__init__(scene, name)
+        imgs = _host(images)
+        if imgs.ndim != 4 or imgs.shape[-1] != 3:
+            raise ValueError("Background: images must be [N, H, W, 3]")
+        self.images = np.ascontiguousarray(imgs)
+        self.instances = int(instances)
+        I = self.instances
+        self.index = np.zeros(I, np.int32)
+        self.yaw = np.zeros(I, np.float32)
+        self.intensity = np.ones(I, np.float32)
+        self._assign(index, yaw, intensity)
+
+    @property
+    def num_images(self) -> int:
+        return len(self.images)
+
+    def _assign(self, index, yaw, intensity):
+        I = self.instances
+        if index is not None:
+            index = np.broadcast_to(np.asarray(index, np.int32), (I,))
+            if np.any(index >= self.num_images) or np.any(index < -1):
+                raise ValueError("Background: index out of range")
+            self.index = index.copy()
+        if yaw is not None:
+            self.yaw = np.broadcast_to(_host(yaw), (I,)).copy()
+        if intensity is not None:
+            self.intensity = np.broadcast_to(_host(intensity), (I,)).copy()
+
+    def set(self, *, index=None, yaw=None, intensity=None) -> None:
+        """Per-instance panorama ``index`` ``[instances]`` (-1 = none),
+        ``yaw`` and ``intensity`` (each broadcast; None keeps the current
+        values). Write a slice of the attributes and pass them back to
+        change a few instances."""
+        self._assign(index, yaw, intensity)
+        self._changed("background")
+
+    def state(self):
+        return (dict(instances=self.instances),
+                dict(images=self.images.astype(np.float16), index=self.index,
+                     yaw=self.yaw, intensity=self.intensity))
+
+
 class CameraSensor(_Object):
     """A camera (an image sensor, not the viewer's camera) per instance.
 
@@ -718,7 +781,8 @@ class Backend:
     """What a scene sends its changes to. ``create`` gets a new object,
     ``update`` the object and what changed ("poses", "colors",
     "visibility", "materials", "boxes", "points", "values", "texts",
-    "light", "pose", "lens", "display"), ``remove`` its name. Backends skip
+    "light", "background", "pose", "lens", "display"), ``remove`` its
+    name. Backends skip
     the object kinds they do not draw. ``draw_overlay`` is called once per
     frame with every label set (immediate-mode viewers rebuild text each
     frame)."""
@@ -813,6 +877,9 @@ class Scene:
 
     def light(self, name, type="directional", **kw) -> Light:
         return self._add(Light(self, name, type, **kw))
+
+    def background(self, name, images, **kw) -> Background:
+        return self._add(Background(self, name, images, **kw))
 
     def camera_sensor(self, name, width, height, K, **kw) -> CameraSensor:
         return self._add(CameraSensor(self, name, width, height, K, **kw))

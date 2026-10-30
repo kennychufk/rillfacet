@@ -15,8 +15,10 @@ on the GPU) a frame never waits on the CPU. How it maps the scene, and why
 - Each env renders a centered PINHOLE proxy of its camera, which a compute
   pass resamples through the exact OpenCV distortion (``supersample`` x
   ``supersample`` taps per output pixel; the same proxy and remap as the
-  Cycles backend), then adds the background (the ambient light and the
-  envmap, seen directly), applies the shared sensor stage (gain,
+  Cycles backend), then adds the background (the env's
+  :class:`~rillfacet.scene_api.Background` panorama, mip-filtered to the
+  pixel's size, or else the ambient light and the envmap, seen
+  directly), applies the shared sensor stage (gain,
   vignetting, shot and read noise; :mod:`rillfacet.render.sensor`'s model,
   with its own GPU random numbers) and writes the outputs.
 - Shading: forward PBR with Mitsuba's principled BRDF (Burley diffuse,
@@ -50,7 +52,7 @@ import zlib
 
 import numpy as np
 
-from . import Renderer, srgb_to_linear
+from . import Renderer, background_mips, srgb_to_linear
 from .camera import PixelRays
 from .sensor import radius2
 
@@ -475,9 +477,24 @@ class RasterRenderer(Renderer):
 
     # -- per-render state -------------------------------------------------------
 
+    def _upload_background(self):
+        bg = self.background
+        if bg is not None:
+            mips = []
+            for m in background_mips(bg.images):
+                rgba = np.concatenate([m, np.ones(m.shape[:3] + (1,),
+                                                  np.float32)], -1)
+                mips.append(rgba.astype(np.float16).view(np.uint16))
+            if not self._r.set_background(mips):
+                raise RuntimeError("RasterRenderer: cannot upload the "
+                                   "background panoramas")
+        self._background_dirty = False
+
     def _sync(self, cam):
         if self._structure_dirty:
             self._build()
+        if self._background_dirty:
+            self._upload_background()
         if self._dirty_appearance:
             self._write_materials(cam.instances)
             self._dirty_appearance.clear()
@@ -495,11 +512,23 @@ class RasterRenderer(Renderer):
                 F[23] = 2 * r + ext         # casters anywhere in the scene
             F[7] = 1.5 * 2 * F[11] / max(self.shadow_resolution, 1)  # bias (m)
         self._r.set_frame(F)
-        lens = np.zeros((cam.instances, 8), np.float32)
+        from .. import _rillfacet
+        lens = np.zeros((cam.instances, _rillfacet.CameraRaster.LENS_FLOATS),
+                        np.float32)
         lens[:, :3] = cam.gain
         lens[:, 3] = cam.vignetting
         lens[:, 4] = cam.shot_noise
         lens[:, 5] = cam.read_noise
+        lens[:, 8] = -1.0
+        bg = self.background
+        if bg is not None:
+            if bg.instances != cam.instances:
+                raise ValueError(f"camera {cam.name!r} has {cam.instances} "
+                                 f"instances, background {bg.name!r} "
+                                 f"{bg.instances}")
+            lens[:, 8] = bg.index
+            lens[:, 9] = bg.yaw
+            lens[:, 10] = bg.intensity
         self._r.set_lens(lens)
 
     def _write_materials(self, I):
