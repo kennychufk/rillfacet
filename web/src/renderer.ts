@@ -182,7 +182,6 @@ interface LabelSet {
 type Gpu = RigidGpu | DynGpu | LabelSet;
 type Geometry = RigidGpu | DynGpu;
 
-const VF = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
 const PARAMS_SIZE = 32; // Params in rigid.wgsl / dynamic.wgsl
 
 // Extra overlay items drawn this frame (Overlay in overlay.h): line items
@@ -240,6 +239,9 @@ export class Renderer {
 
     // -- bind-group layouts (renderer.cpp's make_layout calls) --
     const L = (entries: GPUBindGroupLayoutEntry[]) => dev.createBindGroupLayout({ entries });
+    // Not module-level: GPUShaderStage is undefined outside a secure context,
+    // and reading it at load would crash before create() can say why.
+    const VF = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
     const ubo = (b: number): GPUBindGroupLayoutEntry => ({ binding: b, visibility: VF, buffer: { type: "uniform" } });
     const ro = (b: number, visibility = VF): GPUBindGroupLayoutEntry => ({ binding: b, visibility, buffer: { type: "read-only-storage" } });
     const vro = (b: number) => ro(b, GPUShaderStage.VERTEX);
@@ -368,6 +370,13 @@ export class Renderer {
   }
 
   static async create(canvas: HTMLCanvasElement): Promise<Renderer> {
+    if (!window.isSecureContext) {
+      throw new Error(`WebGPU needs a secure context, and ${location.origin} is not one. ` +
+        "Open the viewer through http://localhost (an SSH tunnel from another machine: " +
+        "ssh -L <port>:localhost:<port> <host>), serve it over HTTPS, or allowlist this origin " +
+        "in the browser (Firefox: dom.securecontext.allowlist in about:config; Chrome: " +
+        "chrome://flags/#unsafely-treat-insecure-origin-as-secure).");
+    }
     if (!navigator.gpu) throw new Error("WebGPU is not available in this browser");
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) throw new Error("no WebGPU adapter (is hardware acceleration on?)");
