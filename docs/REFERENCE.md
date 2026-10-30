@@ -391,6 +391,16 @@ the producer:
 python -m rillfacet.web.replay RUN_DIR      # RUN_DIR or its evals/ directory
 ```
 
+HTTPS: WebGPU needs a secure context, which plain http is only on
+`localhost` (the client says so instead of starting). To open the viewer
+from other machines, give the server a PEM certificate and key:
+`VizServer(ssl_cert=, ssl_key=)`, or the environment variables
+`RILLFACET_WEB_CERT` / `RILLFACET_WEB_KEY` so every script using the server
+(and `rillfacet.web.replay`) serves https + wss on the same port without a
+flag; `ssl_cert=""` keeps it http. The browsers must trust the certificate:
+a private CA whose `ca.crt` is imported on each client, its name
+constraints limited to the hosts it signs for, is one way.
+
 The browser renders like the native viewer: the same WGSL (the shared
 `shaders/common`, all four styles, SSAO, grid, composite, overlays, SDF
 text) and the same viewport, so everything under Controls below applies,

@@ -39,6 +39,12 @@ they can ask the producing process for its latest training episodes. A
 replay is read, encoded and sent off the caller's thread, its pose chunks
 paced by the client's acks (at most :data:`REPLAY_WINDOW` in flight).
 See :mod:`rillfacet.web.protocol` for the messages.
+
+HTTPS: WebGPU only runs in a secure context, which plain http is only on
+localhost. To open the viewer from other machines, give the server a
+certificate (``ssl_cert=`` / ``ssl_key=``, PEM files, or the environment
+variables :data:`CERT_ENV` / :data:`KEY_ENV`, so every script using the
+server picks it up); it then serves https and wss on the same port.
 """
 from __future__ import annotations
 
@@ -48,6 +54,7 @@ import logging
 import mimetypes
 import os
 import socket
+import ssl
 import threading
 import time
 
@@ -55,6 +62,10 @@ import numpy as np
 
 from ..scene_api import Backend, Boxes, Labels, Points, Polyline, RigidMesh
 from .protocol import VERSION, encode
+
+#: Environment variables naming the PEM certificate (chain) and private key
+#: used when ``VizServer`` is not given ``ssl_cert`` / ``ssl_key``.
+CERT_ENV, KEY_ENV = "RILLFACET_WEB_CERT", "RILLFACET_WEB_KEY"
 
 __all__ = ["VizServer", "Stream", "StreamBackend", "ACK_TIMEOUT",
            "REPLAY_WINDOW"]
@@ -208,13 +219,29 @@ class VizServer:
     ``port + 20`` is used; :attr:`url` tells which. ``evals`` is a records
     directory (:class:`~.replay.EvalLibrary`) to offer for replay; set
     :attr:`ring` to a :class:`~.replay.RingMailbox` to offer the producer's
-    in-memory episodes."""
+    in-memory episodes. ``ssl_cert`` (PEM, the key may be in it too) and
+    ``ssl_key`` serve https / wss instead; they default to the environment
+    variables :data:`CERT_ENV` / :data:`KEY_ENV`, and ``ssl_cert=""`` turns
+    TLS off whatever the environment says."""
 
     def __init__(self, host: str = "0.0.0.0", port: int = 8080, *,
                  name: str = "", static_dir: str | None = None,
-                 evals: str | None = None, verbose: bool = True):
+                 evals: str | None = None, verbose: bool = True,
+                 ssl_cert: str | None = None, ssl_key: str | None = None):
         from .replay import EvalLibrary
         self.host, self.name = host, name
+        if ssl_cert is None:
+            ssl_cert = os.environ.get(CERT_ENV, "")
+            ssl_key = ssl_key or os.environ.get(KEY_ENV) or None
+        self._ssl = None
+        if ssl_cert:
+            # Built here, not on the server thread, so a bad path or key
+            # raises in the caller instead of reading as a taken port.
+            self._ssl = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            self._ssl.load_cert_chain(ssl_cert, ssl_key)
+        elif ssl_key:
+            raise ValueError(f"rillfacet web: a key without a certificate "
+                             f"(set ssl_cert or {CERT_ENV})")
         self.static_dir = static_dir or STATIC_DIR
         self.evals = EvalLibrary(evals) if evals else None
         self._evals_dirty = False
@@ -249,7 +276,7 @@ class VizServer:
     @property
     def url(self) -> str:
         host = socket.gethostname() if self.host in ("0.0.0.0", "") else self.host
-        return f"http://{host}:{self.port}/"
+        return f"{'https' if self._ssl else 'http'}://{host}:{self.port}/"
 
     def accept(self, *kinds: str) -> None:
         """Queue browser requests of these types for :meth:`take_requests`
@@ -323,6 +350,7 @@ class VizServer:
                 self._server = await serve(
                     self._handler, self.host, port,
                     process_request=self._http, compression=None,
+                    ssl=self._ssl,
                     max_size=1 << 20, logger=log)
             except OSError as e:
                 self._error = e

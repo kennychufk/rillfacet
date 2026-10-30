@@ -5,6 +5,9 @@ Python WebSocket client.
 """
 
 import json
+import shutil
+import ssl
+import subprocess
 import time
 import urllib.request
 
@@ -13,7 +16,7 @@ import pytest
 
 from rillfacet.scene_api import Scene, box_mesh
 from rillfacet.web.protocol import decode, encode
-from rillfacet.web.server import StreamBackend, VizServer
+from rillfacet.web.server import CERT_ENV, KEY_ENV, StreamBackend, VizServer
 
 websockets = pytest.importorskip("websockets")
 from websockets.sync.client import connect  # noqa: E402
@@ -34,6 +37,13 @@ def test_protocol_roundtrip_alignment_and_casts():
     assert out["nested"]["b"][0].shape == (2, 3) and out["nested"]["b"][1] == 7
     assert out["c"].tolist() == [1, 0] and out["i"].dtype == np.int32
     assert out["s"].shape == (0,)
+
+
+@pytest.fixture(autouse=True)
+def _no_tls_env(monkeypatch):
+    # A certificate in the environment would turn these servers https.
+    monkeypatch.delenv(CERT_ENV, raising=False)
+    monkeypatch.delenv(KEY_ENV, raising=False)
 
 
 def make_scene(backend):
@@ -333,3 +343,34 @@ def test_requests_events_and_stream_info(server):
         recv(ws)                                     # frame
         server.event("eval done", "info")
         assert recv(ws) == {"type": "event", "level": "info", "text": "eval done"}
+
+
+@pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl")
+def test_tls_from_the_environment(tmp_path, monkeypatch):
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt",
+                    "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1",
+                    "-keyout", str(key), "-out", str(cert), "-subj", "/CN=localhost",
+                    "-addext", "subjectAltName=IP:127.0.0.1"],
+                   check=True, capture_output=True)
+    (tmp_path / "index.html").write_text("<html>tls</html>")
+    monkeypatch.setenv(CERT_ENV, str(cert))
+    monkeypatch.setenv(KEY_ENV, str(key))
+    srv = VizServer("127.0.0.1", 18800, static_dir=str(tmp_path), verbose=False)
+    try:
+        assert srv.url.startswith("https://")
+        ctx = ssl.create_default_context(cafile=str(cert))
+        with urllib.request.urlopen(f"https://127.0.0.1:{srv.port}/", context=ctx) as r:
+            assert r.read() == b"<html>tls</html>"
+        with connect(f"wss://127.0.0.1:{srv.port}/ws", ssl=ctx) as ws:
+            assert recv(ws)["type"] == "hello"
+    finally:
+        srv.close()
+    off = VizServer("127.0.0.1", 18800, static_dir=str(tmp_path), verbose=False,
+                    ssl_cert="")                      # explicit off beats the env
+    try:
+        assert off.url.startswith("http://")
+    finally:
+        off.close()
+    with pytest.raises(FileNotFoundError):            # in the caller, not a port skip
+        VizServer("127.0.0.1", 18800, ssl_cert=str(tmp_path / "missing.pem"))
