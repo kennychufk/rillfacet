@@ -58,6 +58,8 @@ tools = ["pillow", "matplotlib"]
 torch = ["torch"]
 # Camera rendering with Mitsuba 3 (rillfacet.render.mitsuba; needs CUDA).
 mitsuba = ["mitsuba>=3.9", "torch", "pillow"]
+# Camera images in the web viewer and in records (rillfacet.web.images).
+images = ["pillow"]
 # Embedded / image-file textures of rillfacet.assets meshes.
 assets = ["pillow"]
 

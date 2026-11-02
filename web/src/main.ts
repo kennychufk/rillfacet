@@ -6,7 +6,10 @@
 // viewer's (interaction.ts: Blender-style navigation, vertex / edge / face /
 // body selection, measuring, wireframe shading); the selected element's env
 // is the panel's focus. Double-click an env to show it alone (Esc: all).
+// The cameras switch shows a scene's Images (cameras.ts) in every mode; off,
+// the server sends this client none.
 import "./style.css";
+import { CameraPanel, imagesInfo, type ImagesInfo } from "./cameras";
 import { LiveHistory, Panel, type SeriesSource, type StreamStats } from "./panel";
 import { type Arr, decode } from "./protocol";
 import { applyStyleDefaults, defaultSettings, Renderer, type SceneObject } from "./renderer";
@@ -14,7 +17,7 @@ import { type Vec3 } from "./math";
 import { Interaction } from "./interaction";
 import { Inspector } from "./inspector";
 import { Hud } from "./hud";
-import { envOutcome, OUTCOMES, Replay, type ChunkMsg, type ReplayMsg } from "./replay";
+import { envOutcome, OUTCOMES, Replay, type ChunkMsg, type ImagesMsg, type ReplayMsg } from "./replay";
 import { type EvalEntry, type Mode, Timeline } from "./timeline";
 import { DisplayPanel } from "./display";
 
@@ -31,10 +34,13 @@ const envSel = $<HTMLSelectElement>("envs");
 const rateSel = $<HTMLSelectElement>("rate");
 const saveBtn = $<HTMLButtonElement>("save");
 const evalBtn = $<HTMLButtonElement>("eval");
+const camsBox = $<HTMLInputElement>("cams");
+const evalSetSel = $<HTMLSelectElement>("evalset");
+const cameras = new CameraPanel($("cameras"));
 
-const stats: StreamStats & { mode: Mode; replay: unknown; focus: number; isolated: number } = {
+const stats: StreamStats & { mode: Mode; replay: unknown; focus: number; isolated: number; cameras: CameraPanel } = {
   status: "connecting", name: "", time: null, frames: 0, dropped: 0, fps: 0, lastFrameAt: 0,
-  mode: "live", replay: null, focus: -1, isolated: -1,
+  mode: "live", replay: null, focus: -1, isolated: -1, cameras,
 };
 // For automated checks (e.g. a CDP screenshot harness), with console errors.
 (window as unknown as { __rillfacet: unknown }).__rillfacet = stats;
@@ -75,6 +81,13 @@ const history = new LiveHistory();
 let replay: Replay | null = null;
 let replayRequests = 0; // the server numbers replays per connection, in order
 let lastPanel = 0;
+let camsOn = false;
+let camsInfo: ImagesInfo | null = null; // of the scene on screen
+let camsAvailable = false; // live or a replay has images: the switch shows
+let decoding = 0; // the latest sheet being decoded wins
+let shownSheet = -1; // replay: its index
+const evalSets = new Map<string, EvalEntry[]>();
+let evalSet = "";
 
 function fail(msg: string) {
   errorEl.textContent = msg;
@@ -97,6 +110,12 @@ function send(m: object) {
 
 function showScene(msg: SceneMsg) {
   renderer!.setScene(msg.objects);
+  camsInfo = imagesInfo(msg.objects);
+  camsAvailable ||= camsInfo !== null;
+  cameras.setInfo(camsInfo);
+  cameras.envNames = envNames;
+  shownSheet = -1;
+  renderTop();
   // Object ids restart with every scene.
   if (ix) {
     ix.measurements.length = 0;
@@ -162,6 +181,8 @@ function flyTo(target: Vec3, distance: number) {
 function applyEnvState() {
   renderer?.setIsolated(stats.isolated);
   panel.focus = stats.focus;
+  cameras.focus = stats.focus;
+  cameras.draw();
   timeline.focus = stats.focus;
   timeline.drawPlot();
   refreshPanel(true);
@@ -194,12 +215,54 @@ function isolateEnv(env: number) {
 }
 
 panel.onFocus = (env) => focusEnv(env);
+cameras.onPick = (env) => focusEnv(env);
+
+// -- cameras ------------------------------------------------------------------
+
+async function showSheet(bytes: Uint8Array, wire: number) {
+  const token = ++decoding;
+  const bitmap = await createImageBitmap(new Blob([bytes as BlobPart], { type: "image/jpeg" }));
+  if (token === decoding && camsOn) cameras.show(bitmap, wire);
+  else bitmap.close();
+}
+
+// Ask for the current replay's images, from what already arrived on (or
+// tell the server to stop).
+function syncReplayImages() {
+  const r = replay;
+  if (!r?.images) return;
+  send({ type: "replay_images", id: r.id, on: camsOn, from: r.images.sheets.length });
+}
+
+function showReplaySheet() {
+  if (!camsOn) return;
+  const s = replay?.imageAt(timeline.t);
+  if (!s || s.index === shownSheet) return;
+  shownSheet = s.index;
+  void showSheet(s.bytes, 0);
+}
+
+function setCams(on: boolean) {
+  camsOn = on;
+  cameras.visible = on;
+  shownSheet = -1;
+  decoding++;
+  if (!on) cameras.clear();
+  send({ type: "images", on });
+  syncReplayImages();
+  showReplaySheet();
+}
+
+camsBox.addEventListener("change", () => setCams(camsBox.checked));
 
 // -- top bar ------------------------------------------------------------------
 
 function renderTop() {
   const live = stats.mode === "live";
   for (const el of top.querySelectorAll<HTMLElement>(".live-only")) el.style.display = live && hasLive ? "" : "none";
+  for (const el of top.querySelectorAll<HTMLElement>(".cams-only")) el.style.display = camsAvailable ? "" : "none";
+  for (const el of top.querySelectorAll<HTMLElement>(".evalset-only"))
+    el.style.display = stats.mode === "eval" && evalSets.size > 1 ? "" : "none";
   envSel.disabled = !accepts.includes("select_envs");
   saveBtn.style.display = accepts.includes("save_checkpoint") ? "" : "none";
   evalBtn.style.display = accepts.includes("run_eval") ? "" : "none";
@@ -235,12 +298,43 @@ for (const [btn, type] of [[saveBtn, "save_checkpoint"], [evalBtn, "run_eval"]] 
   });
 }
 
+// -- eval sets ----------------------------------------------------------------
+
+function setEvalList(set: string, list: EvalEntry[]) {
+  const known = evalSets.has(set);
+  evalSets.set(set, list);
+  if (!known) {
+    evalSetSel.innerHTML = [...evalSets.keys()].map((s) => `<option>${s}</option>`).join("");
+    renderTop();
+  }
+  evalSet ||= set;
+  evalSetSel.value = evalSet;
+  if (set === evalSet) timeline.setEvals(list);
+}
+
+// The same checkpoint on another set, when it has one.
+evalSetSel.addEventListener("change", () => {
+  evalSet = evalSetSel.value;
+  const list = evalSets.get(evalSet) ?? [];
+  const keep = list.some((e) => e.id === timeline.selectedEval);
+  timeline.setEvals(list);
+  if (stats.mode !== "eval") return;
+  const id = keep ? timeline.selectedEval : list[list.length - 1]?.id;
+  if (id) pickEval(id);
+  else {
+    replay = null;
+    timeline.setReplay(null);
+  }
+});
+
 // -- modes ------------------------------------------------------------------
 
 function setMode(m: Mode) {
   stats.mode = m;
   timeline.setMode(m);
   renderTop();
+  cameras.clear();
+  shownSheet = -1;
   if (m === "live") {
     replay = null;
     timeline.setReplay(null);
@@ -284,7 +378,7 @@ function pickEval(id: string) {
     setMode("eval");
     return;
   }
-  openReplay({ source: "eval", id });
+  openReplay({ source: "eval", set: evalSet, id });
 }
 
 function onReplay(msg: ReplayMsg) {
@@ -295,6 +389,9 @@ function onReplay(msg: ReplayMsg) {
   envNames = msg.meta.envs;
   showScene(msg.scene);
   timeline.setReplay(r);
+  // A record older than the images (or with its file deleted) has none.
+  if (!r.images) cameras.setInfo(null);
+  syncReplayImages();
   r.onChunk = () => {
     send({ type: "replay_ack", id: r.id, n: r.chunksDone });
     (stats.replay as Record<string, unknown>).loaded = r.chunksDone;
@@ -330,6 +427,7 @@ function applyReplay(all = false) {
   const s = r.sample(timeline.t, all);
   frameOnce(s.objects);
   renderer.applyFrame(s.objects);
+  showReplaySheet();
   // The episode's summary rates and means as the batch numbers.
   for (const [k, v] of Object.entries(r.msg.summary.batch ?? {}))
     if (typeof v === "number") s.channels[`episode ${k}`] = v;
@@ -400,6 +498,7 @@ function connect() {
       accepts = msg.accepts ?? [];
       subscribed = false;
       replayRequests = 0;
+      if (camsOn) send({ type: "images", on: true }); // a new connection
       timeline.setAvailable(hasLive, hasRing, hasEvals);
       stats.status = hasLive ? "waiting for the scene" : "replay";
       const m = stats.mode === "live" && !hasLive ? "eval" : stats.mode;
@@ -420,13 +519,22 @@ function connect() {
       const first = !hasEvals || !timeline.evalList.length;
       hasEvals = true;
       timeline.setAvailable(hasLive, hasRing, true);
-      timeline.setEvals(msg.evals as EvalEntry[]);
+      setEvalList(msg.set ?? "", msg.evals as EvalEntry[]);
       if (stats.mode === "eval" && first && !replay) setMode("eval");
     } else if (msg.type === "replay") {
       onReplay(msg as ReplayMsg);
     } else if (msg.type === "replay_chunk") {
       const c = msg as ChunkMsg;
       if (replay && c.id === replay.id) replay.addChunk(c);
+    } else if (msg.type === "images") {
+      const first = Object.values(msg.images as Record<string, { data: { data: Uint8Array } }>)[0];
+      if (first && camsOn && stats.mode === "live") void showSheet(first.data.data, first.data.data.length);
+    } else if (msg.type === "replay_images") {
+      const m = msg as ImagesMsg;
+      if (replay?.images && m.id === replay.id) {
+        replay.images.add(m);
+        showReplaySheet();
+      }
     } else if (msg.type === "event") {
       toast(msg.text, msg.level);
     }

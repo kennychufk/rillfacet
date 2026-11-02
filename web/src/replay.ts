@@ -3,7 +3,8 @@
 // rebuilds the scene state at tick t — each track's latest sample at or
 // before t, poses interpolated (lerp + slerp) between samples — in the same
 // {object: {field: Arr}} shape as a live frame, so the renderer and panel
-// take it as is.
+// take it as is. Image tracks come apart from that, as JPEG sheets, only when
+// asked for (ImageTrack).
 import { type Arr, type TypedArray } from "./protocol";
 import type { Series, SeriesSource } from "./panel";
 import { type SceneObject } from "./renderer";
@@ -15,7 +16,9 @@ interface PoseInfo {
   chunk: number; chunks: number;
 }
 
-interface TrackMsg { object: string; field: string; t: Arr; values?: Arr; pose?: PoseInfo }
+interface ImagesTrackInfo { samples: number; shape: number[] }
+
+interface TrackMsg { object: string; field: string; t: Arr; values?: Arr; pose?: PoseInfo; images?: ImagesTrackInfo }
 
 export interface EnvSummary { env: number; end_step: number; [k: string]: unknown }
 
@@ -33,6 +36,8 @@ export interface ReplayMsg {
 }
 
 export interface ChunkMsg { id: number; track: number; start: number; count: number; shape: number[]; data: Arr }
+
+export interface ImagesMsg { id: number; track: number; start: number; sizes: Arr; data: Arr }
 
 class PoseTrack {
   readonly n: number;
@@ -162,6 +167,25 @@ export function envOutcome(s: EnvSummary | undefined): string {
   return "ended";
 }
 
+// The JPEG sheets received so far (a prefix of the samples).
+class ImageTrack {
+  sheets: Uint8Array[] = [];
+
+  constructor(readonly t: TypedArray) {}
+
+  get samples() { return this.t.length; }
+
+  add(m: ImagesMsg) {
+    const bytes = m.data.data as Uint8Array;
+    let at = 0;
+    for (let i = 0; i < m.sizes.data.length; i++) {
+      const n = m.sizes.data[i];
+      this.sheets[m.start + i] = bytes.subarray(at, at + n);
+      at += n;
+    }
+  }
+}
+
 export class Replay {
   readonly msg: ReplayMsg;
   readonly numEnvs: number;
@@ -169,6 +193,7 @@ export class Replay {
   private poses = new Map<number, PoseTrack>();
   private cache = new Map<number, number>(); // track -> last sample index sent
   private chain: Promise<void> = Promise.resolve();
+  images: ImageTrack | null = null;
   chunksDone = 0;
   readonly chunksTotal: number;
   onChunk: () => void = () => {};
@@ -185,6 +210,7 @@ export class Replay {
         this.poses.set(i, new PoseTrack(tr.pose));
         total += tr.pose.chunks;
       }
+      if (tr.images) this.images = new ImageTrack(tr.t.data);
     });
     this.chunksTotal = total;
   }
@@ -219,6 +245,15 @@ export class Replay {
     return this.chain;
   }
 
+  // The sheet to show at tick t, or null while it has not arrived.
+  imageAt(t: number): { index: number; bytes: Uint8Array } | null {
+    const im = this.images;
+    if (!im) return null;
+    const index = lastAtOrBefore(im.t, t);
+    const bytes = im.sheets[index];
+    return bytes ? { index, bytes } : null;
+  }
+
   // Per-env channel [K, n] -> its values over time for plotting.
   channel(name: string): Arr | null {
     const tr = this.msg.tracks.find((t) => t.object === "channels" && t.field === name);
@@ -245,6 +280,7 @@ export class Replay {
     const channels: Record<string, number | Arr> = {};
     const n = this.numEnvs;
     this.msg.tracks.forEach((tr, i) => {
+      if (tr.images) return;
       const tt = tr.t.data;
       const pose = this.poses.get(i);
       if (pose) {

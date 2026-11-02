@@ -14,6 +14,8 @@
         <label class="live-only">rate <select id="rate" title="Live frames per second at most">
           <option value="1">1 Hz</option><option value="5">5 Hz</option><option value="10">10 Hz</option>
           <option value="20" selected>20 Hz</option><option value="30">30 Hz</option></select></label>
+        <label class="evalset-only">eval set <select id="evalset" title="Which saved evals the Evals timeline shows"></select></label>
+        <label class="cams-only switch" title="Show the camera images. Off, none are sent to this browser, in any mode."><input id="cams" type="checkbox" role="switch" /><span class="track"></span>cameras</label>
         <button id="display-btn" aria-expanded="false" aria-controls="display" title="Style, shadows, slice plane, see-through objects">Display</button>
         <button id="save" title="Write a checkpoint of the current policy">Save checkpoint</button>
         <button id="eval" title="Write a checkpoint and run the side eval on it">Run eval now</button>
@@ -23,6 +25,7 @@
       <details id="inspect-wrap" open><summary>Inspect</summary><div id="inspect"></div></details>
       <div id="stats"></div>
     </aside>
+    <aside id="cameras" hidden aria-label="Camera images"></aside>
     <div id="hud"></div>
     <div id="scalebar"></div>
     <div id="gizmo"></div>

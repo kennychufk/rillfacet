@@ -15,7 +15,8 @@ uint16, uint8 (float64 goes out as float32, int64 as int32, bool as uint8).
 Messages (``type``):
 
 - ``hello``: ``version``, ``name`` (the run), ``streams`` [{"name", "kind"}],
-  ``replay`` {"evals": bool, "ring": bool} (what can be replayed),
+  ``replay`` {"evals": bool, "ring": bool, "eval_sets": [labels]} (what can
+  be replayed),
   ``accepts`` [request types the producer handles, e.g. "save_checkpoint",
   "run_eval", "select_envs"].
 - ``scene``: ``stream``, ``version``, ``objects`` [{"kind", "name",
@@ -25,26 +26,36 @@ Messages (``type``):
   {name: {field: array}} (the whole dynamic state: rigid ``poses``, box
   ``lo``/``hi``/``colors``, label ``values``, ``points``), ``channels``.
 - ``event``: ``level``, ``text``.
-- ``evals``: ``evals`` — the saved-eval index (``record.read_index``
-  entries: ``id``, ``timestep``, ``checkpoint``, ``summary`` batch rates);
-  sent on connect and whenever it changes.
+- ``images``: ``stream``, ``seq`` (of the frame it follows), ``time``,
+  ``images`` {name: {"shape" [n, C, H, W], "data" uint8: one JPEG sheet, a
+  row per instance, a column per view}}; only to a client that asked.
+- ``evals``: ``set`` (the eval set's label), ``evals`` — the saved-eval index
+  (``record.read_index`` entries: ``id``, ``timestep``, ``checkpoint``,
+  ``summary`` batch rates); sent on connect and whenever it changes.
 - ``replay``: ``id`` (per connection), ``source`` ("eval" | "ring"),
   ``name``, ``meta``, ``summary`` (per-env outcomes, ``envs[e].end_step``),
   ``tick_seconds``, ``duration`` (last tick), ``scene`` (the start snapshot:
   ``objects``, ``camera``), ``tracks`` [{"object", "field", "t" int32 [K],
-  and "values" [K, ...] or, for poses, "pose" {"samples", "envs",
-  "bodies", "static_mask", "static_poses", "pos_lo", "pos_span", "chunk",
-  "chunks"}}]. See :mod:`rillfacet.web.replay`.
+  and "values" [K, ...], for poses "pose" {"samples", "envs", "bodies",
+  "static_mask", "static_poses", "pos_lo", "pos_span", "chunk", "chunks"},
+  for images "images" {"samples", "shape" [n, C, H, W]}}]. See
+  :mod:`rillfacet.web.replay`.
 - ``replay_chunk``: ``id``, ``track``, ``start``, ``count``, ``shape``
   [n, moving bodies, 7], ``data`` (uint8: zlib of int16 samples,
   delta-coded along time).
+- ``replay_images``: ``id``, ``track``, ``start``, ``sizes`` int32 [n],
+  ``data`` (uint8: the ``n`` JPEG sheets of samples ``start``..., one after
+  the other).
 
 Browser -> server messages are JSON text: ``{"type": "subscribe", "stream",
 "rate"}``, ``{"type": "unsubscribe", "stream"}``, ``{"type": "ack",
 "stream", "seq"}`` (flow control: the server sends a stream's next frame
 once the previous one is acked), ``{"type": "open_replay", "source":
-"eval", "id"}`` or ``{"source": "ring"}``, and ``{"type": "replay_ack",
-"id", "n"}`` (chunks received so far). Requests the producer accepts
+"eval", "set", "id"}`` or ``{"source": "ring"}``, ``{"type": "replay_ack",
+"id", "n"}`` (chunks received so far), ``{"type": "images", "on"}`` (this
+client's live images) and ``{"type": "replay_images", "id", "on", "from"}``
+(the replay's images from sample ``from`` on, or stop sending them).
+Requests the producer accepts
 (``hello.accepts``) are queued for it as sent: ``{"type":
 "save_checkpoint"}``, ``{"type": "run_eval"}``, ``{"type": "select_envs",
 "first": k}``.

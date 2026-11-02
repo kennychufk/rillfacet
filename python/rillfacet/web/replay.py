@@ -14,7 +14,9 @@ metadata, summary and every small track in full) followed by
 record's codec), delta-coded along time within the chunk and zlib-deflated,
 so a 16-env eval of 2,500 physics steps is about 3 MB on the wire instead
 of 32 MB. The client plays tracks as recorded: at time ``t`` each track
-shows its latest sample at or before ``t``; poses are interpolated.
+shows its latest sample at or before ``t``; poses are interpolated. Image
+tracks stay out of that: a client that wants them asks, and gets
+``replay_images`` messages of JPEG sheets.
 
 Sources: :class:`EvalLibrary` (records on disk) and :class:`RingMailbox`
 (records built on request by the producing process, e.g. a trainer's
@@ -31,13 +33,17 @@ import zlib
 
 import numpy as np
 
-from .record import encode_poses, read_index, read_record
+from .images import encode_sheet
+from .record import encode_poses, load_images, read_index, read_record
 
 __all__ = ["ReplayData", "EvalLibrary", "RingMailbox", "CHUNK_TICKS",
-           "decode_chunk", "build_scene", "set_state", "main"]
+           "IMAGE_CHUNK", "decode_chunk", "build_scene", "set_state", "main"]
 
 #: Pose samples per ``replay_chunk``.
 CHUNK_TICKS = 256
+
+#: Sheets per ``replay_images`` message.
+IMAGE_CHUNK = 16
 
 
 def _json(x):
@@ -66,7 +72,9 @@ class ReplayData:
         self.tracks = []                  # (object, field, t, values | enc)
         self.poses = []                   # track index -> absolute int16 q
         for (obj, field), (t, v) in sorted(record.tracks.items()):
-            if field == "poses" and (isinstance(v, dict) or (
+            if field == "images":             # array, or read_record's dict
+                self.tracks.append((obj, field, t, v))
+            elif field == "poses" and (isinstance(v, dict) or (
                     np.ndim(v) == 4 and np.shape(v)[-1] == 7)):
                 enc = v if isinstance(v, dict) else encode_poses(v)
                 self.tracks.append((obj, field, t, enc))
@@ -80,7 +88,11 @@ class ReplayData:
         for obj, field, t, v in self.tracks:
             e: dict = dict(object=obj, field=field,
                            t=np.asarray(t, np.int32))
-            if isinstance(v, dict):
+            if field == "images":
+                shape = v["shape"] if isinstance(v, dict) else v.shape
+                e["images"] = dict(samples=len(t),
+                                   shape=[int(x) for x in shape[1:5]])
+            elif isinstance(v, dict):
                 K, n, B, _ = (int(x) for x in v["shape"])
                 static = v["static_mask"].astype(bool)
                 e["pose"] = dict(
@@ -106,8 +118,9 @@ class ReplayData:
 
     def chunks(self, rid: int):
         """``replay_chunk`` messages, in order (encoded on demand)."""
-        for i, (_, _, _, v) in enumerate(self.tracks):
-            if not isinstance(v, dict) or "pos_dq" not in v:
+        for i, (_, field, _, v) in enumerate(self.tracks):
+            if (field == "images" or not isinstance(v, dict)
+                    or "pos_dq" not in v):
                 continue
             q = np.concatenate([np.cumsum(v["pos_dq"], axis=0, dtype=np.int16),
                                 np.cumsum(v["rot_dq"], axis=0, dtype=np.int16)],
@@ -120,6 +133,26 @@ class ReplayData:
                 yield dict(type="replay_chunk", id=rid, track=i, start=k0,
                            count=len(c), shape=list(c.shape[1:]),
                            data=np.frombuffer(data, np.uint8))
+
+
+    def image_chunks(self, rid: int, start: int = 0):
+        """``replay_images`` messages from sample ``start`` on, in order
+        (read or encoded on demand): ``sizes`` [n] bytes of each of the
+        ``n`` sheets concatenated in ``data``."""
+        for i, (_, field, t, v) in enumerate(self.tracks):
+            if field != "images":
+                continue
+            enc = load_images(v) if isinstance(v, dict) else None
+            for k0 in range(int(start), len(t), IMAGE_CHUNK):
+                ks = range(k0, min(k0 + IMAGE_CHUNK, len(t)))
+                if enc is not None:
+                    o = enc["offsets"]
+                    sheets = [enc["data"][int(o[k]):int(o[k + 1])] for k in ks]
+                else:
+                    sheets = [encode_sheet(v[k]) for k in ks]
+                yield dict(type="replay_images", id=rid, track=i, start=k0,
+                           sizes=np.asarray([len(s) for s in sheets], np.int32),
+                           data=np.frombuffer(b"".join(sheets), np.uint8))
 
 
 def decode_chunk(msg: dict) -> np.ndarray:
@@ -160,6 +193,9 @@ def build_scene(scene, snapshot: dict) -> None:
                          color=at["color"], align=at["align"],
                          world_height=at["world_height"],
                          size_px=at["size_px"])
+        elif k == "images":
+            scene.images(n, at["instances"], at["views"], at["height"],
+                         at["width"])
         else:
             continue
         if at.get("display"):
@@ -187,6 +223,8 @@ def set_state(scene, record, t: int) -> None:
             o.set_values(at[(name, "values")])
         elif o.kind in ("points", "polyline") and (name, "points") in at:
             o.set_points(at[(name, "points")])
+        elif o.kind == "images" and (name, "images") in at:
+            o.set_images(at[(name, "images")])
     ch = {f: v for (obj, f), v in at.items() if obj == "channels"}
     if ch:
         scene.set_channels(**ch)
@@ -281,6 +319,18 @@ class RingMailbox:
 # standalone replay server
 # --------------------------------------------------------------------------
 
+def _sibling_sets(root: str) -> dict:
+    """``{label: dir}`` of the other eval sets next to ``root``, when that
+    is a run's ``evals`` (``evals_seen`` -> "seen")."""
+    if os.path.basename(root) != "evals":
+        return {}
+    run = os.path.dirname(root)
+    return {d[len("evals_"):]: os.path.join(run, d)
+            for d in sorted(os.listdir(run))
+            if d.startswith("evals_")
+            and os.path.isfile(os.path.join(run, d, "index.json"))}
+
+
 def _evals_dir(path: str) -> str:
     path = os.path.abspath(path)
     if os.path.isfile(os.path.join(path, "index.json")):
@@ -307,6 +357,8 @@ def main(argv=None) -> None:
     n = len(read_index(root))
     server = VizServer(args.host, args.port, name=os.path.basename(run),
                        evals=root)
+    for label, d in _sibling_sets(root).items():
+        server.offer_evals(d, label)
     print(f"[rillfacet] replaying {n} evals from {root}; Ctrl-C to stop")
     try:
         while True:

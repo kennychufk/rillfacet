@@ -26,6 +26,12 @@ is False while nobody is connected, so an unwatched run pays nothing.
 Frames carry the whole dynamic state (not deltas), so a dropped frame
 loses nothing. A client connecting mid-run gets the latest scene first.
 
+Images (:class:`~rillfacet.scene_api.Images`) are per client, off until it
+sends ``{"type": "images", "on": true}``: they ride as an ``images`` message
+behind that client's frames, so one browser's camera panel costs another
+nothing and, with nobody asking, they are not even copied. JPEG encoding is
+done off both the caller's thread and the server loop.
+
 Requests: :meth:`VizServer.accept` names the browser requests the
 producer handles (e.g. "save_checkpoint", "run_eval", "select_envs");
 they queue up until it calls :meth:`VizServer.take_requests` from its own
@@ -37,7 +43,10 @@ clients are sent the eval index, again whenever it changes, and can open
 any eval; with :attr:`VizServer.ring` (a :class:`~.replay.RingMailbox`)
 they can ask the producing process for its latest training episodes. A
 replay is read, encoded and sent off the caller's thread, its pose chunks
-paced by the client's acks (at most :data:`REPLAY_WINDOW` in flight).
+paced by the client's acks (at most :data:`REPLAY_WINDOW` in flight). Its
+images go only to a client that asks (``replay_images``), paced by the
+socket. :meth:`VizServer.offer_evals` takes a label per records directory
+(e.g. a run's held-out and seen evals): the client picks the set.
 See :mod:`rillfacet.web.protocol` for the messages.
 
 HTTPS: WebGPU only runs in a secure context, which plain http is only on
@@ -60,7 +69,9 @@ import time
 
 import numpy as np
 
-from ..scene_api import Backend, Boxes, Labels, Points, Polyline, RigidMesh
+from ..scene_api import (Backend, Boxes, Images, Labels, Points, Polyline,
+                         RigidMesh)
+from .images import encode_sheet
 from .protocol import VERSION, encode
 
 #: Environment variables naming the PEM certificate (chain) and private key
@@ -81,6 +92,9 @@ RING_TIMEOUT = 120.0
 
 #: Seconds between checks of the eval index for new records.
 EVALS_POLL = 1.0
+
+#: The label of an eval set offered without one.
+DEFAULT_EVALS = "evals"
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "static")
@@ -127,6 +141,9 @@ class _Client:
         self.replay_sent = 0
         self.replay_acked = 0
         self.replay_wake = asyncio.Event()
+        self.replay_data = None
+        self.images = False
+        self.images_task = None
 
     def ready(self, now: float) -> bool:
         return not self.awaiting or now - self.sent_at > ACK_TIMEOUT
@@ -145,6 +162,8 @@ class Stream:
         self.seq = 0
         self._frame = None                # (seq, msg, cuda event | None)
         self._frame_bytes = (0, None)
+        self._images = None               # (seq, {name: images}, time, event)
+        self._images_bytes = (0, None)
         self._last_commit = 0.0
         self.scene_requested = False
         self.commits = 0
@@ -169,7 +188,12 @@ class Stream:
             return False
         return any(c.ready(now) for c in clients)
 
-    def publish(self, frame: dict, event=None, scene: dict | None = None):
+    def images_wanted(self) -> bool:
+        """True when a client of this stream asked for images."""
+        return any(c.images for c in list(self.clients))
+
+    def publish(self, frame: dict, event=None, scene: dict | None = None,
+                images: dict | None = None):
         with self._lock:
             if scene is not None:
                 self.scene_version += 1
@@ -183,6 +207,8 @@ class Stream:
                                           stream=self.name, seq=self.seq,
                                           scene_version=self.scene_version),
                            event)
+            self._images = (self.seq, images, frame.get("time"),
+                            event) if images else None
             self._last_commit = time.monotonic()
             self.commits += 1
         self.server._wake(self)
@@ -212,12 +238,39 @@ class Stream:
                 self._frame_bytes = (seq, data)
         return seq, data
 
+    async def _images_encoded(self):
+        """The ``images`` message of the latest frame, or None."""
+        with self._lock:
+            if self._images is None:
+                return None
+            seq, images, t, event = self._images
+            if self._images_bytes[0] == seq:
+                return self._images_bytes[1]
+        while event is not None and not event.query():
+            await asyncio.sleep(0.001)
+
+        def build():
+            out = {}
+            for name, x in images.items():
+                a = _to_numpy(x)
+                out[name] = dict(shape=list(a.shape[:4]), data=np.frombuffer(
+                    encode_sheet(a), np.uint8))
+            return encode(dict(type="images", stream=self.name, seq=seq,
+                               time=t, images=out))
+
+        data = await asyncio.get_running_loop().run_in_executor(None, build)
+        with self._lock:
+            if self._images is not None and self._images[0] == seq:
+                self._images_bytes = (seq, data)
+        return data
+
 
 class VizServer:
     """HTTP + WebSocket server on ``host:port``, started on construction
     (a daemon thread). If the port is taken, the next free one up to
     ``port + 20`` is used; :attr:`url` tells which. ``evals`` is a records
-    directory (:class:`~.replay.EvalLibrary`) to offer for replay; set
+    directory (:class:`~.replay.EvalLibrary`) to offer for replay
+    (:meth:`offer_evals` adds more); set
     :attr:`ring` to a :class:`~.replay.RingMailbox` to offer the producer's
     in-memory episodes. ``ssl_cert`` (PEM, the key may be in it too) and
     ``ssl_key`` serve https / wss instead; they default to the environment
@@ -228,7 +281,6 @@ class VizServer:
                  name: str = "", static_dir: str | None = None,
                  evals: str | None = None, verbose: bool = True,
                  ssl_cert: str | None = None, ssl_key: str | None = None):
-        from .replay import EvalLibrary
         self.host, self.name = host, name
         if ssl_cert is None:
             ssl_cert = os.environ.get(CERT_ENV, "")
@@ -243,8 +295,10 @@ class VizServer:
             raise ValueError(f"rillfacet web: a key without a certificate "
                              f"(set ssl_cert or {CERT_ENV})")
         self.static_dir = static_dir or STATIC_DIR
-        self.evals = EvalLibrary(evals) if evals else None
-        self._evals_dirty = False
+        self.eval_sets: dict = {}          # label -> EvalLibrary
+        self._evals_dirty: set = set()
+        if evals:
+            self.offer_evals(evals)
         self.ring = None
         self.accepted: set = set()
         self._requests: list = []
@@ -278,6 +332,11 @@ class VizServer:
         host = socket.gethostname() if self.host in ("0.0.0.0", "") else self.host
         return f"{'https' if self._ssl else 'http'}://{host}:{self.port}/"
 
+    @property
+    def evals(self):
+        """The first eval set offered (an ``EvalLibrary``), or None."""
+        return next(iter(self.eval_sets.values()), None)
+
     def accept(self, *kinds: str) -> None:
         """Queue browser requests of these types for :meth:`take_requests`
         (clients connecting later are told which are available)."""
@@ -310,12 +369,14 @@ class VizServer:
         except RuntimeError:                       # loop closed
             pass
 
-    def offer_evals(self, root: str) -> None:
-        """Offer the records under ``root`` for replay (it may not exist
-        yet); connected clients get its index within :data:`EVALS_POLL`."""
+    def offer_evals(self, root: str, label: str = DEFAULT_EVALS) -> None:
+        """Offer the records under ``root`` for replay, as the eval set
+        ``label`` (replacing a set of that name; ``root`` may not exist
+        yet). Connected clients get its index within :data:`EVALS_POLL`, and
+        a client connecting later the list of sets."""
         from .replay import EvalLibrary
-        self.evals = EvalLibrary(root)
-        self._evals_dirty = True            # push it to connected clients
+        self.eval_sets[label] = EvalLibrary(root)
+        self._evals_dirty.add(label)        # push it to connected clients
 
     def stream(self, name: str, kind: str = "live") -> Stream:
         s = self.streams.get(name)
@@ -418,11 +479,12 @@ class VizServer:
             type="hello", version=VERSION, name=self.name,
             streams=[dict(name=s.name, kind=s.kind)
                      for s in self.streams.values()],
-            replay=dict(evals=self.evals is not None,
-                        ring=self.ring is not None),
+            replay=dict(evals=bool(self.eval_sets),
+                        ring=self.ring is not None,
+                        eval_sets=list(self.eval_sets)),
             accepts=sorted(self.accepted))))
-        if self.evals is not None:
-            await conn.send(self._evals_msg(self.evals.entries))
+        for label, lib in list(self.eval_sets.items()):
+            await conn.send(self._evals_msg(label, lib.entries))
         sender = asyncio.create_task(self._send_loop(client, subs))
         try:
             async for raw in conn:
@@ -437,11 +499,24 @@ class VizServer:
                     with self._req_lock:
                         self._requests.append(m)
                     continue
+                if kind == "images":
+                    client.images = bool(m.get("on"))
+                    continue
                 if kind == "open_replay":
                     if client.replay_task is not None:
                         client.replay_task.cancel()
+                    self._stop_replay_images(client)
+                    client.replay_data = None
                     client.replay_task = asyncio.create_task(
                         self._serve_replay(client, m))
+                    continue
+                if kind == "replay_images":
+                    self._stop_replay_images(client)
+                    if (m.get("on") and client.replay_data is not None
+                            and int(m.get("id", -1)) == client.replay_id):
+                        client.images_task = asyncio.create_task(
+                            self._serve_replay_images(
+                                client, int(m.get("from", 0))))
                     continue
                 if kind == "replay_ack":
                     if int(m.get("id", -1)) == client.replay_id:
@@ -471,6 +546,7 @@ class VizServer:
             sender.cancel()
             if client.replay_task is not None:
                 client.replay_task.cancel()
+            self._stop_replay_images(client)
             for s in subs.values():
                 s.clients.discard(client)
             self._clients.discard(client)
@@ -478,26 +554,24 @@ class VizServer:
     # -- replay -----------------------------------------------------------------
 
     @staticmethod
-    def _evals_msg(entries: list) -> bytes:
-        return encode(dict(type="evals", evals=entries))
+    def _evals_msg(label: str, entries: list) -> bytes:
+        return encode(dict(type="evals", set=label, evals=entries))
 
     async def _watch_evals(self):
         loop = asyncio.get_running_loop()
         while True:
             await asyncio.sleep(EVALS_POLL)
-            lib = self.evals
-            if lib is None:
-                continue
-            changed, entries = await loop.run_in_executor(None, lib.index)
-            if not (changed or self._evals_dirty):
-                continue
-            self._evals_dirty = False
-            data = self._evals_msg(entries)
-            for c in list(self._clients):
-                try:
-                    await c.conn.send(data)
-                except Exception:                  # noqa: BLE001 (closed)
-                    pass
+            for label, lib in list(self.eval_sets.items()):
+                changed, entries = await loop.run_in_executor(None, lib.index)
+                if not (changed or label in self._evals_dirty):
+                    continue
+                self._evals_dirty.discard(label)
+                data = self._evals_msg(label, entries)
+                for c in list(self._clients):
+                    try:
+                        await c.conn.send(data)
+                    except Exception:              # noqa: BLE001 (closed)
+                        pass
 
     async def _serve_replay(self, client: _Client, m: dict):
         loop = asyncio.get_running_loop()
@@ -511,10 +585,12 @@ class VizServer:
                 data = await asyncio.wait_for(
                     asyncio.wrap_future(self.ring.ask()), RING_TIMEOUT)
             else:
-                if self.evals is None:
+                lib = self.eval_sets.get(m.get("set")) or self.evals
+                if lib is None:
                     raise ValueError("this server has no saved evals")
                 data = await loop.run_in_executor(
-                    None, self.evals.load, str(m.get("id", "")))
+                    None, lib.load, str(m.get("id", "")))
+            client.replay_data = data
             head = await loop.run_in_executor(
                 None, lambda: encode(data.header(rid)))
             await client.conn.send(head)
@@ -539,6 +615,31 @@ class VizServer:
                 await client.conn.send(encode(dict(
                     type="event", level="error",
                     text=f"replay failed: {type(e).__name__}: {e}")))
+            except Exception:                      # noqa: BLE001 (closed)
+                pass
+
+    @staticmethod
+    def _stop_replay_images(client: _Client) -> None:
+        if client.images_task is not None:
+            client.images_task.cancel()
+            client.images_task = None
+
+    async def _serve_replay_images(self, client: _Client, start: int):
+        loop = asyncio.get_running_loop()
+        chunks = client.replay_data.image_chunks(client.replay_id, start)
+        try:
+            while True:
+                msg = await loop.run_in_executor(None, next, chunks, None)
+                if msg is None:
+                    break
+                await client.conn.send(encode(msg))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:                     # noqa: BLE001
+            try:
+                await client.conn.send(encode(dict(
+                    type="event", level="error",
+                    text=f"replay images failed: {type(e).__name__}: {e}")))
             except Exception:                      # noqa: BLE001 (closed)
                 pass
 
@@ -567,6 +668,10 @@ class VizServer:
                     client.last_seq = seq
                     client.awaiting = True
                     client.sent_at = time.monotonic()
+                    if client.images:
+                        images = await s._images_encoded()
+                        if images is not None:
+                            await client.conn.send(images)
         except asyncio.CancelledError:
             pass
         except Exception:                          # noqa: BLE001 (closed)
@@ -605,6 +710,11 @@ class StreamBackend(Backend):
     def wanted(self) -> bool:
         return self.stream.wanted()
 
+    def images_wanted(self) -> bool:
+        """True when a client wants images: set them before :meth:`commit`.
+        Otherwise a commit does not touch them."""
+        return self.stream.images_wanted()
+
     def commit(self, scene, *, time=None, **extra) -> None:
         """Snapshot the scene's current state as the stream's latest frame
         (and its structure, when that changed or a new client needs it).
@@ -640,6 +750,12 @@ class StreamBackend(Backend):
                 f["points"] = o.points.copy()
             if f:
                 objects[o.name] = f
+        images = None
+        if self.images_wanted():
+            images = {o.name: _host_copy(o.images)
+                      for o in scene.objects.values()
+                      if isinstance(o, Images) and o.images is not None}
+            cuda |= any(hasattr(x, "is_pinned") for x in images.values())
         event = None
         if cuda:
             import torch
@@ -648,4 +764,4 @@ class StreamBackend(Backend):
         frame = dict(time=time, objects=objects,
                      channels={k: _host_copy(v)
                                for k, v in scene.channels.items()}, **extra)
-        self.stream.publish(frame, event, scene=snap)
+        self.stream.publish(frame, event, scene=snap, images=images)

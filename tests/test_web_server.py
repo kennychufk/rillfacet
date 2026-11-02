@@ -250,9 +250,10 @@ def test_eval_index_push_and_replay(tmp_path):
     try:
         with connect(f"ws://127.0.0.1:{srv.port}/ws") as ws:
             hello = recv(ws)
-            assert hello["replay"] == {"evals": False, "ring": False}
+            assert hello["replay"] == {"evals": False, "ring": False,
+                                       "eval_sets": []}
             srv.offer_evals(str(root))              # before any eval exists
-            assert recv(ws) == {"type": "evals", "evals": []}
+            assert recv(ws) == {"type": "evals", "set": "evals", "evals": []}
             write_record(str(root), "t000000100", rec,
                          meta=dict(timestep=100, dt=0.01,
                                clock="physics_step"),
@@ -286,6 +287,176 @@ def test_eval_index_push_and_replay(tmp_path):
                                     id="../x")))
             e = recv(ws)
             assert e["type"] == "event" and e["level"] == "error"
+    finally:
+        srv.close()
+
+
+def noisy_images(K, n=2, C=4, H=48, W=64, seed=0):
+    """``[K, n, C, H, W, 3]``: a gradient per (env, view), plus sensor noise."""
+    r = np.random.default_rng(seed)
+    y, x = np.mgrid[0:H, 0:W]
+    base = np.stack([40 + 2 * x, 40 + 3 * y, 0 * x + 90], -1).astype(np.float32)
+    out = np.empty((K, n, C, H, W, 3), np.uint8)
+    for k in range(K):
+        for e in range(n):
+            for c in range(C):
+                out[k, e, c] = np.clip(base + 8 * (e + c + k)
+                                       + r.normal(0, 3, base.shape), 0, 255)
+    return out
+
+
+def image_scene(backend, n=2):
+    sc = Scene(backend)
+    v, t = box_mesh([[0, 0, 0]], [[1, 1, 1]])
+    rm = sc.rigid_mesh("bodies", v, np.zeros(8, np.int32), t, [0, 12],
+                       instances=n)
+    p = np.zeros((n, 1, 7), np.float32)
+    p[..., 6] = 1
+    rm.set_poses(p)
+    return sc, sc.images("cams", n, ["a", "b", "c", "d"], 48, 64)
+
+
+def recv_until(ws, kind):
+    for _ in range(50):
+        m = recv(ws)
+        if m["type"] == kind:
+            return m
+    raise AssertionError(f"no {kind} message")
+
+
+def test_live_images_go_only_to_the_client_that_asked(server):
+    from rillfacet.web.images import decode_sheet
+    stream = server.stream("cams live")
+    backend = StreamBackend(stream)
+    scene, cams = image_scene(backend)
+    x = noisy_images(1)[0]
+    cams.set_images(x)
+
+    def wait(cond):
+        t0 = time.monotonic()
+        while not cond() and time.monotonic() - t0 < 5:
+            time.sleep(0.005)
+        assert cond()
+
+    with connect(f"ws://127.0.0.1:{server.port}/ws") as a, \
+            connect(f"ws://127.0.0.1:{server.port}/ws") as b:
+        for ws in (a, b):
+            recv(ws)                                # hello
+            ws.send(json.dumps(dict(type="subscribe", stream=stream.name)))
+        wait(lambda: len(stream.clients) == 2)
+        backend.commit(scene, time=1)
+        assert stream._images is None               # nobody asked: not copied
+        for ws in (a, b):
+            assert recv(ws)["type"] == "scene"
+            assert recv(ws)["type"] == "frame"
+            ws.send(json.dumps(dict(type="ack", stream=stream.name, seq=1)))
+
+        a.send(json.dumps(dict(type="images", on=True)))
+        wait(backend.images_wanted)
+        time.sleep(0.05)                            # the acks too
+        backend.commit(scene, time=2)
+        assert recv(a)["type"] == "frame"
+        m = recv(a)
+        assert m["type"] == "images" and m["time"] == 2
+        assert m["images"]["cams"]["shape"] == [2, 4, 48, 64]
+        got = decode_sheet(m["images"]["cams"]["data"].tobytes(),
+                           (2, 4, 48, 64)).astype(np.float32)
+        assert np.abs(got - x).mean() < 6
+        assert recv(b)["type"] == "frame"           # b: its frame, no images
+        with pytest.raises(TimeoutError):
+            b.recv(timeout=0.2)
+
+        a.send(json.dumps(dict(type="images", on=False)))
+        wait(lambda: not backend.images_wanted())
+        backend.commit(scene, time=3)
+        assert stream._images is None
+
+
+def test_replay_images_only_on_request_and_resumable(tmp_path):
+    from rillfacet.web.images import decode_sheet
+    from rillfacet.web.record import Recorder, write_record
+    from rillfacet.web.replay import IMAGE_CHUNK
+    K = 2 * IMAGE_CHUNK + 3
+    rec = Recorder()
+    scene, cams = image_scene(rec)
+    x = noisy_images(K)
+    cams.set_images(x[0])
+    rec.start(scene, t=0)
+    for k in range(1, K):
+        rec.tick(25 * k)
+        cams.set_images(x[k])
+    root = tmp_path / "evals"
+    write_record(str(root), "t1", rec.finish(), meta=dict(dt=0.002),
+                 summary=dict(envs=[], batch={}))
+    srv = VizServer("127.0.0.1", 18790, static_dir=str(tmp_path),
+                    evals=str(root), verbose=False)
+    try:
+        with connect(f"ws://127.0.0.1:{srv.port}/ws") as ws:
+            hello = recv(ws)
+            assert hello["replay"]["eval_sets"] == ["evals"]
+            assert recv(ws)["type"] == "evals"
+            ws.send(json.dumps(dict(type="open_replay", id="t1")))
+            head = recv_until(ws, "replay")
+            tr = next(t for t in head["tracks"] if t["field"] == "images")
+            assert tr["images"] == dict(samples=K, shape=[2, 4, 48, 64])
+            assert "values" not in tr and tr["t"][-1] == 25 * (K - 1)
+            assert any(o["kind"] == "images" for o in head["scene"]["objects"])
+            with pytest.raises(TimeoutError):       # not asked for
+                while True:
+                    m = recv(ws, 0.2)
+                    assert m["type"] == "replay_chunk"
+
+            def fetch(start):
+                ws.send(json.dumps(dict(type="replay_images", id=head["id"],
+                                        on=True, **{"from": start})))
+                out, n = {}, start
+                while n < K:
+                    m = recv_until(ws, "replay_images")
+                    assert m["id"] == head["id"] and m["start"] == n
+                    at = 0
+                    for i, size in enumerate(m["sizes"].tolist()):
+                        out[n + i] = m["data"][at:at + size].tobytes()
+                        at += size
+                    n += len(m["sizes"])
+                return out
+
+            sheets = fetch(0)
+            assert sorted(sheets) == list(range(K))
+            assert np.abs(decode_sheet(sheets[K - 1], (2, 4, 48, 64))
+                          .astype(np.float32) - x[K - 1]).mean() < 6
+            assert sorted(fetch(IMAGE_CHUNK)) == list(range(IMAGE_CHUNK, K))
+    finally:
+        srv.close()
+
+
+def test_eval_sets(tmp_path):
+    from rillfacet.web.record import write_record
+    from rillfacet.web.replay import _sibling_sets
+    rec, _ = make_record()
+    run = tmp_path / "run"
+    for sub, ts in (("evals", 100), ("evals_seen", 200)):
+        write_record(str(run / sub), "t1", rec,
+                     meta=dict(timestep=ts, dt=0.01, clock="physics_step"),
+                     summary=dict(envs=[dict(env=0, end_step=599)] * 2,
+                                  batch={}))
+    assert _sibling_sets(str(run / "evals")) == {"seen": str(run / "evals_seen")}
+    assert _sibling_sets(str(run / "evals_seen")) == {}
+    srv = VizServer("127.0.0.1", 18800, static_dir=str(tmp_path), verbose=False)
+    try:
+        srv.offer_evals(str(run / "evals"), "held-out")
+        srv.offer_evals(str(run / "evals_seen"), "seen")
+        with connect(f"ws://127.0.0.1:{srv.port}/ws") as ws:
+            assert recv(ws)["replay"]["eval_sets"] == ["held-out", "seen"]
+            sets = {}
+            for _ in range(2):
+                m = recv_until(ws, "evals")
+                sets[m["set"]] = m["evals"][0]["timestep"]
+            assert sets == {"held-out": 100, "seen": 200}
+            ws.send(json.dumps(dict(type="open_replay", set="seen", id="t1")))
+            assert recv_until(ws, "replay")["meta"]["timestep"] == 200
+            ws.send(json.dumps(dict(type="open_replay", set="held-out",
+                                    id="t1")))
+            assert recv_until(ws, "replay")["meta"]["timestep"] == 100
     finally:
         srv.close()
 

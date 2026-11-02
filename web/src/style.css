@@ -86,8 +86,26 @@ tr.focus { background: rgba(77, 143, 214, 0.25); }
   background: rgba(0, 0, 0, 0.2); border-radius: 4px; }
 td.oc { font-weight: 500; }
 
+/* camera panel (cameras.ts) and its switch in the top bar */
+#cameras { position: fixed; left: 12px; bottom: calc(var(--bar-h, 0px) + 12px); width: min(528px, calc(100vw - 24px));
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px 8px; z-index: 4; }
+#cameras[hidden] { display: none; }
+.cam-head { color: var(--muted); font-variant-numeric: tabular-nums; padding-bottom: 4px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cam-view { display: block; width: 100%; max-height: calc(100vh - 110px - var(--top-h, 44px) - var(--bar-h, 0px));
+  object-fit: contain; image-rendering: pixelated; cursor: pointer; background: #000; }
+#top label.switch { cursor: pointer; user-select: none; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch .track { position: relative; width: 26px; height: 14px; border-radius: 7px; background: #3a3d44;
+  border: 1px solid var(--line); transition: background 0.12s; }
+.switch .track::after { content: ""; position: absolute; top: 1px; left: 1px; width: 10px; height: 10px;
+  border-radius: 50%; background: var(--muted); transition: transform 0.12s, background 0.12s; }
+.switch input:checked + .track { background: var(--accent); border-color: var(--accent); }
+.switch input:checked + .track::after { transform: translateX(12px); background: #fff; }
+.switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 /* golden-image captures (tools/golden.py): the 3D view alone */
-body.bare #panel, body.bare #display, body.bare #bar, body.bare #top, body.bare #toasts, body.bare #error { display: none !important; }
+body.bare #cameras, body.bare #panel, body.bare #display, body.bare #bar, body.bare #top, body.bare #toasts, body.bare #error { display: none !important; }
 
 /* Display popover (style, shadows, slice plane, per-object opacity) */
 #display { position: fixed; top: calc(12px + var(--top-h, 44px)); left: 12px; width: min(330px, calc(100vw - 24px));

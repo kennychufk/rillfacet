@@ -17,8 +17,12 @@ once per content hash as ``<root>/scenes/<hash>.npz`` and ``<root>/index.json``
 lists the records (append-only). Pose tracks are compressed: bodies that
 never move are stored once, the rest quantized to int16 (positions over
 their range, quaternions over [-1, 1]); :func:`pose_codec_error` reports the
-worst position error. :class:`RecordWriter` does the compression and file
-I/O on a background thread.
+worst position error. Image tracks (:class:`~rillfacet.scene_api.Images`) are
+JPEG sheets (:mod:`.images`) in a file of their own, ``images_<track>.bin``
+with the offsets in ``tracks.npz``: replays read it only when asked to, and
+deleting it leaves a record that replays without images.
+:class:`RecordWriter` does the compression and file I/O on a background
+thread.
 """
 from __future__ import annotations
 
@@ -31,11 +35,13 @@ import threading
 
 import numpy as np
 
-from ..scene_api import Backend, Boxes, Labels, Points, Polyline, RigidMesh
+from ..scene_api import (Backend, Boxes, Images, Labels, Points, Polyline,
+                         RigidMesh, _host)
+from .images import decode_images, encode_images
 
 __all__ = ["Recorder", "Record", "RecordWriter", "write_record",
            "read_record", "read_index", "encode_poses", "decode_poses",
-           "pose_codec_error"]
+           "pose_codec_error", "load_images"]
 
 #: Samples per pinned host chunk for GPU tracks.
 _CHUNK = 512
@@ -46,7 +52,7 @@ _CHUNK = 512
 _DYNAMIC = {"rigid_mesh": ("poses",), "labels": ("values",)}
 _INITIAL = {"rigid_mesh": ("poses", "colors"), "boxes": ("boxes",),
             "labels": ("values",), "points": ("points",),
-            "polyline": ("points",)}
+            "polyline": ("points",), "images": ("images",)}
 
 
 class _Track:
@@ -137,6 +143,8 @@ class Recorder(Backend):
             for what in _INITIAL.get(obj.kind, ()):
                 if what == "poses" and obj.poses is None:
                     continue
+                if what == "images" and obj.images is None:
+                    continue
                 self.update(obj, what)
         if scene.channels:
             self.set_channels(scene.channels)
@@ -187,6 +195,10 @@ class Recorder(Backend):
         elif isinstance(obj, Labels) and what == "values":
             if obj.values is not None:
                 self._log(n, "values", obj.values)
+        elif isinstance(obj, Images) and what == "images":
+            # On the host at once: a GPU track's pinned chunks hold 512
+            # samples, far too much for images.
+            self._log(n, "images", _host(obj.images, np.uint8))
 
     def set_channels(self, channels: dict) -> None:
         if not self.active:
@@ -316,6 +328,12 @@ def write_record(root: str, rid: str, record: Record, *, meta: dict,
             for k, a in enc.items():
                 arrays[f"{i}/poses.{k}"] = a
             entry["codec"] = "poses_q16"
+        elif field == "images" and v.ndim == 6:
+            enc = encode_images(v)
+            entry.update(codec="jpeg_sheet", file=f"images_{i}.bin")
+            _write_atomic(os.path.join(d, entry["file"]), enc["data"])
+            arrays[f"{i}/images.shape"] = enc["shape"]
+            arrays[f"{i}/images.offsets"] = enc["offsets"]
         else:
             arrays[f"{i}/v"] = v
         manifest.append(entry)
@@ -347,10 +365,21 @@ def read_index(root: str) -> list:
         return json.load(f)
 
 
+def load_images(enc: dict) -> dict:
+    """An image track of ``read_record(raw_poses=True)`` with its ``data``
+    (the file's bytes) read."""
+    if "data" in enc:
+        return enc
+    with open(enc["path"], "rb") as f:
+        return dict(enc, data=f.read())
+
+
 def read_record(path: str, *, raw_poses: bool = False):
     """``(meta, Record, summary)`` of the record directory ``path``. Pose
-    tracks are decoded, or with ``raw_poses`` left as their
-    :func:`encode_poses` dicts (what the web replay sends)."""
+    and image tracks are decoded, or with ``raw_poses`` left as their
+    :func:`encode_poses` dicts and, for images, ``{"shape", "offsets",
+    "path"}`` (what the web replay sends, see :func:`load_images`). An image
+    track whose file was deleted is left out."""
     with open(os.path.join(path, "meta.json")) as f:
         meta = json.load(f)
     with open(os.path.join(path, "summary.json")) as f:
@@ -366,6 +395,14 @@ def read_record(path: str, *, raw_poses: bool = False):
             v = {n[len(pre):]: z[n] for n in z.files if n.startswith(pre)}
             if not raw_poses:
                 v = decode_poses(v)
+        elif e.get("codec") == "jpeg_sheet":
+            file = os.path.join(path, e["file"])
+            if not os.path.exists(file):
+                continue
+            v = dict(shape=z[f"{k}/images.shape"],
+                     offsets=z[f"{k}/images.offsets"], path=file)
+            if not raw_poses:
+                v = decode_images(load_images(v))
         else:
             v = z[f"{k}/v"]
         tracks[(e["object"], e["field"])] = (z[f"{k}/t"], v)

@@ -356,6 +356,8 @@ the static scene once per content hash under `<root>/scenes/`, an
 `index.json`); pose tracks store never-moving bodies once and the rest as
 time-delta-coded int16. `read_record(path)` returns `(meta, record,
 summary)`. A training loop can record every checkpoint's evaluation this way.
+Image tracks (below) are JPEG in their own `images_<track>.bin`; deleting that
+file leaves a record that replays without images.
 
 Web viewer: `rillfacet.web.server.VizServer(host, port)` serves the browser
 client (WebGPU, `web/`) and streams scenes over a WebSocket from inside a
@@ -381,7 +383,9 @@ ring** (the producer's latest episodes, built on request through
 `server.ring = RingMailbox()`), and **Evals** (saved records:
 `VizServer(evals=dir)` or `server.offer_evals(dir)`, picked on the outer
 timeline, played under the scrubber with Space, ←/→, Home/End, [ ]; there Home
-seeks to the start and Shift+Home frames the scene).
+seeks to the start and Shift+Home frames the scene). `offer_evals(dir,
+label)` adds further labelled sets (e.g. a run's held-out and seen evals),
+with an "eval set" selector in the client.
 `server.accept("save_checkpoint", ...)` names the browser requests the
 producer handles; it collects them with `take_requests()` between steps and
 answers with `event(text)` toasts. A finished run's records replay without
@@ -390,6 +394,21 @@ the producer:
 ```bash
 python -m rillfacet.web.replay RUN_DIR      # RUN_DIR or its evals/ directory
 ```
+
+Given a run, its `evals_<label>/` directories are offered as eval sets too.
+
+Camera images: `scene.images(name, instances, views, height, width)` carries
+uint8 `[instances, views, H, W, 3]` pixels the caller already has, e.g. what a
+vision policy sees (`set_images`, numpy or torch; the native viewer ignores
+them). A scene with images gets a "cameras" switch in the client's top bar,
+off by default, and a panel showing every instance (click one for its views).
+Per client: off, the server sends it none, and with no client asking,
+`StreamBackend.commit` does not copy them (`images_wanted()` tells the
+producer not to fetch them either). A step travels as ONE JPEG, a row per
+instance and a column per view (`rillfacet.web.images`, quality 85, 4:4:4; needs
+`pip install rillfacet[images]`): at 64 x 48 a JPEG per view would be mostly
+headers. 16 envs x 4 views x 64 x 48 is ~60 KB per step. A `Recorder` logs every
+`set_images`, and a replay sends them on request, from where it left off.
 
 HTTPS: WebGPU needs a secure context, which plain http is only on
 `localhost` (the client says so instead of starting). To open the viewer

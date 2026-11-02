@@ -14,7 +14,9 @@ The scene is split by how often things change, so streaming stays cheap:
 - labels: world-anchored text, either fixed strings or VALUES formatted by
   the backend (``fmt``), so a stream carries numbers, not strings;
 - channels: named value arrays (per-env metrics, batch stats) that panels
-  and plots read. The native backend keeps them only for the application.
+  and plots read. The native backend keeps them only for the application;
+- images: uint8 camera images per instance and view (:class:`Images`), for
+  the web viewer's camera panel. The native backend ignores them.
 
 Handles keep their latest state, so a backend attached later (a browser
 connecting mid-run) can be sent the whole scene.
@@ -40,7 +42,8 @@ import numpy as np
 
 __all__ = ["Scene", "Backend", "NativeBackend", "RigidMesh", "Boxes",
            "Points", "Polyline", "Labels", "Material", "Light",
-           "Background", "CameraSensor", "box_mesh", "skin", "compose", "as_scene"]
+           "Background", "CameraSensor", "Images", "box_mesh", "skin",
+           "compose", "as_scene"]
 
 
 def _host(a, dtype=np.float32) -> np.ndarray:
@@ -607,6 +610,38 @@ class Background(_Object):
                      yaw=self.yaw, intensity=self.intensity))
 
 
+class Images(_Object):
+    """Images to LOOK AT, e.g. what a vision policy saw: uint8 sRGB
+    ``[instances, views, height, width, 3]``, ``views`` the names of the
+    second axis. :meth:`set_images` holds a reference (numpy, or a torch
+    tensor on any device); a stream copies it only for a client that asked
+    for images, a recorder logs every call as the ``(name, "images")``
+    track. Not scene content: a :class:`CameraSensor` renders from the
+    scene, this only carries pixels the caller already has."""
+    kind = "images"
+
+    def __init__(self, scene, name, instances, views, height, width):
+        super().__init__(scene, name)
+        self.instances, self.views = int(instances), [str(v) for v in views]
+        self.height, self.width = int(height), int(width)
+        self.images = None
+
+    @property
+    def shape(self) -> tuple:
+        return (self.instances, len(self.views), self.height, self.width, 3)
+
+    def set_images(self, images) -> None:
+        if tuple(images.shape) != self.shape:
+            raise ValueError(f"Images {self.name!r}: expected {self.shape}, "
+                             f"got {tuple(images.shape)}")
+        self.images = images
+        self._changed("images")
+
+    def state(self):
+        return (dict(instances=self.instances, views=self.views,
+                     height=self.height, width=self.width), {})
+
+
 class CameraSensor(_Object):
     """A camera (an image sensor, not the viewer's camera) per instance.
 
@@ -883,6 +918,9 @@ class Scene:
 
     def camera_sensor(self, name, width, height, K, **kw) -> CameraSensor:
         return self._add(CameraSensor(self, name, width, height, K, **kw))
+
+    def images(self, name, instances, views, height, width) -> Images:
+        return self._add(Images(self, name, instances, views, height, width))
 
     # -- per frame ----------------------------------------------------------
 

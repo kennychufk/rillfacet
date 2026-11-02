@@ -179,3 +179,56 @@ def test_record_with_render_only_objects(tmp_path):
     assert objs["sun"]["kind"] == "light"
     assert objs["wrist"]["attrs"]["mount"] == "bodies"
     assert objs["bodies"]["attrs"]["materials"][0]["name"] == "m"
+
+
+def image_record(K=5, n=2, C=4, H=48, W=64):
+    x = np.zeros((K, n, C, H, W, 3), np.uint8)
+    for k in range(K):
+        for e in range(n):
+            for c in range(C):
+                x[k, e, c] = (30 * k + 40, 40 * e + 30, 30 * c + 40)
+    rec = Recorder()
+    sc = Scene(rec)
+    cams = sc.images("cams", n, [f"v{c}" for c in range(C)], H, W)
+    cams.set_images(x[0])
+    rec.start(sc, t=0)
+    for k in range(1, K):
+        rec.tick(25 * k)
+        cams.set_images(x[k])
+    return rec.finish(), x
+
+
+def test_image_track_is_jpeg_in_its_own_file(tmp_path):
+    record, x = image_record()
+    t, v = record.track("cams", "images")
+    assert t.tolist() == [0, 25, 50, 75, 100] and v.shape == x.shape
+    d = write_record(str(tmp_path), "r", record, meta={}, summary={})
+    assert os.path.getsize(os.path.join(d, "images_0.bin")) < x.size / 4
+    _, back, _ = read_record(d)
+    t, v = back.track("cams", "images")
+    assert v.shape == x.shape and np.abs(v.astype(int) - x).max() <= 4
+
+    # the raw form leaves the bytes on disk until asked for
+    _, raw, _ = read_record(d, raw_poses=True)
+    enc = raw.track("cams", "images")[1]
+    assert "data" not in enc and enc["offsets"][-1] == os.path.getsize(enc["path"])
+
+    # pruning a record's frames leaves a record without images
+    os.remove(os.path.join(d, "images_0.bin"))
+    _, pruned, _ = read_record(d)
+    assert ("cams", "images") not in pruned.tracks
+
+
+def test_images_shape_is_checked_and_scene_rebuilds(tmp_path):
+    from rillfacet.web.replay import build_scene, set_state
+    record, x = image_record(K=2)
+    d = write_record(str(tmp_path), "r", record, meta={}, summary={})
+    _, back, _ = read_record(d)
+    sc = Scene()
+    build_scene(sc, back.snapshot)
+    cams = sc.objects["cams"]
+    assert cams.views == ["v0", "v1", "v2", "v3"]
+    set_state(sc, back, 30)
+    assert np.abs(cams.images.astype(int) - x[1]).max() <= 4
+    with pytest.raises(ValueError):
+        cams.set_images(np.zeros((1, 4, 48, 64, 3), np.uint8))
