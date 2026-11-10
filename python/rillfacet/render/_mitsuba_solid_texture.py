@@ -1,9 +1,12 @@
 """Mitsuba 3 plugins for the procedural solid (3D) textures of
-:mod:`rillfacet.solid_texture` (used by
+:mod:`rillfacet.solid_texture` and the UV (2D) textures of
+:mod:`rillfacet.uv_texture` (used by
 :class:`~rillfacet.render.mitsuba.MitsubaRenderer`).
 
-The solid-texture slots of a rigid mesh form one Mitsuba mesh (two with bump:
-it is a different BSDF) holding every instance. Its BSDF is
+The solid- and UV-texture slots of a rigid mesh form one Mitsuba mesh (two
+with bump: it is a different BSDF) holding every instance; each lane's row
+(:func:`rillfacet.uv_texture.render_rows`) says which kind it draws. Its
+BSDF is
 ``scope(twosided([normalmap](principled)))``, with
 
 - ``base_color``, ``roughness`` (and the ``normalmap``'s normals): three
@@ -12,10 +15,13 @@ it is a different BSDF) holding every instance. Its BSDF is
   instance, then the triangle's slot) in a flat buffer that is rewritten
   for new parameters without recompiling, evaluates the row's family with
   ``dr.switch`` at the body-local position (the ``vertex_plocal`` mesh
-  attribute), and bumps with finite differences along the triangle's
+  attribute) or, for a UV row, at the metric UV (``vertex_muv``), and
+  bumps with finite differences along the triangle's
   tangents (world edges ``si.dp_du`` / ``si.dp_dv``, which Mitsuba sets
   for meshes without UVs, and the same edges body-local, the
-  ``face_le1`` / ``face_le2`` attributes).
+  ``face_le1`` / ``face_le2`` attributes); a UV row's bump takes finite
+  differences along u and v and the surface gradients of u and v
+  (``face_gu`` / ``face_gv``: coefficients of the world edges).
 - ``scope`` (:class:`ScopeBSDF`): forwards every call, and memoizes the
   pattern within ONE call. ``principled`` reads its textures separately,
   in each of eval / sample / pdf, and ``twosided`` once per side, so
@@ -39,6 +45,7 @@ from __future__ import annotations
 import numpy as np
 
 from .. import solid_texture as sx
+from .. import uv_texture as ux
 
 _PLUGINS: dict = {}            # variant -> (State, make_texture, make_scope)
 
@@ -56,11 +63,14 @@ def _define(mi):
     import drjit as dr
     o = sx.DrOps(mi, dr)
     NF = len(sx.FAMILY_FNS)
+    NU = len(ux.FAMILY_FNS)
+    UV0 = ux.RENDER_FAMILY_OFFSET
     PAR = sx.PARAM
 
     class State:
-        def __init__(self, nt, tri_slot, M):
+        def __init__(self, nt, tri_slot, M, uv=False):
             self.nt, self.M = int(nt), int(M)
+            self.uv = bool(uv)                # the mesh has vertex_muv
             self.tri_slot = mi.UInt32(np.asarray(tri_slot, np.uint32))
             self.params = None                # mi.Float [I * M * K], linear
             self.depth = 0                    # > 0 inside a scope call
@@ -82,26 +92,40 @@ def _define(mi):
             params, base = self.params, row * sx.K
             return lambda k: dr.gather(mi.Float, params, base + k, active)
 
-        def pattern(self, p, row, active):
-            """(h, (r, g, b)) of the row's family at body-local ``p``."""
+        def pattern(self, p, row, active, uv=None):
+            """(h, (r, g, b)) of the row's family at body-local ``p`` (a
+            solid row) or metric ``uv`` (a UV row)."""
             params = self.params
             fam = mi.UInt32(dr.gather(mi.Float, params,
                                       row * sx.K + PAR["family"], active))
+            if uv is None:
+                uv = (dr.zeros(mi.Float, dr.width(p[0])),) * 2
 
             def make(fn):
-                def target(px, py, pz, row, active=True):
+                def target(px, py, pz, ux_, uy_, row, active=True):
                     P = lambda k: dr.gather(mi.Float, params,           # noqa: E731
                                             row * sx.K + k, active)
                     h, c = fn(o, sx.pattern_point(o, (px, py, pz), P), P)
                     return h, c[0], c[1], c[2]
                 return target
-            h, r, g, b = dr.switch(dr.minimum(fam, NF - 1),
-                                   [make(fn) for fn in sx.FAMILY_FNS],
-                                   p[0], p[1], p[2], row, active=active)
+
+            def make_uv(fn):
+                def target(px, py, pz, ux_, uy_, row, active=True):
+                    P = lambda k: dr.gather(mi.Float, params,           # noqa: E731
+                                            row * sx.K + k, active)
+                    h, c = fn(o, ux.pattern_point(o, (ux_, uy_), P), P)
+                    return h, c[0], c[1], c[2]
+                return target
+            index = dr.select(fam >= UV0, NF + dr.minimum(fam - UV0, NU - 1),
+                              dr.minimum(fam, NF - 1))
+            h, r, g, b = dr.switch(
+                index, [make(fn) for fn in sx.FAMILY_FNS]
+                + [make_uv(fn) for fn in ux.FAMILY_FNS],
+                p[0], p[1], p[2], uv[0], uv[1], row, active=active)
             return h, (r, g, b)
 
         def at(self, si, active):
-            """(row, p, h, rgb) at ``si``; inside a scope call once per
+            """(row, p, uv, h, rgb) at ``si``; inside a scope call once per
             ``si`` (the same variables), for every valid lane: a call
             evaluates its textures under different masks (twosided: front,
             then back)."""
@@ -116,10 +140,15 @@ def _define(mi):
             row = self.row(si, active)
             c = si.shape.eval_attribute_3("vertex_plocal", si, active)
             p = (c.x, c.y, c.z)
-            h, rgb = self.pattern(p, row, active)
+            uv = None
+            if self.uv:
+                u = si.shape.eval_attribute_3("vertex_muv", si, active)
+                uv = (u.x, u.y)
+            h, rgb = self.pattern(p, row, active, uv)
             if key is not None:   # keep the keyed variables alive
-                self.cache[key] = ((row, p, h, rgb), (si.p, si.prim_index))
-            return row, p, h, rgb
+                self.cache[key] = ((row, p, uv, h, rgb),
+                                   (si.p, si.prim_index))
+            return row, p, uv, h, rgb
 
         def tangents(self, si, active):
             """Orthonormal world tangents of the hit triangle and the same
@@ -137,6 +166,14 @@ def _define(mi):
             inv2 = dr.rsqrt(dr.squared_norm(u2l))
             return t1, u2w * inv2, L1, u2l * inv2
 
+        def uv_gradients(self, si, active):
+            """World surface gradients of the metric u and v."""
+            sh = si.shape
+            gu = sh.eval_attribute_3("face_gu", si, active)
+            gv = sh.eval_attribute_3("face_gv", si, active)
+            return (si.dp_du * gu.x + si.dp_dv * gu.y,
+                    si.dp_du * gv.x + si.dp_dv * gv.y)
+
     class SolidTexture(mi.Texture):
         """``mode``: ``color`` (linear rgb), ``rough``
         (lerp(rough0, rough1, h)) or ``normal`` (the bumped shading normal,
@@ -150,12 +187,12 @@ def _define(mi):
         def _color(self, si, active):
             if not self.state.depth:          # a dead call target
                 return mi.Color3f(0.5)
-            return mi.Color3f(*self.state.at(si, active)[3])
+            return mi.Color3f(*self.state.at(si, active)[4])
 
         def _rough(self, si, active):
             if not self.state.depth:
                 return mi.Float(0.5)
-            row, _, h, _ = self.state.at(si, active)
+            row, _, _, h, _ = self.state.at(si, active)
             P = self.state.accessor(row, active)
             return dr.lerp(P(PAR["rough0"]), P(PAR["rough1"]), h)
 
@@ -163,15 +200,24 @@ def _define(mi):
             st = self.state
             if not st.depth:
                 return mi.Color3f(0.5, 0.5, 1.0)
-            row, p, h0, _ = st.at(si, active)
+            row, p, uv, h0, _ = st.at(si, active)
             P = st.accessor(row, active)
             t1, t2, L1, L2 = st.tangents(si, active)
             eps = P(PAR["eps"]) / P(PAR["scale"])
+            # one step serves both kinds: a solid row reads p, a UV row uv
+            uv1 = uv2 = None
+            if uv is not None:
+                uv1, uv2 = (uv[0] + eps, uv[1]), (uv[0], uv[1] + eps)
             h1, _ = st.pattern(tuple(a + eps * b for a, b in zip(p, L1)),
-                               row, active)
+                               row, active, uv1)
             h2, _ = st.pattern(tuple(a + eps * b for a, b in zip(p, L2)),
-                               row, active)
-            g = (t1 * (h1 - h0) + t2 * (h2 - h0)) * (P(PAR["bump"]) / eps)
+                               row, active, uv2)
+            g = t1 * (h1 - h0) + t2 * (h2 - h0)
+            if uv is not None:
+                gu, gv = st.uv_gradients(si, active)
+                is_uv = P(PAR["family"]) >= UV0 - 0.5
+                g = dr.select(is_uv, gu * (h1 - h0) + gv * (h2 - h0), g)
+            g = g * (P(PAR["bump"]) / eps)
             m = dr.normalize(si.sh_frame.n - g)
             return mi.Color3f(si.to_local(m)) * 0.5 + 0.5
 

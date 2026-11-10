@@ -742,3 +742,138 @@ def test_solid_texture_matches_mitsuba():
     d = (imgs[0] - imgs[1]).abs().amax(-1)
     assert float(d.median()) < 0.01
     assert float((d > 0.05).float().mean()) < 0.03
+
+
+# ---- UV (2D) textures ---------------------------------------------------------
+
+def _uv_plane(renderer, rows, half=3.0, light=("ambient", dict(intensity=1.0)),
+              bump=False, materials=None, Kc=K):
+    """One plane at z = 2 per env whose metric UVs are its body-local (x, y)
+    (body pose = identity), a UV-texture slot."""
+    I = len(rows)
+    sc = Scene(renderer)
+    v, f = quad(2.0, half)
+    m = rigid(sc, "m", [(v, f)], I, metric_uvs=v[:, :2], materials=materials or [
+        Material("a", uv_texture=True, bump=bump)])
+    m.set_poses(identity_poses(I, 1))
+    if m.material_uv_texture is not None:
+        m.set_materials(uv_texture=np.asarray(rows)[:, None])
+    sc.light("l", light[0], **light[1])
+    sc.camera_sensor("c", W, H, Kc, instances=I, local_pose=IDENTITY, far=10)
+    return sc, m
+
+
+def test_uv_texture_matches_the_reference():
+    """Unfiltered, every family: the base color the raster shades with is
+    the torch reference's at the pixel's metric UV (as the solid test)."""
+    from rillfacet import uv_texture as ut
+    rng = np.random.default_rng(0)
+    fams = ut.FAMILIES[1:]
+    rows = np.concatenate([ut.sample_params(rng, 2, families=(f,),
+                                            scale=(0.4, 0.8)) for f in fams])
+    rows[:, ut.PARAM["rough1"]] = rows[:, ut.PARAM["rough0"]] = 0.6
+    out = []
+    for kind in ("uv", "black", "white"):
+        r = RasterRenderer(chunk=4, supersample=1, solid_texture_filter=False)
+        mats = None if kind == "uv" else [Material(
+            "a", (0, 0, 0) if kind == "black" else (1, 1, 1), roughness=0.6)]
+        _uv_plane(r, rows, materials=mats)
+        out.append(r.render("c", outputs=("linear",))["linear"].double())
+        r.close()
+    L, Lb, Lw = out
+    base = ((L - Lb) / (Lw - Lb)).cpu()
+    uv = torch.as_tensor(_plane_points()[..., :2]).reshape(-1, 2)
+    for e in range(len(rows)):
+        _, want = ut.evaluate(uv, torch.as_tensor(rows[e]).expand(len(uv), ut.K))
+        err = (base[e].reshape(-1, 3) - want).abs().max(-1).values
+        # fp16 output, bilinear proxy taps; shape edges
+        assert float(err.median()) < 3e-3, fams[e // 2]
+        assert float((err > 0.03).float().mean()) < 0.05, fams[e // 2]
+
+
+def test_uv_texture_bump_follows_the_height():
+    """A bumped white plane under a tilted sun, unfiltered: radiance bumped
+    / flat follows the cosine ratio of the reference's height gradient in
+    u, v (the surface gradients of u, v here: x, y), not its mirror."""
+    from rillfacet import uv_texture as ut
+    amp, scale, eps = 0.02, 3.0, 0.02
+    row = ut.make_params("brushed", colors=((0.7, 0.7, 0.7),), scale=scale,
+                         rotation=0.4, knobs=(0.0, 1.0, 1.5, 0), roughness=1.0,
+                         bump=amp, eps=eps)
+    d = np.array([0.5, 0.3, 1.0])
+    out = []
+    for a in (amp, 0.0):
+        row[ut.PARAM["bump"]] = a
+        r = RasterRenderer(chunk=1, supersample=1, shadow_resolution=0,
+                           solid_texture_filter=False)
+        _uv_plane(r, [row], bump=True, Kc=K_FINE,
+                  light=("directional", dict(direction=tuple(d), intensity=3.0)))
+        out.append(r.render("c", outputs=("linear",))["linear"][0].mean(-1).cpu())
+        r.close()
+    uv = torch.as_tensor(_plane_points(Kc=K_FINE)[..., :2]).reshape(-1, 2)
+    rows = torch.as_tensor(row).expand(len(uv), ut.K)
+    e = eps / scale
+    h0, _ = ut.evaluate(uv, rows)
+    gx = (ut.evaluate(uv + torch.tensor([e, 0]), rows)[0] - h0) / e
+    gy = (ut.evaluate(uv + torch.tensor([0, e]), rows)[0] - h0) / e
+    L = -torch.as_tensor(d / np.linalg.norm(d), dtype=torch.float32)
+
+    def cos_ratio(sign):
+        n = torch.stack([-sign * amp * gx, -sign * amp * gy, -torch.ones_like(gx)], -1)
+        n = n / n.norm(dim=-1, keepdim=True)
+        return (n @ L).clamp(min=0) / -L[2]
+
+    ratio = (out[0] / out[1].clamp(min=1e-4)).reshape(-1)
+    corr = lambda x: float(torch.corrcoef(torch.stack([ratio, x]))[0, 1])  # noqa: E731
+    assert float(ratio.std()) > 0.03
+    assert corr(cos_ratio(1.0)) > 0.9
+    assert corr(cos_ratio(-1.0)) < 0.0
+
+
+def test_uv_texture_filter_removes_aliasing():
+    """Stripes far below a pixel: unfiltered they alias, filtered every
+    pixel is the mean; resolved, the filter keeps the mean."""
+    from rillfacet import uv_texture as ut
+    row = ut.make_params("stripes", colors=((1, 1, 1), (0, 0, 0)), scale=400.0,
+                         rotation=0.3, roughness=0.6)
+    res = {}
+    for filt in (False, True):
+        r = RasterRenderer(chunk=1, solid_texture_filter=filt)
+        _uv_plane(r, [row])
+        res[filt] = r.render("c", outputs=("linear",))["linear"][0, 8:40, 8:56].float()
+        r.close()
+    assert float(res[False].std((0, 1)).mean()) > 0.1
+    assert float(res[True].std((0, 1)).mean()) < 0.01
+    dots = ut.make_params("dots", colors=((0.9, 0.8, 0.7), (0.1, 0.2, 0.3)),
+                          scale=500.0, roughness=0.6)
+    r = RasterRenderer(chunk=1, solid_texture_filter=True)
+    _uv_plane(r, [dots])
+    img = r.render("c", outputs=("linear",))["linear"][0, 8:40, 8:56].float()
+    r.close()
+    assert float(img.std((0, 1)).mean()) < 0.01
+    row[ut.PARAM["scale"]] = 2.0
+    for filt in (False, True):
+        r = RasterRenderer(chunk=1, solid_texture_filter=filt)
+        _uv_plane(r, [row])
+        res[filt] = r.render("c", outputs=("linear",))["linear"].float()
+        r.close()
+    a, b = res[False], res[True]
+    assert float((a[0].mean((0, 1)) - b[0].mean((0, 1))).abs().max()) < 0.01
+
+
+def test_uv_texture_matches_mitsuba():
+    """Random rows of every family (bumped) under the sun, against Mitsuba's
+    direct integrator: the same images up to anti-aliasing."""
+    from rillfacet import uv_texture as ut
+    rng = np.random.default_rng(1)
+    rows = np.concatenate([ut.sample_params(rng, 1, families=(f,), scale=(0.4, 0.8),
+                                            bump=(0.0, 0.002))
+                           for f in ut.FAMILIES[1:]])
+    imgs = []
+    for R in (RasterRenderer(chunk=11, shadow_resolution=0), _mitsuba()):
+        _uv_plane(R, rows, bump=True, Kc=K_FINE,
+                  light=("directional", dict(direction=(0.2, 0.1, 1.0), intensity=2.0)))
+        imgs.append(R.render("c", outputs=("linear",))["linear"].float().cpu())
+    d = (imgs[0] - imgs[1]).abs().amax(-1)
+    assert float(d.median()) < 0.01
+    assert float((d > 0.05).float().mean()) < 0.05

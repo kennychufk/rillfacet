@@ -8,11 +8,13 @@
 // e % T of layer e / T. SEG_FORMAT / SEG_NONE are substituted at load
 // (r16uint / 0xffffu, or r32uint / 0xffffffffu). Solid (3D) textures:
 // common/solid_texture.wgsl, evaluated at the interpolated body-local
-// position.
+// position; UV (2D) textures: common/uv_texture.wgsl, at the interpolated
+// uv (a UV-texture slot's vertices carry its metric UVs).
 enable clip_distances;
 
 #include "common/noise.wgsl"
 #include "common/solid_texture.wgsl"
+#include "common/uv_texture.wgsl"
 
 const PI: f32 = 3.14159265358979;
 const NONE: u32 = SEG_NONE;    // label of "nothing"
@@ -277,16 +279,29 @@ fn shade(i: FIn) -> vec3f {
   let face = cross(dpdx(i.wp), dpdy(i.wp));                 // flat shading without normals
   // a proxy pixel's body-local footprint (m), for the solid texture's
   // filtering (derivatives: before any non-uniform branch)
-  let fl = max(length(dpdx(i.lp)), length(dpdy(i.lp)));
+  let dpx = dpdx(i.lp);
+  let dpy = dpdy(i.lp);
+  let fl = max(length(dpx), length(dpy));
+  let dux = dpdx(i.uv);                                       // UV textures: their
+  let duy = dpdy(i.uv);                                       // footprint and gradients
+  let fu = max(length(dux), length(duy));
   var N = select(normalize(face), normalize(i.n), dot(i.n, i.n) > 1e-12);
   N = select(N, -N, dot(N, V) < 0.0);                        // two-sided
   let srow = i32(m.p.z);
   if (srow >= 0) {
     let r = solid_rows[u32(srow)];
-    let s = solid_texture(r, i.lp, fl);
+    let is_uv = ut_is_uv(r);
+    var s: vec4f;
+    if (is_uv) { s = uv_texture(r, i.uv, fu); } else { s = solid_texture(r, i.lp, fl); }
     base = s.yzw;
     rough = clamp(nz_lerp(sp(r, ST_ROUGH0), sp(r, ST_ROUGH1), s.x), 0.03, 1.0);
-    if (m.p.w > 0.0) { N = solid_bump(r, i.lp, fl, s.x, N, i.bq); }
+    if (m.p.w > 0.0) {
+      if (is_uv) {
+        N = uv_bump(r, i.uv, fu, s.x, N, i.bq, dpx, dpy, dux, duy);
+      } else {
+        N = solid_bump(r, i.lp, fl, s.x, N, i.bq);
+      }
+    }
   }
   let NdV = max(dot(N, V), 1e-4);
   let F0 = mix(vec3f(0.04), base, metal);

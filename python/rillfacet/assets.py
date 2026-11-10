@@ -30,24 +30,59 @@ import numpy as np
 from .scene_api import Material
 
 __all__ = ["MeshAsset", "load_mesh", "load_gltf", "load_obj", "merge_bodies",
-           "vertex_normals"]
+           "vertex_normals", "metric_uvs"]
 
 
 @dataclass
 class MeshAsset:
-    """Triangles with optional normals / UVs and a material per triangle."""
+    """Triangles with optional normals / UVs and a material per triangle.
+
+    ``metric_uvs`` ``[V, 2]``: the UVs rescaled so that one unit is one
+    meter on the surface (:func:`metric_uvs`), what UV textures
+    (:mod:`rillfacet.uv_texture`) are evaluated at; NaN where a vertex has
+    no UVs. Loaders scale each glTF primitive on its own; given only
+    ``uvs``, the whole asset gets one scale."""
     vertices: np.ndarray                       # [V, 3] float32
     triangles: np.ndarray                      # [T, 3] int64
     normals: np.ndarray | None = None          # [V, 3]
     uvs: np.ndarray | None = None              # [V, 2], origin top-left
     triangle_material: np.ndarray | None = None  # [T] index into materials
     materials: list = field(default_factory=list)
+    metric_uvs: np.ndarray | None = None       # [V, 2] (m), NaN = none
 
     def __post_init__(self):
         if self.triangle_material is None:
             self.triangle_material = np.zeros(len(self.triangles), np.int32)
         if not self.materials:
             self.materials = [Material("default")]
+        if self.metric_uvs is None and self.uvs is not None:
+            self.metric_uvs = metric_uvs(self.vertices, self.triangles,
+                                         self.uvs)
+
+
+def metric_uvs(vertices, triangles, uvs) -> np.ndarray:
+    """``uvs`` ``[V, 2]`` times one factor, ``sqrt(3D area / UV area)`` over
+    the triangles whose UVs are finite and not degenerate: UVs in meters
+    (an unwrap such as xatlas' keeps one texel density per mesh, so one
+    factor fits all its charts). Non-finite UVs stay NaN; with no usable
+    triangle, every UV is NaN."""
+    v = np.asarray(vertices, np.float64)
+    t = np.asarray(triangles, np.int64).reshape(-1, 3)
+    uv = np.asarray(uvs, np.float64).reshape(-1, 2)
+    ok_v = np.isfinite(uv).all(1)
+    out = np.where(ok_v[:, None], uv, np.nan)
+    if not len(t):
+        return out.astype(np.float32)
+    p, u = v[t], np.where(ok_v[:, None], uv, 0.0)[t]
+    a3 = 0.5 * np.linalg.norm(np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]),
+                              axis=1)
+    d = u[:, 1:] - u[:, :1]
+    au = 0.5 * np.abs(d[:, 0, 0] * d[:, 1, 1] - d[:, 0, 1] * d[:, 1, 0])
+    ok = ok_v[t].all(1) & (au > 1e-14)
+    if not ok.any() or au[ok].sum() <= 0:
+        return np.full_like(uv, np.nan, dtype=np.float32)
+    k = np.sqrt(a3[ok].sum() / au[ok].sum())
+    return (out * k).astype(np.float32)
 
 
 def load_mesh(path, **kw) -> MeshAsset:
@@ -268,7 +303,7 @@ def load_gltf(path, *, y_up=True, scale=1.0) -> MeshAsset:
 def _concat(parts, materials) -> MeshAsset:
     any_n = any(p[2] is not None for p in parts)
     any_uv = any(p[3] is not None for p in parts)
-    vs, ts, ns, uvs, tm, off = [], [], [], [], [], 0
+    vs, ts, ns, uvs, muvs, tm, off = [], [], [], [], [], [], 0
     for v, t, n, uv, slot in parts:
         vs.append(v)
         ts.append(t + off)
@@ -276,13 +311,16 @@ def _concat(parts, materials) -> MeshAsset:
             ns.append(n if n is not None else vertex_normals(v, t))
         if any_uv:
             uvs.append(uv if uv is not None else np.zeros((len(v), 2)))
+            muvs.append(metric_uvs(v, t, uv) if uv is not None
+                        else np.full((len(v), 2), np.nan))
         tm.append(np.full(len(t), slot, np.int32))
         off += len(v)
     return MeshAsset(
         np.concatenate(vs).astype(np.float32), np.concatenate(ts),
         np.concatenate(ns).astype(np.float32) if any_n else None,
         np.concatenate(uvs).astype(np.float32) if any_uv else None,
-        np.concatenate(tm), materials)
+        np.concatenate(tm), materials,
+        np.concatenate(muvs).astype(np.float32) if any_uv else None)
 
 
 # --------------------------------------------------------------------------
@@ -383,11 +421,12 @@ def merge_bodies(assets, origins=None) -> dict:
     """Keyword arguments of :meth:`Scene.rigid_mesh` for bodies with one
     :class:`MeshAsset` each (``None`` = no geometry): body-local vertices,
     triangles grouped by body, normals and UVs (filled in for assets
-    without), and the materials merged BY NAME across bodies (the first
-    definition wins). ``origins`` ``[B, 7]`` (or None per body) place each
-    asset in its body's frame (a URDF visual origin)."""
+    without: zeros, NaN metric UVs), and the materials merged BY NAME
+    across bodies (the first definition wins). ``origins`` ``[B, 7]`` (or
+    None per body) place each asset in its body's frame (a URDF visual
+    origin)."""
     from .scene_api import compose
-    vs, ts, ns, uvs, tm, vb, tri_off = [], [], [], [], [], [], [0]
+    vs, ts, ns, uvs, muvs, tm, vb, tri_off = [], [], [], [], [], [], [], [0]
     materials, slot_of = [], {}
     any_n = any(a is not None and a.normals is not None for a in assets)
     any_uv = any(a is not None and a.uvs is not None for a in assets)
@@ -419,6 +458,8 @@ def merge_bodies(assets, origins=None) -> dict:
             ns.append(n if n is not None else vertex_normals(v, a.triangles))
         if any_uv:
             uvs.append(a.uvs if a.uvs is not None else np.zeros((len(v), 2)))
+            muvs.append(a.metric_uvs if a.metric_uvs is not None
+                        else np.full((len(v), 2), np.nan))
         tm.append(np.asarray(local_slots, np.int32)[a.triangle_material])
         vb.append(np.full(len(v), b, np.int64))
         tri_off.append(tri_off[-1] + len(a.triangles))
@@ -432,4 +473,6 @@ def merge_bodies(assets, origins=None) -> dict:
         body_triangle_offsets=np.asarray(tri_off, np.int64),
         normals=(np.concatenate(ns).astype(np.float32) if any_n else None),
         uvs=(np.concatenate(uvs).astype(np.float32) if any_uv else None),
+        metric_uvs=(np.concatenate(muvs).astype(np.float32) if any_uv
+                    else None),
         materials=materials, triangle_material=np.concatenate(tm))

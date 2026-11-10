@@ -71,8 +71,10 @@ class _Group:
         tris = mesh.triangles[tri_idx].astype(np.int64)
         gv, inv = np.unique(tris.ravel(), return_inverse=True)
         self.sid, self.slot, self.mesh = sid, slot, mesh
-        # color and roughness from a solid (3D) texture, rillfacet.solid_texture
+        # color and roughness from texture rows: solid (3D) textures of
+        # rillfacet.solid_texture and UV (2D) ones of rillfacet.uv_texture
         self.solid_texture, self.bump = bool(solid_texture), bool(bump)
+        self.uv = None                     # metric UVs [nv, 2] of UV slots
         self.state = None                  # its _mitsuba_solid_texture.State
         self.nv, self.nt = len(gv), len(tri_idx)
         self.faces = inv.reshape(-1, 3)
@@ -82,6 +84,10 @@ class _Group:
         self.normals = (None if mesh.normals is None
                         else T.as_tensor(mesh.normals[gv], device=dev))
         self.uvs = None if mesh.uvs is None else mesh.uvs[gv]
+        if (solid_texture and mesh.metric_uvs is not None and any(
+                mesh.materials[s].uv_texture
+                for s in np.unique(mesh.triangle_material[tri_idx]))):
+            self.uv = np.nan_to_num(mesh.metric_uvs[gv], nan=0.0)
         tri_body = np.searchsorted(mesh.body_triangle_offsets, tri_idx,
                                    side="right") - 1
         self.tri_body = tri_body
@@ -147,7 +153,7 @@ class MitsubaRenderer(Renderer):
                 warnings.warn(f"rigid mesh {m.name!r}: textures without UVs "
                               "are drawn untextured")
             solid = [[i for i, mat in enumerate(m.materials)
-                     if mat.solid_texture and mat.bump == bump]
+                     if mat.procedurally_textured and mat.bump == bump]
                     for bump in (False, True)]
             tri_slot = (m.triangle_material if m.triangle_material is not None
                         else np.zeros(len(m.triangles), np.int32))
@@ -197,6 +203,14 @@ class MitsubaRenderer(Renderer):
                 e = local[g.faces[:, k]] - local[g.faces[:, 0]]
                 mesh.add_attribute(f"face_le{k}", 3,
                                    np.tile(e, (I, 1)).ravel())
+            if g.uv is not None:    # metric UVs + their surface gradients
+                uv3 = np.concatenate([g.uv, np.zeros((g.nv, 1))], 1)
+                mesh.add_attribute("vertex_muv", 3, np.tile(
+                    uv3.astype(np.float32), (I, 1)).ravel())
+                from ..uv_texture import uv_gradients
+                gu, gv = uv_gradients(local, g.faces, g.uv, edge_basis=True)
+                mesh.add_attribute("face_gu", 3, np.tile(gu, (I, 1)).ravel())
+                mesh.add_attribute("face_gv", 3, np.tile(gv, (I, 1)).ravel())
         else:
             if g.slot is None:
                 mesh.add_attribute("face_color", 3,
@@ -233,7 +247,8 @@ class MitsubaRenderer(Renderer):
         from ._mitsuba_solid_texture import plugins
         mi = self.mi
         State, texture, scope = plugins(mi)
-        g.state = State(g.nt, g.tri_slot, len(m.materials))
+        g.state = State(g.nt, g.tri_slot, len(m.materials),
+                        uv=g.uv is not None)
         bsdf = {"type": "principled",
                 "base_color": texture(g.state, "color"),
                 "roughness": texture(g.state, "rough"),
@@ -345,8 +360,11 @@ class MitsubaRenderer(Renderer):
             metal = np.zeros((I, g.nt), np.float32)
         p = self._params
         if g.solid_texture:
-            from ..solid_texture import linearize
-            g.state.set_params(linearize(m.material_solid_texture))
+            from ..uv_texture import render_rows
+            slots, rows = render_rows(m)
+            full = np.zeros((I, len(m.materials), rows.shape[-1]), np.float32)
+            full[:, slots] = rows
+            g.state.set_params(full)
         else:
             if g.slot is None:
                 p[self._key(g.sid, "face_color")] = mi.Float(

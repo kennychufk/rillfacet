@@ -199,6 +199,29 @@ fades detail finer than a pixel to its mean (`solid_texture_filter`; it
 shades one point per pixel, where Mitsuba averages over its samples); the
 Cycles backend (`rillfacet-cycles`) runs an OSL port, unfiltered as
 Mitsuba (OptiX and CPU only; Cycles has no OSL on CUDA).
+A material with `uv_texture=True` can instead take them from a procedural
+UV (2D) texture (`rillfacet.uv_texture`), evaluated at the mesh's METRIC
+UVs (`RigidMesh.metric_uvs`: the UVs rescaled per glTF primitive so that
+one unit is one meter on the surface, `assets.metric_uvs`, NaN where a
+vertex has none), so a pattern's scale is pattern units per meter on every
+mesh and level of detail. Families, in groups: regular (stripes, tiles,
+dots, hexagons), material (weave, brushed, perforated, twill), decal
+(decals, glyphs, stickers). Rows are `[E, M, 32]` again
+(`RigidMesh.material_uv_texture`, `set_materials(uv_texture=rows)`,
+`uv_texture.sample_params` / `make_params`); a row of family `none` (the
+default) leaves that env's slot to its solid texture (a slot may be both)
+or its plain material, so one slot is plain, solid- or UV-textured per env.
+`RigidMesh.slot_has_uvs` says which slots have UVs on every triangle (hulls
+have none: they stay solid-only). Renderers draw both kinds through one row
+per (env, slot), `uv_texture.render_rows` (a UV row's family + 64): Mitsuba
+in the same plugin (bump: finite differences in u, v times the faces'
+surface gradients of u and v, `uv_texture.uv_gradients`), raster in
+`shaders/common/uv_texture.wgsl` (the gradients from pixel derivatives;
+filtered like the solid textures), Cycles in OSL (`texture.osl` +
+`uv_texture.h`; a UV map `rf_muv` and face attributes `rf_gu` / `rf_gv`).
+On an unwrapped mesh a UV texture follows the charts, seams included.
+`rillfacet.primitives` builds boxes, spheres and cylinders with metric UVs
+(`MeshAsset`s), for primitive bodies (a table) that should take UV textures.
 `scene.light(...)` adds lights shared by all envs (`directional`,
 `ambient`, `envmap`). `scene.background(name, images, instances=E)` gives
 each env its own panorama, SEEN ONLY (it lights nothing; the lights do):
@@ -325,7 +348,9 @@ interreflections. Geometry agrees with Mitsuba's (labels on all pixels away
 from edges, z-depth to 1e-5; tests/test_render_raster.py). Solid textures
 match the torch reference unfiltered and Mitsuba's images up to
 anti-aliasing; with every slot solid, 4096 envs at 224x224 take 55 ms
-instead of 35 (96 ms with bump).
+instead of 35 (96 ms with bump). UV textures likewise; on four UV-textured
+primitives per env, 4096 envs at 224x224 take 24 ms instead of 20 (29 ms
+with bump).
 
 On Linux + Vulkan + NVIDIA the poses and images never leave the GPU
 (`src/rillfacet/cuda_share.h`): the shared textures are allocated on our own
@@ -519,14 +544,18 @@ src/rillfacet/
 shaders/
   styles/{studio,matcap,pbr,technical}.wgsl   one `shade()` each: edit these to restyle
   mesh, points, curves, arrows, grid, ssao, composite, overlay_*, env_prefilter .wgsl
-  camera_raster.wgsl (+ common/noise.wgsl, common/solid_texture.wgsl)   RasterRenderer
+  camera_raster.wgsl (+ common/noise.wgsl, common/solid_texture.wgsl,
+                       common/uv_texture.wgsl)   RasterRenderer
 src/python/module.cpp   nanobind module `_rillfacet` (+ `rillfacet.imgui`)
 python/rillfacet/        Python package
   scene_api.py          backend-neutral scene (+ materials, lights, backgrounds,
                         camera sensors)
-  assets.py             glTF / OBJ visual meshes, merge_bodies
+  assets.py             glTF / OBJ visual meshes, merge_bodies, metric UVs
+  primitives.py         box / sphere / cylinder meshes with metric UVs
   solid_texture.py      procedural solid (3D) textures: parameter rows, sampler,
                         noise + families (Dr.Jit / torch), torch reference
+  uv_texture.py         procedural UV (2D) textures: the same at metric UVs,
+                        render_rows (what renderers draw per env and slot)
   sky.py                procedural sky panoramas (background pools)
   render/               camera renderers: camera.py (OpenCV model), sensor.py
                         (gain, vignetting, noise), mitsuba.py

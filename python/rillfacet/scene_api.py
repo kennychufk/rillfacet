@@ -173,24 +173,42 @@ class Material:
     (``set_materials(solid_texture=...)``). Until they are set, every
     instance shows the plain family in ``base_color`` and ``roughness``;
     after, those two are not used. ``bump`` also perturbs the shading
-    normal by the solid texture's height (the parameters' ``bump``
-    amplitude), at about twice the shading cost of a solid texture without
+    normal by the texture's height (the parameters' ``bump``
+    amplitude), at about twice the shading cost of a texture without
     it. Mitsuba, the raster backend and the Cycles backend (OSL: on OptiX
-    and the CPU) render solid textures."""
+    and the CPU) render solid and UV textures.
+
+    ``uv_texture``: the slot can instead take its base color and roughness
+    from a procedural UV (2D) texture evaluated at the mesh's metric UVs
+    (:mod:`rillfacet.uv_texture`: stripes, tiles, fabric, labels, ...),
+    with per-instance parameters :attr:`RigidMesh.material_uv_texture`
+    (``set_materials(uv_texture=...)``). A row of family ``none`` (the
+    default) leaves that instance to the solid texture (when
+    ``solid_texture`` is also set) or the ordinary material, so one slot
+    can be plain, solid- or UV-textured per instance. Its triangles need
+    UVs (:attr:`RigidMesh.slot_has_uvs`)."""
 
     def __init__(self, name, base_color=(0.8, 0.8, 0.8), metallic=0.0,
                  roughness=0.5, base_color_texture=None, solid_texture=False,
-                 bump=False):
+                 bump=False, uv_texture=False):
         self.name = str(name)
         self.base_color = _rgb(base_color)
         self.metallic, self.roughness = float(metallic), float(roughness)
         self.base_color_texture = base_color_texture
         self.solid_texture, self.bump = bool(solid_texture), bool(bump)
-        if self.solid_texture and base_color_texture is not None:
-            raise ValueError("Material: solid_texture or "
+        self.uv_texture = bool(uv_texture)
+        if ((self.solid_texture or self.uv_texture)
+                and base_color_texture is not None):
+            raise ValueError("Material: solid_texture / uv_texture or "
                              "base_color_texture, not both")
-        if self.bump and not self.solid_texture:
-            raise ValueError("Material: bump needs solid_texture=True")
+        if self.bump and not (self.solid_texture or self.uv_texture):
+            raise ValueError("Material: bump needs solid_texture=True or "
+                             "uv_texture=True")
+
+    @property
+    def procedurally_textured(self) -> bool:
+        """A solid- or UV-texture slot."""
+        return self.solid_texture or self.uv_texture
 
     def state(self) -> dict:
         tex = self.base_color_texture
@@ -198,12 +216,16 @@ class Material:
                     metallic=self.metallic, roughness=self.roughness,
                     texture=(tex if isinstance(tex, str)
                              else None if tex is None else "<array>"),
-                    solid_texture=self.solid_texture, bump=self.bump)
+                    solid_texture=self.solid_texture,
+                    uv_texture=self.uv_texture, bump=self.bump)
 
     def __repr__(self):
+        kinds = [k for k, on in (("solid texture", self.solid_texture),
+                                 ("UV texture", self.uv_texture)) if on]
         kind = (", textured" if self.base_color_texture is not None
-                else ", solid texture" + (" + bump" if self.bump else "")
-                if self.solid_texture else "")
+                else ", " + " / ".join(kinds) + (" + bump" if self.bump
+                                                 else "")
+                if kinds else "")
         return (f"Material({self.name!r}, base_color={self.base_color}, "
                 f"metallic={self.metallic}, roughness={self.roughness}{kind})")
 
@@ -221,12 +243,17 @@ class RigidMesh(_Object):
     ``instance_names`` default to ``env0``, ``env1``, ...
 
     Appearance for camera renderers (viewers ignore it): ``normals`` and
-    ``uvs`` ``[V, 3|2]`` (body-local), and ``materials`` (a list of
+    ``uvs`` ``[V, 3|2]`` (body-local), ``metric_uvs`` ``[V, 2]`` (UVs in
+    meters for UV textures, NaN where none,
+    :func:`rillfacet.assets.metric_uvs`; default: ``uvs`` rescaled per
+    body), and ``materials`` (a list of
     :class:`Material`) with ``triangle_material`` ``[T]`` the material slot
     of each triangle. Each instance has its own copy of every slot's
     parameters (:meth:`set_materials`), so appearance is randomized per env
     by writing arrays; solid-texture materials have a row of solid texture
-    parameters per instance (:attr:`material_solid_texture`). Without
+    parameters per instance (:attr:`material_solid_texture`), UV-texture
+    materials a row of UV texture parameters (:attr:`material_uv_texture`).
+    Without
     materials, renderers shade each segment with its segment color
     (roughness 0.5, not metallic)."""
     kind = "rigid_mesh"
@@ -235,7 +262,7 @@ class RigidMesh(_Object):
                  body_triangle_offsets, *, instances=1, offsets=None,
                  body_names=None, instance_names=None, colors=None,
                  smooth=False, normals=None, uvs=None, materials=None,
-                 triangle_material=None):
+                 triangle_material=None, metric_uvs=None):
         super().__init__(scene, name)
         self.local_vertices = _host(local_vertices)
         self.vertex_body = np.asarray(vertex_body, np.int64)
@@ -265,6 +292,21 @@ class RigidMesh(_Object):
         self.normals = (None if normals is None
                         else _host(normals).reshape(V, 3))
         self.uvs = None if uvs is None else _host(uvs).reshape(V, 2)
+        if metric_uvs is not None:
+            self.metric_uvs = _host(metric_uvs).reshape(V, 2)
+        elif self.uvs is not None:
+            from .assets import metric_uvs as _metric
+            self.metric_uvs = np.full((V, 2), np.nan, np.float32)
+            for b in range(self.num_bodies):
+                t = self.triangles[self.body_triangle_offsets[b]:
+                                   self.body_triangle_offsets[b + 1]]
+                vs = np.unique(t)
+                if len(vs):
+                    idx = np.searchsorted(vs, t)
+                    self.metric_uvs[vs] = _metric(self.local_vertices[vs],
+                                                  idx, self.uvs[vs])
+        else:
+            self.metric_uvs = None
         self.materials = list(materials) if materials else []
         if self.materials:
             self.triangle_material = (
@@ -291,6 +333,35 @@ class RigidMesh(_Object):
         if any(m.solid_texture for m in self.materials):
             from .solid_texture import default_params
             self.material_solid_texture = default_params(self.materials, I)
+        #: ``[instances, M, K]`` UV texture parameters (family ``none``
+        #: until set), None without UV-texture materials
+        self.material_uv_texture = None
+        if any(m.uv_texture for m in self.materials):
+            from .uv_texture import default_params as uv_default
+            self.material_uv_texture = uv_default(self.materials, I)
+            used = np.bincount(self.triangle_material,
+                               minlength=len(self.materials)) > 0
+            bad = [m.name for m, ok, u in zip(self.materials,
+                                              self.slot_has_uvs, used)
+                   if m.uv_texture and u and not ok]
+            if bad:
+                import warnings
+                warnings.warn(f"RigidMesh {name!r}: UV-texture materials "
+                              f"{bad} have triangles without UVs (drawn at "
+                              "UV 0 there)")
+
+    @property
+    def slot_has_uvs(self) -> np.ndarray:
+        """``[M]`` bool: every triangle of the material slot has finite
+        metric UVs (slots without triangles: False), i.e. it can show a UV
+        texture."""
+        M = len(self.materials)
+        if self.metric_uvs is None or not M:
+            return np.zeros(M, bool)
+        tri_ok = np.isfinite(self.metric_uvs[self.triangles]).all((1, 2))
+        bad = np.bincount(self.triangle_material[~tri_ok], minlength=M)
+        used = np.bincount(self.triangle_material, minlength=M)
+        return (bad == 0) & (used > 0)
 
     @property
     def num_segments(self) -> int:
@@ -334,12 +405,15 @@ class RigidMesh(_Object):
         raise KeyError(f"RigidMesh {self.name!r}: no material {name!r}")
 
     def set_materials(self, base_color=None, metallic=None,
-                      roughness=None, solid_texture=None) -> None:
+                      roughness=None, solid_texture=None,
+                      uv_texture=None) -> None:
         """Per-instance material parameters: ``base_color`` broadcasts to
         ``[instances, M, 3]`` (sRGB), ``metallic`` / ``roughness`` to
         ``[instances, M]``, ``solid_texture`` (parameter rows of
         :mod:`rillfacet.solid_texture`, e.g. ``solid_texture.sample_params(
-        rng, (E, M))``) to ``[instances, M, K]``; None keeps the current values.
+        rng, (E, M))``) and ``uv_texture`` (rows of
+        :mod:`rillfacet.uv_texture`) to ``[instances, M, K]``; None keeps
+        the current values.
         E.g. ``base_color=rng.uniform(0, 1, (E, M, 3))`` randomizes every
         slot of every env; write a slice of :attr:`material_base_color` and
         pass it back to change a few."""
@@ -350,6 +424,12 @@ class RigidMesh(_Object):
                                  "solid-texture material")
             self.material_solid_texture = np.ascontiguousarray(np.broadcast_to(
                 _host(solid_texture), self.material_solid_texture.shape))
+        if uv_texture is not None:
+            if self.material_uv_texture is None:
+                raise ValueError(f"RigidMesh {self.name!r}: no "
+                                 "UV-texture material")
+            self.material_uv_texture = np.ascontiguousarray(np.broadcast_to(
+                _host(uv_texture), self.material_uv_texture.shape))
         if base_color is not None:
             self.material_base_color = np.ascontiguousarray(np.broadcast_to(
                 _host(base_color), (I, M, 3)))
@@ -378,6 +458,8 @@ class RigidMesh(_Object):
             arrays["normals"] = self.normals
         if self.uvs is not None:
             arrays["uvs"] = self.uvs
+        if self.metric_uvs is not None:
+            arrays["metric_uvs"] = self.metric_uvs
         if self.materials:
             attrs["materials"] = [m.state() for m in self.materials]
             arrays.update(triangle_material=self.triangle_material,
@@ -386,6 +468,8 @@ class RigidMesh(_Object):
                           material_roughness=self.material_roughness)
             if self.material_solid_texture is not None:
                 arrays["material_solid_texture"] = self.material_solid_texture
+            if self.material_uv_texture is not None:
+                arrays["material_uv_texture"] = self.material_uv_texture
         return attrs, arrays
 
 

@@ -25,7 +25,9 @@ on the GPU) a frame never waits on the CPU. How it maps the scene, and why
   GGX with separable Smith masking; glTF metallic-roughness, base color
   textures times the per-env base color, solid (3D) textures of
   :mod:`rillfacet.solid_texture` evaluated at the interpolated body-local
-  position, ``shaders/common/solid_texture.wgsl``) under up to 4
+  position, ``shaders/common/solid_texture.wgsl``, and UV (2D) textures
+  of :mod:`rillfacet.uv_texture` at the interpolated metric UVs,
+  ``shaders/common/uv_texture.wgsl``; one row buffer serves both) under up to 4
   directional lights, the first one casting shadows (a
   ``shadow_resolution``\\ :sup:`2` map per env over the scene's bounding
   box or ahead of the camera, 3x3 PCF), plus
@@ -232,9 +234,9 @@ class RasterRenderer(Renderer):
     casts into it; receivers outside it are lit). ``zero_copy``: share
     poses and images with CUDA (needs torch with CUDA; falls back to host
     copies when unavailable). ``seed`` seeds the sensor noise.
-    ``solid_texture_filter``: fade the solid textures' detail finer than a
-    proxy pixel to its mean (the rasterizer shades one point per pixel,
-    so it would alias; Mitsuba averages over its samples instead).
+    ``solid_texture_filter``: fade the solid and UV textures' detail finer
+    than a proxy pixel to its mean (the rasterizer shades one point per
+    pixel, so it would alias; Mitsuba averages over its samples instead).
     """
 
     def __init__(self, *, chunk=256, double_buffer=True, supersample=2,
@@ -323,6 +325,12 @@ class RasterRenderer(Renderer):
                 v[:, 3:6] = m.normals[src]
             if m.uvs is not None:
                 v[:, 6:8] = m.uvs[src]
+            if m.metric_uvs is not None and m.materials:
+                # a UV-texture slot never has an image texture: its
+                # vertices carry the metric UVs instead
+                uvs_slot = np.array([mat.uv_texture for mat in m.materials])
+                sel = uvs_slot[vslot]
+                v[sel, 6:8] = np.nan_to_num(m.metric_uvs[src[sel]], nan=0.0)
             v[:, 8] = (vslot + slots).astype(np.uint32).view(np.float32)
             verts.append(v)
             idx.append((inv.reshape(-1, 3) + nv).astype(np.uint32))
@@ -339,7 +347,7 @@ class RasterRenderer(Renderer):
                 else:
                     spheres.append([0, 0, 0, -1])
             solid = [s for s, mat in enumerate(m.materials)
-                     if mat.solid_texture]
+                     if mat.procedurally_textured]
             if solid:
                 self._solid[m.name] = (rows, solid)
                 rows += len(solid)
@@ -536,7 +544,7 @@ class RasterRenderer(Renderer):
         mats[..., 5:7] = -1.0
         NS = self._solid_rows
         if NS:
-            from ..solid_texture import linearize
+            from ..uv_texture import render_rows
             rows = np.zeros((I, NS, 32), np.float32)
         for m in self.meshes.values():
             s0 = self._slot_bases[m.name]
@@ -547,8 +555,9 @@ class RasterRenderer(Renderer):
                 mats[:, s0:s0 + M, 4] = m.material_metallic
                 if m.name in self._solid:
                     r0, solid = self._solid[m.name]
-                    rows[:, r0:r0 + len(solid)] = linearize(
-                        m.material_solid_texture[:, solid])
+                    slots, rr = render_rows(m)
+                    assert slots == solid
+                    rows[:, r0:r0 + len(solid)] = rr
                     k = np.arange(len(solid))
                     mats[:, s0 + np.array(solid), 6] = (
                         np.arange(I)[:, None] * NS + r0 + k[None])
