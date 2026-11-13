@@ -89,7 +89,7 @@ COPY --from=wheels /dist /dist
 COPY tests /work/tests
 WORKDIR /work
 # --no-index for rillfacet itself: the wheel under test, not whatever an index has.
-RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir pytest numpy websockets \
+RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir pytest numpy websockets pillow \
     && /venv/bin/pip install --no-cache-dir --no-index --no-deps --find-links /dist rillfacet
 ENV PATH=/venv/bin:$PATH
 RUN python -c "import rillfacet, pathlib; p = pathlib.Path(rillfacet.__file__).parent; \
