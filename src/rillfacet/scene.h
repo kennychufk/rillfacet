@@ -152,7 +152,7 @@ class SurfaceMesh : public QuantityStructure {
                     size_t num_triangles);
   void set_positions(const float* xyz);  // same vertex count, e.g. once per sim step
   // Texture coordinates (2 per vertex, origin at the image's top-left) for
-  // ColorSource::Texture.
+  // ColorSource::Texture and normal_map.
   void set_uvs(const float* uv, size_t num_vertices);
   const std::vector<float>& uvs() const { return uvs_; }
   // Segments as CSR offsets over triangles (size S+1). Default: one segment.
@@ -191,6 +191,13 @@ class SurfaceMesh : public QuantityStructure {
 
   bool smooth_shading = false;  // interpolate vertex normals (cloth); flat faces otherwise
   std::string texture;          // Scene image sampled with ColorSource::Texture
+  // Tangent-space normal map (a Scene image, read as linear RGB): glTF's
+  // convention, +x along increasing u, +y toward the image's top, +z out of
+  // the surface. Needs UVs (set_uvs); works with any color source. The
+  // tangent frame comes from the screen-space derivatives of position and
+  // uv, so no tangents are stored.
+  std::string normal_map;
+  float normal_scale = 1.0f;    // scales the map's x and y (glTF normalTexture.scale)
   bool unlit = false;           // show the base color as is (images, markers): no lighting
   // Set when every segment only moves rigidly (e.g. rigid bodies): angles
   // between faces never change, so flat-edge masks are computed once.

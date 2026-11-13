@@ -877,3 +877,66 @@ def test_uv_texture_matches_mitsuba():
     d = (imgs[0] - imgs[1]).abs().amax(-1)
     assert float(d.median()) < 0.01
     assert float((d > 0.05).float().mean()) < 0.05
+
+
+def _rotation_to(a, b):
+    """Rotation matrix taking unit vector a to unit vector b."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    v, c = np.cross(a, b), float(a @ b)
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx / (1 + c)
+
+
+def _normal_texel(x, y):
+    return np.round((np.array([x, y, np.sqrt(1 - x * x - y * y)]) + 1) * 127.5)
+
+
+def _tilt_shot(renderer, normal=None, texel=None, mirrored=False):
+    """Radiance at the center of a gray quad at z = 2 facing the camera
+    (winding toward it), under a sun from the upper left: tilted so its
+    normal is `normal`, or flat with a uniform normal map `texel`."""
+    sc = Scene(renderer)
+    v = np.array([[-1, -1, 2], [1, -1, 2], [1, 1, 2], [-1, 1, 2]], float)
+    if normal is not None:
+        c = np.array([0, 0, 2.0])
+        v = (v - c) @ _rotation_to([0, 0, -1], normal).T + c
+    # u along +x (-x when mirrored), v along +y: the image's top is -y
+    uvs = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)
+    if mirrored:
+        uvs[:, 0] = 1 - uvs[:, 0]
+    nmap = None if texel is None else np.tile(np.asarray(texel, np.uint8), (8, 8, 1))
+    m = sc.rigid_mesh("m", v.astype(np.float32), [0] * 4, np.array([[0, 2, 1], [0, 3, 2]]),
+                      [0, 2], instances=1, uvs=uvs,
+                      materials=[Material("g", (0.7, 0.7, 0.7), roughness=1.0,
+                                          normal_texture=nmap)])
+    m.set_poses(identity_poses(1, 1))
+    sc.light("sun", "directional", direction=(0.5, 0.4, 1.0), intensity=2.0)
+    sc.camera_sensor("c", W, H, K, instances=1, local_pose=IDENTITY, far=10)
+    return float(renderer.render("c", outputs=("linear",))["linear"][0, 18:30, 26:38]
+                 .float().mean().cpu())
+
+
+@pytest.mark.parametrize("backend", ["raster", "mitsuba"])
+def test_normal_map_matches_tilted_geometry(backend):
+    """A flat quad with a uniform tangent-space normal map (glTF's
+    convention: +x along u, +y toward the image's top) shades like the quad
+    tilted that way, mirrored UV mapping included."""
+    def make():
+        if backend == "mitsuba":
+            return _mitsuba()
+        return RasterRenderer(chunk=1, supersample=1, shadow_resolution=0)
+
+    s, c = 0.5, np.sqrt(0.75)
+    cases = [  # texel, world normal, mirrored
+        ((s, 0), (s, 0, -c), False),      # +x of the map: +u = +x
+        ((0, s), (0, -s, -c), False),     # +y: the image's top = -y
+        ((0, -s), (0, s, -c), False),
+        ((s, 0), (-s, 0, -c), True),      # mirrored: +u = -x
+        ((0, s), (0, -s, -c), True),      # ... but +y still the image's top
+    ]
+    for texel, normal, mirrored in cases:
+        mapped = _tilt_shot(make(), texel=_normal_texel(*texel), mirrored=mirrored)
+        tilted = _tilt_shot(make(), normal=normal)
+        other = _tilt_shot(make(), normal=(-normal[0], -normal[1], normal[2]))
+        assert abs(other - tilted) > 0.1 * tilted, (texel, mirrored)
+        assert abs(mapped - tilted) < 0.02 * tilted, (texel, mirrored, mapped, tilted)

@@ -350,8 +350,13 @@ NB_MODULE(_rillfacet, m) {
         auto a = as_vector<float>(uv);
         if (a.size() != 2 * s.num_vertices()) throw nb::value_error("need 2 texture coordinates per vertex");
         s.set_uvs(a.data(), s.num_vertices());
-      }, nb::arg("uv"), "Texture coordinates [V, 2] (origin at the image's top-left) for ColorSource.Texture.")
+      }, nb::arg("uv"), "Texture coordinates [V, 2] (origin at the image's top-left) for ColorSource.Texture "
+                        "and normal_map.")
       .def_rw("texture", &SurfaceMesh::texture, "Scene image sampled with ColorSource.Texture.")
+      .def_rw("normal_map", &SurfaceMesh::normal_map,
+              "Scene image read as a tangent-space normal map (glTF convention: +x along u, +y toward "
+              "the image's top); needs UVs, works with any color source.")
+      .def_rw("normal_scale", &SurfaceMesh::normal_scale, "Scale of the normal map's x and y.")
       .def_rw("unlit", &SurfaceMesh::unlit, "Show the base color as is, without lighting.")
       .def_rw("smooth_shading", &SurfaceMesh::smooth_shading)
       .def_rw("rigid_segments", &SurfaceMesh::rigid_segments);

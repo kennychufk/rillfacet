@@ -49,8 +49,9 @@ struct View {
 @group(0) @binding(2) var poses: texture_2d<f32>;
 
 // Linear base color, roughness; metallic, texture layer (-1 = none), solid
-// texture row (-1 = none), its bump (0 / 1).
-struct Mat { c: vec4f, p: vec4f };
+// texture row (-1 = none), its bump (0 / 1); normal map layer (-1 = none),
+// its scale, 2 spare.
+struct Mat { c: vec4f, p: vec4f, n: vec4f };
 @group(0) @binding(3) var<storage, read> mats: array<Mat>;
 // Solid texture parameter rows (linear colors), [envs * solid slots].
 @group(0) @binding(20) var<storage, read> solid_rows: array<SolidRow>;
@@ -63,6 +64,8 @@ struct Mat { c: vec4f, p: vec4f };
 // Directional albedo of the BRDF by (n_dot_v, roughness): GGX scale and
 // bias (F0 * x + y) and Burley diffuse (rillfacet.render.raster.brdf_lut).
 @group(0) @binding(19) var brdf_lut: texture_2d<f32>;
+// Tangent-space normal maps (linear, glTF's convention), sampled like base_tex.
+@group(0) @binding(22) var normal_tex: texture_2d_array<f32>;
 
 fn qrot(q: vec4f, v: vec3f) -> vec3f {
   let t = 2.0 * cross(q.xyz, v);
@@ -263,20 +266,46 @@ fn solid_bump(r: SolidRow, p: vec3f, fl: f32, h0: f32, N: vec3f, q: vec4f) -> ve
   return normalize(N - g);
 }
 
+// N perturbed by a tangent-space normal map texel `t` (glTF's convention:
+// +x along increasing u, +y toward the image's top, i.e. decreasing v),
+// x / y scaled by `k`. Tangent and bitangent are the surface gradients of u
+// and -v from the pixel derivatives of position (dpx, dpy) and uv (dux,
+// duy), so no tangents are stored and mirrored mappings work.
+fn normal_mapped(N: vec3f, t: vec3f, k: f32, dpx: vec3f, dpy: vec3f, dux: vec2f, duy: vec2f) -> vec3f {
+  let g11 = dot(dpx, dpx);
+  let g12 = dot(dpx, dpy);
+  let g22 = dot(dpy, dpy);
+  let det = g11 * g22 - g12 * g12;
+  if (!(det > 1e-12 * g11 * g22)) { return N; }
+  let inv = 1.0 / det;
+  let gu = ((g22 * dux.x - g12 * duy.x) * dpx + (g11 * duy.x - g12 * dux.x) * dpy) * inv;
+  let gv = ((g22 * dux.y - g12 * duy.y) * dpx + (g11 * duy.y - g12 * dux.y) * dpy) * inv;
+  let tu = gu - N * dot(N, gu);
+  let tv = -gv + N * dot(N, gv);
+  if (dot(tu, tu) < 1e-30 || dot(tv, tv) < 1e-30) { return N; }
+  let m = t * 2.0 - 1.0;
+  let n = normalize(tu) * (m.x * k) + normalize(tv) * (m.y * k) + N * max(m.z, 0.0);
+  return select(N, normalize(n), dot(n, n) > 1e-12);
+}
+
 // Linear radiance toward the camera under the directional lights (light 0
 // shadowed), the uniform sky and the environment. The BRDF is Mitsuba's
 // principled one without sheen / clearcoat / transmission: Burley diffuse
 // with retro-reflection, GGX (alpha = roughness^2) with separable Smith
 // masking and Schlick's Fresnel toward the base color for metals.
-fn shade(i: FIn) -> vec3f {
+fn shade(i: FIn, front: bool) -> vec3f {
   let m = mats[(view.chunk.x + i.ids.y) * view.chunk.w + i.ids.x];
   let layer = i32(m.p.y);
   let tex = textureSample(base_tex, repeat_lin, i.uv, max(layer, 0));
   var base = select(m.c.rgb, m.c.rgb * tex.rgb, layer >= 0);
   var rough = clamp(m.c.a, 0.03, 1.0);
   let metal = m.p.x;
+  let nlayer = i32(m.n.x);
+  let ntex = textureSample(normal_tex, repeat_lin, i.uv, max(nlayer, 0)).xyz;
   let V = normalize(i.cam - i.wp);
-  let face = cross(dpdx(i.wp), dpdy(i.wp));                 // flat shading without normals
+  let dwx = dpdx(i.wp);
+  let dwy = dpdy(i.wp);
+  let face = cross(dwx, dwy);                                 // flat shading without normals
   // a proxy pixel's body-local footprint (m), for the solid texture's
   // filtering (derivatives: before any non-uniform branch)
   let dpx = dpdx(i.lp);
@@ -285,8 +314,16 @@ fn shade(i: FIn) -> vec3f {
   let dux = dpdx(i.uv);                                       // UV textures: their
   let duy = dpdy(i.uv);                                       // footprint and gradients
   let fu = max(length(dux), length(duy));
-  var N = select(normalize(face), normalize(i.n), dot(i.n, i.n) > 1e-12);
-  N = select(N, -N, dot(N, V) < 0.0);                        // two-sided
+  // Without vertex normals: the face normal, on the side its winding faces
+  // (the camera's y-down projection mirrors the winding seen in clip space)
+  var N = select(normalize(face) * select(1.0, -1.0, front), normalize(i.n), dot(i.n, i.n) > 1e-12);
+  let back = dot(N, V) < 0.0;
+  // The normal map perturbs the front side's normal; the back side sees
+  // its mirror image (a thin sheet), as Mitsuba's twosided BSDF does.
+  if (nlayer >= 0) {
+    N = normal_mapped(N, ntex, m.n.y, dwx, dwy, dux, duy);
+  }
+  N = select(N, -N, back);                                    // two-sided
   let srow = i32(m.p.z);
   if (srow >= 0) {
     let r = solid_rows[u32(srow)];
@@ -348,16 +385,16 @@ struct FRgb { @location(0) c: vec4f };
 struct FGeo { @location(0) z: f32, @location(1) s: u32 };
 struct FAll { @location(0) c: vec4f, @location(1) z: f32, @location(2) s: u32 };
 
-@fragment fn fs_rgb(i: FIn) -> FRgb {
-  return FRgb(vec4f(shade(i), 1.0));
+@fragment fn fs_rgb(i: FIn, @builtin(front_facing) front: bool) -> FRgb {
+  return FRgb(vec4f(shade(i, front), 1.0));
 }
 
 @fragment fn fs_geo(i: FIn) -> FGeo {
   return FGeo(i.z, i.ids.z);
 }
 
-@fragment fn fs_all(i: FIn) -> FAll {
-  return FAll(vec4f(shade(i), 1.0), i.z, i.ids.z);
+@fragment fn fs_all(i: FIn, @builtin(front_facing) front: bool) -> FAll {
+  return FAll(vec4f(shade(i, front), 1.0), i.z, i.ids.z);
 }
 
 // ---- remap (compute) --------------------------------------------------------

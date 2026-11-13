@@ -19,12 +19,13 @@ struct MeshObject {
   base_color: vec4f,     // linear rgb, a = opacity
   color_mode: u32,       // see base_color()
   cmap_row: u32,
-  flags: u32,            // bit 0 isolines, bit 1 cut by the slice plane, bit 2 smooth normals, bit 3 unlit
+  flags: u32,            // bit 0 isolines, bit 1 cut by the slice plane, bit 2 smooth normals, bit 3 unlit,
+                         // bit 4 normal map
   object_id: u32,
   scalar_range: vec2f,
   iso_spacing: f32,
   edge_band: f32,        // width (px) of the bands showing edge quantities
-  material: vec4f,       // x = metallic, y = roughness
+  material: vec4f,       // x = metallic, y = roughness, z = normal map scale
 };
 
 struct SegmentInfo {
@@ -47,9 +48,13 @@ struct SegmentInfo {
 @group(1) @binding(6) var<storage, read> face_info: array<vec2u>;
 // Faces around each vertex (CSR: V+1 offsets into this array, then face ids).
 @group(1) @binding(7) var<storage, read> vertex_faces: array<u32>;
-// Image sampled by color mode 9 (texture coordinates packed in vertex_attr).
+// Image sampled by color mode 9.
 @group(1) @binding(8) var image_tex: texture_2d<f32>;
 @group(1) @binding(9) var image_sampler: sampler;
+// Texture coordinates per vertex (two unorm16; a single 0 when the mesh has none).
+@group(1) @binding(10) var<storage, read> uvs: array<u32>;
+// Tangent-space normal map (linear; flat when the mesh has none), flag bit 4.
+@group(1) @binding(11) var normal_tex: texture_2d<f32>;
 
 struct VsOut {
   @builtin(position) clip: vec4f,
@@ -121,7 +126,7 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
   let a = vertex_attr[min(vi, arrayLength(&vertex_attr) - 1u)];
   out.scalar = a;
   out.color = unpack_srgb(bitcast<u32>(a));
-  out.uv = unpack2x16unorm(bitcast<u32>(a));
+  out.uv = unpack2x16unorm(uvs[min(vi, arrayLength(&uvs) - 1u)]);
   out.face = face;
   return out;
 }
@@ -188,14 +193,56 @@ fn wire_color(seg_flags: u32, albedo: vec3f) -> vec3f {
   return select(frame.wire.rgb, albedo, frame.wire_mode.z > 0.5);
 }
 
+// Screen-space derivatives of position and uv (for the normal map's tangent
+// frame). Taken in the entry points: they need uniform control flow.
+struct Deriv {
+  px: vec3f,
+  py: vec3f,
+  ux: vec2f,
+  uy: vec2f,
+};
+
+fn derivatives(in: VsOut) -> Deriv {
+  return Deriv(dpdx(in.world_pos), dpdy(in.world_pos), dpdx(in.uv), dpdy(in.uv));
+}
+
+// N perturbed by the tangent-space normal map (glTF convention: +x along
+// increasing u, +y toward the image's top, i.e. decreasing v). Tangent and
+// bitangent are the surface gradients of u and -v from the pixel
+// derivatives (no stored tangents); a mirrored mapping flips the bitangent
+// on its own.
+fn normal_mapped(N: vec3f, uv: vec2f, d: Deriv) -> vec3f {
+  let g11 = dot(d.px, d.px);
+  let g12 = dot(d.px, d.py);
+  let g22 = dot(d.py, d.py);
+  let det = g11 * g22 - g12 * g12;
+  if (!(det > 1e-12 * g11 * g22)) { return N; }
+  let inv = 1.0 / det;
+  let gu = ((g22 * d.ux.x - g12 * d.uy.x) * d.px + (g11 * d.uy.x - g12 * d.ux.x) * d.py) * inv;
+  let gv = ((g22 * d.ux.y - g12 * d.uy.y) * d.px + (g11 * d.uy.y - g12 * d.ux.y) * d.py) * inv;
+  let tu = gu - N * dot(N, gu);
+  let tv = -gv + N * dot(N, gv);
+  if (dot(tu, tu) < 1e-30 || dot(tv, tv) < 1e-30) { return N; }
+  let m = textureSampleLevel(normal_tex, image_sampler, uv, 0.0).xyz * 2.0 - 1.0;
+  let k = obj.material.z;
+  let n = normalize(tu) * (m.x * k) + normalize(tv) * (m.y * k) + N * max(m.z, 0.0);
+  return select(N, normalize(n), dot(n, n) > 1e-12);
+}
+
 // Lit surface color, selection tint and wireframe overlay.
-fn surface_color(in: VsOut, front: bool, value_width: f32, bary_width: vec3f) -> vec3f {
+fn surface_color(in: VsOut, front: bool, value_width: f32, bary_width: vec3f, d: Deriv) -> vec3f {
   var s: Surface;
-  s.n = select(-in.normal, in.normal, front);  // two-sided lighting
-  if (dot(s.n, s.n) < 1e-12) {
-    s.n = vec3f(0.0, 0.0, 1.0);
+  var n = in.normal;
+  if (dot(n, n) < 1e-12) {
+    n = vec3f(0.0, 0.0, 1.0);
   }
-  s.n = normalize(s.n);
+  n = normalize(n);
+  // The normal map perturbs the front side's normal; the back side sees
+  // its mirror image (a thin sheet), as glTF viewers and Mitsuba do.
+  if ((obj.flags & 16u) != 0u) {
+    n = normal_mapped(n, in.uv, d);
+  }
+  s.n = select(-n, n, front);  // two-sided lighting
   s.p = in.world_pos;
   s.v = view_dir(in.world_pos);
   s.albedo = base_color(in, value_width, bary_width);
@@ -227,10 +274,11 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4f 
   // Screen-space derivatives first: they must run in uniform control flow.
   let bary_width = fwidth(in.bary);
   let value_width = fwidth(in.scalar);
+  let d = derivatives(in);
   if (clipped(in.world_pos)) {
     discard;
   }
-  return vec4f(surface_color(in, front, value_width, bary_width), 1.0);
+  return vec4f(surface_color(in, front, value_width, bary_width, d), 1.0);
 }
 
 // Weighted blended order-independent transparency (McGuire & Bavoil 2013):
@@ -245,10 +293,11 @@ struct OitOut {
 fn fs_transparent(in: VsOut, @builtin(front_facing) front: bool) -> OitOut {
   let bary_width = fwidth(in.bary);
   let value_width = fwidth(in.scalar);
+  let d = derivatives(in);
   if (clipped(in.world_pos)) {
     discard;
   }
-  let color = surface_color(in, front, value_width, bary_width);
+  let color = surface_color(in, front, value_width, bary_width, d);
   let a = obj.base_color.a;
   let z = view_depth(in.clip.z) / 50.0;
   let w = a * clamp(0.03 / (1e-5 + pow(z, 4.0)), 1e-2, 3e3);

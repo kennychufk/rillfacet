@@ -67,10 +67,18 @@ class _Group:
     instances."""
 
     def __init__(self, mesh, sid, tri_idx, slot, torch, dev,
-                 solid_texture=False, bump=False):
+                 solid_texture=False, bump=False, flip_normal_y=False):
         tris = mesh.triangles[tri_idx].astype(np.int64)
         gv, inv = np.unique(tris.ravel(), return_inverse=True)
+        # slot: the UV-mapped material slot (a base color texture and / or a
+        # normal map) or None
         self.sid, self.slot, self.mesh = sid, slot, mesh
+        mat = None if slot is None else mesh.materials[slot]
+        self.base_texture = mat is not None and mat.base_color_texture is not None
+        self.normal_texture = (None if mat is None
+                               else getattr(mat, "normal_texture", None))
+        # mirrored UV mapping: the normal map's +y runs along -cross(n, dp/du)
+        self.flip_normal_y = bool(flip_normal_y)
         # color and roughness from texture rows: solid (3D) textures of
         # rillfacet.solid_texture and UV (2D) ones of rillfacet.uv_texture
         self.solid_texture, self.bump = bool(solid_texture), bool(bump)
@@ -93,6 +101,21 @@ class _Group:
         self.tri_body = tri_body
         self.tri_slot = (None if mesh.triangle_material is None
                          else mesh.triangle_material[tri_idx])
+
+
+def _uv_mapped(mat):
+    """The material samples an image through the UVs."""
+    return (mat.base_color_texture is not None
+            or getattr(mat, "normal_texture", None) is not None)
+
+
+def _uv_mirrored(uvs, tris):
+    """Per triangle, whether its UV mapping is mirrored seen from the side
+    its winding faces: with v growing down the image (glTF), an unmirrored
+    counter-clockwise triangle has a negative signed area in uv."""
+    t = np.asarray(uvs, np.float64)[tris]
+    d1, d2 = t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]
+    return d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0] > 0
 
 
 class MitsubaRenderer(Renderer):
@@ -146,10 +169,10 @@ class MitsubaRenderer(Renderer):
         for mi_idx, m in enumerate(self.meshes.values()):
             groups = []
             textured = ([i for i, mat in enumerate(m.materials)
-                         if mat.base_color_texture is not None]
+                         if _uv_mapped(mat)]
                         if m.uvs is not None else [])
             if m.materials and m.uvs is None and any(
-                    mat.base_color_texture is not None for mat in m.materials):
+                    _uv_mapped(mat) for mat in m.materials):
                 warnings.warn(f"rigid mesh {m.name!r}: textures without UVs "
                               "are drawn untextured")
             solid = [[i for i, mat in enumerate(m.materials)
@@ -158,16 +181,28 @@ class MitsubaRenderer(Renderer):
             tri_slot = (m.triangle_material if m.triangle_material is not None
                         else np.zeros(len(m.triangles), np.int32))
             flat = np.nonzero(~np.isin(tri_slot, textured + sum(solid, [])))[0]
-            parts = [(flat, None, None)] if len(flat) else []
-            parts += [(np.nonzero(np.isin(tri_slot, sl))[0], None, bump)
+            parts = [(flat, None, None, False)] if len(flat) else []
+            parts += [(np.nonzero(np.isin(tri_slot, sl))[0], None, bump, False)
                       for bump, sl in zip((False, True), solid) if sl]
-            parts += [(np.nonzero(tri_slot == s)[0], s, None) for s in textured]
-            for gi, (tri_idx, slot, bump) in enumerate(parts):
+            for s in textured:
+                tri_idx = np.nonzero(tri_slot == s)[0]
+                if getattr(m.materials[s], "normal_texture", None) is None:
+                    parts.append((tri_idx, s, None, False))
+                    continue
+                # Mitsuba's normalmap takes +y along cross(n, dp/du): right
+                # for a UV mapping seen unmirrored from the front, flipped
+                # where the mapping is mirrored (those triangles get the map
+                # with y negated)
+                mirrored = _uv_mirrored(m.uvs,
+                                        m.triangles[tri_idx])
+                parts += [(tri_idx[mirrored == f], s, None, f)
+                          for f in (False, True)]
+            for gi, (tri_idx, slot, bump, flip) in enumerate(parts):
                 if not len(tri_idx):
                     continue
                 g = _Group(m, f"m{mi_idx}_{_sid(m.name)}_{gi}", tri_idx, slot,
                            torch, self.dev, solid_texture=bump is not None,
-                           bump=bool(bump))
+                           bump=bool(bump), flip_normal_y=flip)
                 d[g.sid] = self._make_mesh(g, m, bases[m.name])
                 groups.append(g)
             self._groups[m.name] = groups
@@ -212,7 +247,7 @@ class MitsubaRenderer(Renderer):
                 mesh.add_attribute("face_gu", 3, np.tile(gu, (I, 1)).ravel())
                 mesh.add_attribute("face_gv", 3, np.tile(gv, (I, 1)).ravel())
         else:
-            if g.slot is None:
+            if not g.base_texture:
                 mesh.add_attribute("face_color", 3,
                                    np.zeros(3 * I * g.nt, np.float32))
             mesh.add_attribute("face_rough", 1, np.zeros(I * g.nt, np.float32))
@@ -231,16 +266,20 @@ class MitsubaRenderer(Renderer):
         if g.solid_texture:
             mesh.set_bsdf(self._solid_texture_bsdf(g, m))
             return mesh
-        if g.slot is None:
+        if not g.base_texture:
             base = {"type": "mesh_attribute", "name": "face_color"}
         else:
             base = {"type": "bitmap", "bitmap": self._texture(m, g.slot),
                     "raw": True, "filter_type": "bilinear",
                     "wrap_mode": "repeat"}
-        mesh.set_bsdf(mi.load_dict({"type": "twosided", "bsdf": {
-            "type": "principled", "base_color": base,
-            "roughness": {"type": "mesh_attribute", "name": "face_rough"},
-            "metallic": {"type": "mesh_attribute", "name": "face_metal"}}}))
+        bsdf = {"type": "principled", "base_color": base,
+                "roughness": {"type": "mesh_attribute", "name": "face_rough"},
+                "metallic": {"type": "mesh_attribute", "name": "face_metal"}}
+        if g.normal_texture is not None:
+            bsdf = {"type": "normalmap", "bsdf": bsdf, "normalmap": {
+                "type": "bitmap", "bitmap": self._normal_bitmap(g, m),
+                "raw": True, "filter_type": "bilinear", "wrap_mode": "repeat"}}
+        mesh.set_bsdf(mi.load_dict({"type": "twosided", "bsdf": bsdf}))
         return mesh
 
     def _solid_texture_bsdf(self, g, m):
@@ -273,6 +312,25 @@ class MitsubaRenderer(Renderer):
         lin = srgb_to_linear(tex) * srgb_to_linear(
             np.asarray(mat.base_color, np.float32))
         return mi.Bitmap(np.ascontiguousarray(lin, np.float32))
+
+    def _normal_bitmap(self, g, m):
+        """The slot's normal map as a raw bitmap in Mitsuba's encoding
+        (rgb = (n + 1) / 2 in the frame (dp/du, cross(n, dp/du), n)):
+        normal_scale applied, y negated for mirrored triangles."""
+        mat = m.materials[g.slot]
+        tex = mat.normal_texture
+        if isinstance(tex, str):
+            from PIL import Image
+            tex = np.asarray(Image.open(tex).convert("RGB"))
+        tex = np.asarray(tex)
+        n = (tex[..., :3].astype(np.float32) / 127.5 - 1.0
+             if tex.dtype == np.uint8 else tex[..., :3].astype(np.float32) * 2 - 1)
+        n[..., :2] *= mat.normal_scale
+        if g.flip_normal_y:
+            n[..., 1] *= -1
+        n[..., 2] = np.maximum(n[..., 2], 0.0)
+        n /= np.maximum(np.linalg.norm(n, axis=-1, keepdims=True), 1e-6)
+        return self.mi.Bitmap(np.ascontiguousarray((n + 1) * 0.5, np.float32))
 
     def _emitter(self, light):
         c = (np.asarray(light.color) * light.intensity).tolist()
@@ -344,7 +402,7 @@ class MitsubaRenderer(Renderer):
             rough = m.material_roughness[:, slot]
             metal = m.material_metallic[:, slot]
             color = m.material_base_color[:, slot]          # [I, nt, 3]
-            if g.slot is not None:
+            if g.base_texture:
                 key = (m.name, g.slot)
                 if (key not in self._warned_tint and not np.allclose(
                         m.material_base_color[:, g.slot],
@@ -366,7 +424,7 @@ class MitsubaRenderer(Renderer):
             full[:, slots] = rows
             g.state.set_params(full)
         else:
-            if g.slot is None:
+            if not g.base_texture:
                 p[self._key(g.sid, "face_color")] = mi.Float(
                     srgb_to_linear(color).astype(np.float32).ravel())
             p[self._key(g.sid, "face_rough")] = mi.Float(

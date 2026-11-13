@@ -165,9 +165,9 @@ struct Renderer::MeshGpu {
   float edge_angle = 0.0f;
   std::string color_key;
   wgpu::Buffer ubo;
-  DynamicBuffer positions, triangles, face_segment, segments, vertex_attr, face_info, vertex_faces;
+  DynamicBuffer positions, triangles, face_segment, segments, vertex_attr, face_info, vertex_faces, uvs;
   wgpu::BindGroup group;
-  wgpu::TextureView texture;
+  wgpu::TextureView texture, normal_tex;
   MeshUniforms u;
   uint32_t faces = 0;
   bool transparent = false;
@@ -306,7 +306,7 @@ bool Renderer::init(std::string* error) {
   mesh_layout_ = make_layout(gpu_, "mesh",
                              {{0, BK::Uniform}, {1, BK::Storage}, {2, BK::Storage}, {3, BK::Storage},
                               {4, BK::Storage}, {5, BK::Storage}, {6, BK::Storage}, {7, BK::Storage},
-                              {8, BK::Texture}, {9, BK::Sampler}});
+                              {8, BK::Texture}, {9, BK::Sampler}, {10, BK::Storage}, {11, BK::Texture}});
   item_layout_ = make_layout(gpu_, "item", {{0, BK::Uniform}, {1, BK::Storage}});
   points_layout_ = make_layout(gpu_, "points", {{0, BK::Uniform}, {1, BK::Storage}, {2, BK::Storage}});
   curves_layout_ = make_layout(gpu_, "curves",
@@ -377,6 +377,11 @@ bool Renderer::init(std::string* error) {
     wgpu::Extent3D e{1, 1, 1};
     gpu_.queue.WriteTexture(&dst, px, 4, &l, &e);
     white_view_ = white.CreateView();
+    wgpu::Texture flat = gpu_.create_texture(1, 1, TF::RGBA8Unorm, TU::TextureBinding | TU::CopyDst, "flat normal");
+    const uint8_t up[4] = {128, 128, 255, 255};
+    dst.texture = flat;
+    gpu_.queue.WriteTexture(&dst, up, 4, &l, &e);
+    flat_normal_view_ = flat.CreateView();
   }
 
   // Font atlas for 3D labels.
@@ -595,19 +600,29 @@ void Renderer::update_environment(const RenderSettings& s) {
 
 // ---- Per-frame sync -------------------------------------------------------------
 
-wgpu::TextureView Renderer::image_view(const Scene& scene, const std::string& name) {
+// Linear copies (normal maps) are cached apart from the sRGB ones under this
+// suffix, which no scene image name contains.
+static const std::string kLinearSuffix("\n#linear");
+
+static std::string image_name(const std::string& key) {
+  return key.ends_with(kLinearSuffix) ? key.substr(0, key.size() - kLinearSuffix.size()) : key;
+}
+
+wgpu::TextureView Renderer::image_view(const Scene& scene, const std::string& name, bool linear) {
   const Scene::Image* im = scene.image(name);
+  const std::string key = linear ? name + kLinearSuffix : name;
   if (!im || !im->width || !im->height || im->rgba.size() < size_t(im->width) * im->height * 4) {
-    if (auto it = images_.find(name); it != images_.end()) {
+    if (auto it = images_.find(key); it != images_.end()) {
       retired_images_.push_back(it->second.texture);
       images_.erase(it);
     }
-    return white_view_;
+    return linear ? flat_normal_view_ : white_view_;
   }
-  ImageGpu& g = images_[name];
+  ImageGpu& g = images_[key];
   if (g.width != im->width || g.height != im->height || !g.texture) {
     if (g.texture) retired_images_.push_back(g.texture);
-    g.texture = gpu_.create_texture(im->width, im->height, wgpu::TextureFormat::RGBA8UnormSrgb,
+    g.texture = gpu_.create_texture(im->width, im->height,
+                                    linear ? wgpu::TextureFormat::RGBA8Unorm : wgpu::TextureFormat::RGBA8UnormSrgb,
                                     wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
                                     name.c_str());
     g.view = g.texture.CreateView();
@@ -650,11 +665,17 @@ void Renderer::sync_mesh(MeshGpu& g, const SurfaceMesh& m, uint32_t object_id, c
   // What colors the mesh (modes as in base_color() of mesh.wgsl).
   const Quantity* q = m.coloring_quantity();
   uint32_t mode = m.color_source == ColorSource::SegmentPalette ? 1 : 0;
-  const bool textured = m.color_source == ColorSource::Texture && !m.texture.empty() &&
-                        m.uvs().size() == 2 * m.num_vertices() && sync_scene_;
+  const bool has_uvs = m.uvs().size() == 2 * m.num_vertices() && m.num_vertices() > 0;
+  const bool textured = m.color_source == ColorSource::Texture && !m.texture.empty() && has_uvs && sync_scene_;
   wgpu::TextureView tex = textured ? image_view(*sync_scene_, m.texture) : white_view_;
   if (g.texture.Get() != tex.Get()) {
     g.texture = tex;
+    rebind = true;
+  }
+  const bool normal_mapped = !m.normal_map.empty() && has_uvs && sync_scene_;
+  wgpu::TextureView ntex = normal_mapped ? image_view(*sync_scene_, m.normal_map, true) : flat_normal_view_;
+  if (g.normal_tex.Get() != ntex.Get()) {
+    g.normal_tex = ntex;
     rebind = true;
   }
   if (textured) {
@@ -669,7 +690,7 @@ void Renderer::sync_mesh(MeshGpu& g, const SurfaceMesh& m, uint32_t object_id, c
       default: mode = 0; break;
     }
   }
-  std::string key = std::to_string(mode) + (textured ? m.texture : q ? q->name : "");
+  std::string key = std::to_string(mode) + (textured ? m.texture : q ? q->name : "") + (has_uvs ? "#uv" : "");
   bool mask_stale = g.edge_angle != edge_angle || (edge_angle > 0 && !m.rigid_segments && g.mask_ver != m.positions_version());
   if (g.attr_ver != m.attributes_version() || g.sel_ver != sel.version || g.color_key != key || mask_stale) {
     size_t nf = m.num_faces(), ns = m.num_segments();
@@ -699,15 +720,6 @@ void Renderer::sync_mesh(MeshGpu& g, const SurfaceMesh& m, uint32_t object_id, c
     if (mode == 2 || mode == 5) {
       attr.resize(std::max<size_t>(m.num_vertices(), 1));
       for (size_t i = 0; i < m.num_vertices(); ++i) attr[i] = attr_value(*q, i);
-    } else if (mode == 9) {
-      // Texture coordinates packed as two unorm16 (bitcast in the shader).
-      const auto& uv = m.uvs();
-      attr.resize(std::max<size_t>(m.num_vertices(), 1));
-      for (size_t i = 0; i < m.num_vertices(); ++i) {
-        glm::vec2 t = glm::clamp(glm::vec2(uv[2 * i], uv[2 * i + 1]), 0.0f, 1.0f);
-        uint32_t packed = uint32_t(std::lround(t.x * 65535.0f)) | (uint32_t(std::lround(t.y * 65535.0f)) << 16);
-        attr[i] = std::bit_cast<float>(packed);
-      }
     } else if (mode == 7 || mode == 8) {
       const auto& fe = m.face_edges();
       attr.resize(std::max<size_t>(3 * nf, 1));
@@ -716,6 +728,17 @@ void Renderer::sync_mesh(MeshGpu& g, const SurfaceMesh& m, uint32_t object_id, c
     rebind |= g.segments.upload(gpu_, segs.data(), segs.size() * sizeof(SegmentInfo), storage, "segments");
     rebind |= g.face_info.upload(gpu_, face_info.data(), face_info.size() * 4, storage, "face info");
     rebind |= g.vertex_attr.upload(gpu_, attr.data(), attr.size() * 4, storage, "vertex attr");
+    // Texture coordinates (textures and normal maps) as two unorm16 per
+    // vertex; one zero entry when there are none (the shader then reads 0).
+    std::vector<uint32_t> uv_packed(has_uvs ? m.num_vertices() : 1, 0u);
+    if (has_uvs) {
+      const auto& uv = m.uvs();
+      for (size_t i = 0; i < m.num_vertices(); ++i) {
+        glm::vec2 t = glm::clamp(glm::vec2(uv[2 * i], uv[2 * i + 1]), 0.0f, 1.0f);
+        uv_packed[i] = uint32_t(std::lround(t.x * 65535.0f)) | (uint32_t(std::lround(t.y * 65535.0f)) << 16);
+      }
+    }
+    rebind |= g.uvs.upload(gpu_, uv_packed.data(), uv_packed.size() * 4, storage, "uvs");
     g.u.scalar_range = m.color_range();
     g.attr_ver = m.attributes_version();
     g.sel_ver = sel.version;
@@ -726,19 +749,21 @@ void Renderer::sync_mesh(MeshGpu& g, const SurfaceMesh& m, uint32_t object_id, c
   g.u.base_color = glm::vec4(srgb_to_linear(m.color), std::clamp(m.opacity, 0.0f, 1.0f));
   g.u.color_mode = mode;
   g.u.cmap_row = uint32_t(std::clamp(m.colormap, 0, kColormapCount - 1));
-  g.u.flags = (m.isolines ? 1u : 0u) | (clip ? 2u : 0u) | (m.smooth_shading ? 4u : 0u) | (m.unlit ? 8u : 0u);
+  g.u.flags = (m.isolines ? 1u : 0u) | (clip ? 2u : 0u) | (m.smooth_shading ? 4u : 0u) | (m.unlit ? 8u : 0u) |
+              (normal_mapped ? 16u : 0u);
   g.u.object_id = object_id;
   if (!m.auto_range) g.u.scalar_range = m.range;
   g.u.iso_spacing = m.isoline_spacing;
   g.u.edge_band = edge_band;
-  g.u.material = glm::vec4(m.metallic, m.roughness, 0, 0);
+  g.u.material = glm::vec4(m.metallic, m.roughness, m.normal_scale, 0);
   gpu_.queue.WriteBuffer(g.ubo, 0, &g.u, sizeof(MeshUniforms));
   g.transparent = m.opacity < 0.999f;
   if (rebind)
     g.group = make_group(gpu_, mesh_layout_,
                          {{0, g.ubo}, {1, g.positions.buffer}, {2, g.triangles.buffer}, {3, g.face_segment.buffer},
                           {4, g.segments.buffer}, {5, g.vertex_attr.buffer}, {6, g.face_info.buffer},
-                          {7, g.vertex_faces.buffer}, {8, g.texture}, {9, clamp_sampler_}});
+                          {7, g.vertex_faces.buffer}, {8, g.texture}, {9, clamp_sampler_},
+                          {10, g.uvs.buffer}, {11, g.normal_tex}});
 }
 
 void Renderer::sync_volume(VolumeGpu& g, const VolumeMesh& v, const RenderSettings& s, const Selection& sel) {
@@ -870,7 +895,7 @@ void Renderer::sync_arrows(const QuantityStructure& s, bool clip) {
 void Renderer::sync(const Scene& scene, const RenderSettings& settings, const Selection& sel) {
   sync_scene_ = &scene;
   std::erase_if(images_, [&](auto& kv) {
-    if (scene.image(kv.first)) return false;
+    if (scene.image(image_name(kv.first))) return false;
     retired_images_.push_back(kv.second.texture);
     return true;
   });

@@ -438,6 +438,67 @@ def test_textured_unlit_quad(v, tmp_path):
     assert v.frame()
 
 
+
+def _normal_map_shot(v, tmp_path, verts, uvs, nmap=None):
+    """Mean gray level of a gray quad seen head-on from -y."""
+    from PIL import Image
+    v.scene.clear()
+    m = v.scene.add_mesh("q")
+    m.set_geometry(np.asarray(verts, np.float32), np.array([[0, 1, 2], [0, 2, 3]]))
+    m.set_uvs(np.asarray(uvs, np.float32))
+    m.color = (0.7, 0.7, 0.7)
+    if nmap is not None:
+        v.scene.set_image("nmap", np.tile(np.asarray(nmap, np.uint8), (4, 4, 1)))
+        m.normal_map = "nmap"
+    v.camera.look_at((0, -3, 0), (0, 0, 0))
+    v.camera.ortho = True
+    for _ in range(3):
+        assert v.frame()
+    path = tmp_path / "nmap.png"
+    assert v.screenshot(str(path))
+    # a patch of the quad clear of the UI panels and grid labels
+    return np.asarray(Image.open(path).convert("L"), float)[170:230, 120:180].mean()
+
+
+def test_normal_map_matches_tilted_geometry(v, tmp_path):
+    """A flat quad with a tangent-space normal map (glTF convention: +x along
+    u, +y toward the image's top) shades like the quad tilted that way.
+    Shadows off: a quad tilted away from the sun shadows itself in the
+    shadow map, which a normal map does not change."""
+    v.settings.shadows = False
+    try:
+        _check_normal_map(v, tmp_path)
+    finally:
+        v.settings.shadows = True
+
+
+def _check_normal_map(v, tmp_path):
+    quad = np.array([[-1, 0, -1], [1, 0, -1], [1, 0, 1], [-1, 0, 1]])
+    a = np.radians(30)
+
+    def tilt_z(sign):  # normal (0, -cos a, sign * sin a): rotate about x
+        c, s = np.cos(-sign * a), np.sin(-sign * a)
+        return quad @ np.array([[1, 0, 0], [0, c, -s], [0, s, c]]).T
+
+    def texel(x, y):
+        return np.round((np.array([x, y, np.sqrt(1 - x * x - y * y)]) + 1) * 127.5)
+
+    up = _normal_map_shot(v, tmp_path, tilt_z(+1), [[0, 1]] * 4)
+    down = _normal_map_shot(v, tmp_path, tilt_z(-1), [[0, 1]] * 4)
+    assert abs(up - down) > 5
+    # u along +x, image top toward +z: +y of the map tilts toward +z
+    uv = [[0, 1], [1, 1], [1, 0], [0, 0]]
+    flat = _normal_map_shot(v, tmp_path, quad, uv)
+    assert abs(_normal_map_shot(v, tmp_path, quad, uv, texel(0, 0)) - flat) < 1
+    assert abs(_normal_map_shot(v, tmp_path, quad, uv, texel(0, 0.5)) - up) < 1
+    # u along +z (rotated mapping): +x of the map tilts toward +z
+    uv = [[0, 0], [0, 1], [1, 1], [1, 0]]
+    assert abs(_normal_map_shot(v, tmp_path, quad, uv, texel(0.5, 0)) - up) < 1
+    # mirrored mapping (u along -x): +y still toward the image's top
+    uv = [[1, 1], [0, 1], [0, 0], [1, 0]]
+    assert abs(_normal_map_shot(v, tmp_path, quad, uv, texel(0, 0.5)) - up) < 1
+    assert abs(_normal_map_shot(v, tmp_path, quad, uv, texel(0, -0.5)) - down) < 1
+
 def test_world_height_text(v):
     v.overlay.text("far", (0, 0, 0), world_height=0.05, min_px=6.0)
 

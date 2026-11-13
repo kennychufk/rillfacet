@@ -165,6 +165,16 @@ class Material:
     uint8 or 0..1 float) sampled at the mesh UVs (origin top-left, glTF's
     convention). The texture is multiplied by ``base_color``, as in glTF.
 
+    ``normal_texture``: an optional tangent-space normal map (an image path
+    or an ``[H, W, 3|4]`` array, uint8 or 0..1 float, read as LINEAR data)
+    at the same UVs, glTF's ``normalTexture``: +x along increasing u, +y
+    toward the image's top (decreasing v), +z out of the surface;
+    ``normal_scale`` scales its x and y. The tangent frame comes from the
+    UVs (no stored tangents), so mirrored mappings work. It changes the
+    shading normal only (not silhouettes or shadows); Mitsuba and the raster
+    backend render it. Not with ``solid_texture`` / ``uv_texture`` (those
+    have their own ``bump``).
+
     ``solid_texture``: the base color and roughness come from a procedural
     SOLID (3D) texture evaluated at the body-local position instead of UVs
     (:mod:`rillfacet.solid_texture`: wood, marble, granite, ...; no UVs
@@ -190,7 +200,8 @@ class Material:
 
     def __init__(self, name, base_color=(0.8, 0.8, 0.8), metallic=0.0,
                  roughness=0.5, base_color_texture=None, solid_texture=False,
-                 bump=False, uv_texture=False):
+                 bump=False, uv_texture=False, normal_texture=None,
+                 normal_scale=1.0):
         self.name = str(name)
         self.base_color = _rgb(base_color)
         self.metallic, self.roughness = float(metallic), float(roughness)
@@ -204,6 +215,11 @@ class Material:
         if self.bump and not (self.solid_texture or self.uv_texture):
             raise ValueError("Material: bump needs solid_texture=True or "
                              "uv_texture=True")
+        self.normal_texture = normal_texture
+        self.normal_scale = float(normal_scale)
+        if self.procedurally_textured and normal_texture is not None:
+            raise ValueError("Material: solid_texture / uv_texture or "
+                             "normal_texture, not both (use bump)")
 
     @property
     def procedurally_textured(self) -> bool:
@@ -211,13 +227,17 @@ class Material:
         return self.solid_texture or self.uv_texture
 
     def state(self) -> dict:
-        tex = self.base_color_texture
-        return dict(name=self.name, base_color=self.base_color,
-                    metallic=self.metallic, roughness=self.roughness,
-                    texture=(tex if isinstance(tex, str)
-                             else None if tex is None else "<array>"),
-                    solid_texture=self.solid_texture,
-                    uv_texture=self.uv_texture, bump=self.bump)
+        def ref(tex):
+            return tex if isinstance(tex, str) else None if tex is None else "<array>"
+        d = dict(name=self.name, base_color=self.base_color,
+                 metallic=self.metallic, roughness=self.roughness,
+                 texture=ref(self.base_color_texture),
+                 solid_texture=self.solid_texture,
+                 uv_texture=self.uv_texture, bump=self.bump)
+        if self.normal_texture is not None:
+            d.update(normal_texture=ref(self.normal_texture),
+                     normal_scale=self.normal_scale)
+        return d
 
     def __repr__(self):
         kinds = [k for k, on in (("solid texture", self.solid_texture),
@@ -226,6 +246,8 @@ class Material:
                 else ", " + " / ".join(kinds) + (" + bump" if self.bump
                                                  else "")
                 if kinds else "")
+        if self.normal_texture is not None:
+            kind += ", normal map"
         return (f"Material({self.name!r}, base_color={self.base_color}, "
                 f"metallic={self.metallic}, roughness={self.roughness}{kind})")
 

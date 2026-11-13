@@ -173,6 +173,10 @@ CameraRaster::CameraRaster(bool zero_copy) {
   lay.bytesPerRow = 4;
   wgpu::Extent3D one{1, 1, 1};
   gpu_.queue.WriteTexture(&dst, white, 4, &lay, &one);
+  normal_tex_ = make_texture(dev, wgpu::TextureFormat::RGBA8Unorm, 1, 1, 1, TB, "raster normal tex");
+  const uint8_t flat[4] = {128, 128, 255, 255};
+  dst.texture = normal_tex_;
+  gpu_.queue.WriteTexture(&dst, flat, 4, &lay, &one);
   env_tex_ = make_texture(dev, wgpu::TextureFormat::RGBA16Float, 1, 1, 1, TB, "raster env");
   bg_tex_ = make_texture(dev, wgpu::TextureFormat::RGBA16Float, 1, 1, 1, TB, "raster background");
   brdf_lut_ = make_texture(dev, wgpu::TextureFormat::RGBA16Float, 1, 1, 1, TB, "raster brdf lut");
@@ -188,7 +192,7 @@ CameraRaster::CameraRaster(bool zero_copy) {
                               "raster frame");
   std::vector<float> zero(kFrameFloats, 0.0f);
   gpu_.queue.WriteBuffer(frame_, 0, zero.data(), kFrameFloats * 4);
-  mats_ = gpu_.create_buffer(32, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, "raster mats");
+  mats_ = gpu_.create_buffer(kMaterialFloats * 4, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, "raster mats");
   lens_ = gpu_.create_buffer(kLensFloats * 4, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
                              "raster lens");
   solid_ = gpu_.create_buffer(128, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
@@ -239,7 +243,7 @@ bool CameraRaster::make_pipelines() {
       {3, V::Fragment, Entry::Storage}, {4, V::Fragment, Entry::Depth, A},
       {5, V::Fragment, Entry::Cmp}, {6, V::Fragment, Entry::Tex, A},
       {7, V::Fragment, Entry::Filt}, {8, V::Fragment, Entry::Tex}, {9, V::Fragment, Entry::Filt},
-      {19, V::Fragment, Entry::Tex}, {20, V::Fragment, Entry::Storage}});
+      {19, V::Fragment, Entry::Tex}, {20, V::Fragment, Entry::Storage}, {22, V::Fragment, Entry::Tex, A}});
   // The shadow pass writes the shadow maps: its group must not bind them.
   shadow_layout_ = make_layout(dev, "raster shadow", {
       {0, VF, Entry::Uniform}, {1, VF, Entry::Uniform}, {2, VF, Entry::UnfTex}});
@@ -344,14 +348,23 @@ bool CameraRaster::set_geometry(const float* verts, uint32_t nv, const uint32_t*
 }
 
 bool CameraRaster::set_textures(uint32_t size, uint32_t layers, const std::vector<const uint8_t*>& mips) {
+  return upload_layers(base_tex_, wgpu::TextureFormat::RGBA8UnormSrgb, "raster base tex", size, layers, mips);
+}
+
+bool CameraRaster::set_normal_textures(uint32_t size, uint32_t layers, const std::vector<const uint8_t*>& mips) {
+  return upload_layers(normal_tex_, wgpu::TextureFormat::RGBA8Unorm, "raster normal tex", size, layers, mips);
+}
+
+bool CameraRaster::upload_layers(wgpu::Texture& tex, wgpu::TextureFormat format, const char* label, uint32_t size,
+                                 uint32_t layers, const std::vector<const uint8_t*>& mips) {
   if (!size || !layers || mips.empty()) return false;
-  base_tex_ = make_texture(gpu_.device, wgpu::TextureFormat::RGBA8UnormSrgb, size, size, layers,
-                           wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
-                           "raster base tex", uint32_t(mips.size()));
+  tex = make_texture(gpu_.device, format, size, size, layers,
+                     wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst, label,
+                     uint32_t(mips.size()));
   for (uint32_t k = 0; k < mips.size(); ++k) {
     uint32_t s = std::max(size >> k, 1u);
     wgpu::TexelCopyTextureInfo dst{};
-    dst.texture = base_tex_;
+    dst.texture = tex;
     dst.mipLevel = k;
     wgpu::TexelCopyBufferLayout lay{};
     lay.bytesPerRow = s * 4;
@@ -421,7 +434,7 @@ bool CameraRaster::set_brdf_lut(uint32_t n, const uint16_t* data) {
 }
 
 bool CameraRaster::set_materials(const float* m, uint32_t envs, uint32_t slots) {
-  uint64_t size = uint64_t(envs) * slots * 32;
+  uint64_t size = uint64_t(envs) * slots * kMaterialFloats * 4;
   if (size > mats_size_) {
     mats_ = gpu_.create_buffer(size, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, "raster mats");
     mats_size_ = size;
@@ -576,7 +589,7 @@ void CameraRaster::make_groups(View& v) {
         buf(0, frame_), buf(1, s.uniform), tex(2, pose_view), buf(3, mats_),
         tex(4, array_view(v.shadow ? v.shadow : dummy_shadow_)), smp(5, cmp_),
         tex(6, array_view(base_tex_)), smp(7, repeat_), tex(8, env_tex_.CreateView()), smp(9, clamp_),
-        tex(19, brdf_lut_.CreateView()), buf(20, solid_)};
+        tex(19, brdf_lut_.CreateView()), buf(20, solid_), tex(22, array_view(normal_tex_))};
     wgpu::BindGroupDescriptor d{};
     d.layout = render_layout_;
     d.entryCount = r.size();

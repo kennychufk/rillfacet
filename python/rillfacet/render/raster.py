@@ -302,6 +302,7 @@ class RasterRenderer(Renderer):
     def _build(self):
         verts, idx, ranges, spheres = [], [], [], []
         tex_layers, tex_index = [], {}
+        nrm_layers, nrm_index = [], {}
         nb = slots = nv = nt = rows = 0
         self._bases, self._slot_bases, self._solid = {}, {}, {}
         for m in self.meshes.values():
@@ -352,20 +353,26 @@ class RasterRenderer(Renderer):
                 self._solid[m.name] = (rows, solid)
                 rows += len(solid)
             for s, mat in enumerate(m.materials):
-                if mat.base_color_texture is None:
+                normal = getattr(mat, "normal_texture", None)
+                if mat.base_color_texture is None and normal is None:
                     continue
                 if m.uvs is None:
                     warnings.warn(f"rigid mesh {m.name!r}: textures without "
                                   "UVs are drawn untextured")
                     continue
-                tex_index[(m.name, s)] = len(tex_layers)
-                tex_layers.append(mat.base_color_texture)
+                if mat.base_color_texture is not None:
+                    tex_index[(m.name, s)] = len(tex_layers)
+                    tex_layers.append(mat.base_color_texture)
+                if normal is not None:
+                    nrm_index[(m.name, s)] = len(nrm_layers)
+                    nrm_layers.append(normal)
             nb += B
             slots += M
             nv += V
             nt += len(tris)
         self._nb, self._slots, self._solid_rows = nb, slots, rows
         self._tex_index = tex_index
+        self._nrm_index = nrm_index
         verts = np.concatenate(verts) if verts else np.zeros((0, 9), np.float32)
         idx = (np.concatenate(idx).ravel() if idx
                else np.zeros(0, np.uint32))
@@ -374,6 +381,9 @@ class RasterRenderer(Renderer):
         self._body_spheres = np.asarray(spheres, np.float32).reshape(-1, 4)
         if tex_layers:
             self._r.set_textures(self._texture_mips(tex_layers))
+        if nrm_layers:
+            self._r.set_normal_textures(self._texture_mips(nrm_layers,
+                                                           normals=True))
         self._build_lights()
         for _, v in self._views.values():   # body count may have changed
             self._r.remove_view(v.id)
@@ -385,7 +395,11 @@ class RasterRenderer(Renderer):
         if not self._shadow_box_fixed:
             self._shadow_box = None
 
-    def _texture_mips(self, textures):
+    def _texture_mips(self, textures, normals=False):
+        """Mip chains of the texture layers, each resized to texture_size^2.
+        ``normals``: tangent-space normal maps, filtered as vectors and
+        renormalized per level (box-filtering the bytes would shorten them,
+        flattening the relief at a distance only by accident)."""
         from PIL import Image
         s = self.texture_size
         layers = []
@@ -394,11 +408,22 @@ class RasterRenderer(Renderer):
                 np.asarray(t) if np.asarray(t).dtype == np.uint8 else
                 (np.clip(np.asarray(t), 0, 1) * 255).astype(np.uint8)))
             layers.append(img.convert("RGBA").resize((s, s), Image.LANCZOS))
+        if normals:
+            chans = [[Image.fromarray(np.asarray(im, np.float32)[..., c] / 127.5 - 1, "F")
+                      for c in range(3)] for im in layers]
         mips, k = [], 0
         while True:
             sk = max(s >> k, 1)
-            mips.append(np.stack([np.asarray(im.resize((sk, sk), Image.BOX))
-                                  for im in layers]).astype(np.uint8))
+            if normals:
+                v = np.stack([np.stack([np.asarray(c.resize((sk, sk), Image.BOX))
+                                        for c in ch], -1) for ch in chans])
+                v /= np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-6)
+                b = np.round((v + 1) * 127.5).clip(0, 255).astype(np.uint8)
+                mips.append(np.concatenate(
+                    [b, np.full(b.shape[:3] + (1,), 255, np.uint8)], -1))
+            else:
+                mips.append(np.stack([np.asarray(im.resize((sk, sk), Image.BOX))
+                                      for im in layers]).astype(np.uint8))
             if sk == 1:
                 return mips
             k += 1
@@ -540,8 +565,11 @@ class RasterRenderer(Renderer):
         self._r.set_lens(lens)
 
     def _write_materials(self, I):
-        mats = np.zeros((I, max(self._slots, 1), 8), np.float32)
+        # per slot: linear base color, roughness, metallic, texture layer,
+        # solid row, bump, normal map layer, its scale, 2 spare
+        mats = np.zeros((I, max(self._slots, 1), 12), np.float32)
         mats[..., 5:7] = -1.0
+        mats[..., 8] = -1.0
         NS = self._solid_rows
         if NS:
             from ..uv_texture import render_rows
@@ -567,6 +595,10 @@ class RasterRenderer(Renderer):
                     layer = self._tex_index.get((m.name, s))
                     if layer is not None:
                         mats[:, s0 + s, 5] = layer
+                    layer = self._nrm_index.get((m.name, s))
+                    if layer is not None:
+                        mats[:, s0 + s, 8] = layer
+                        mats[:, s0 + s, 9] = m.materials[s].normal_scale
             else:
                 B = m.num_bodies
                 mats[:, s0:s0 + B, :3] = srgb_to_linear(

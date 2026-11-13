@@ -114,6 +114,31 @@ def test_gltf_embedded_texture(tmp_path):
     assert a.normals is None
 
 
+
+def test_gltf_normal_texture(tmp_path):
+    """normalTexture (and its scale) lands in Material.normal_texture, next
+    to the base color texture."""
+    Image = pytest.importorskip("PIL.Image")
+    pngs = []
+    for color in ((200, 30, 30), (128, 160, 240)):
+        buf = io.BytesIO()
+        Image.fromarray(np.full((4, 4, 3), color, np.uint8)).save(buf, format="PNG")
+        pngs.append(buf.getvalue())
+    p = tmp_path / "n.glb"
+    write_glb(p, nodes=[dict(mesh=0)],
+              meshes=[dict(primitives=[dict(
+                  attributes=dict(POSITION=0, TEXCOORD_0=1), indices=2,
+                  material=0)])],
+              materials=[dict(name="label", normalTexture=dict(index=1, scale=0.5),
+                              pbrMetallicRoughness=dict(baseColorTexture=dict(index=0)))],
+              arrays=[(QUAD_V, "VEC3"), (QUAD_UV, "VEC2"), (QUAD_I, "SCALAR")],
+              images=pngs)
+    mat = load_mesh(p).materials[0]
+    assert tuple(mat.base_color_texture[0, 0]) == (200, 30, 30)
+    assert tuple(mat.normal_texture[0, 0]) == (128, 160, 240)
+    assert mat.normal_scale == 0.5
+    assert "normal map" in repr(mat) and mat.state()["normal_scale"] == 0.5
+
 def test_obj_with_mtl(tmp_path):
     (tmp_path / "m.mtl").write_text("newmtl red\nKd 1 0 0\nnewmtl blue\nKd 0 0 1\n")
     (tmp_path / "m.obj").write_text(

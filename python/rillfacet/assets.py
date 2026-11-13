@@ -215,20 +215,25 @@ def _gltf_material(doc, buffers, base_dir, index):
         return Material("default", (1, 1, 1), metallic=1.0, roughness=1.0)
     m = doc["materials"][index]
     pbr = m.get("pbrMetallicRoughness", {})
-    tex = None
-    if "baseColorTexture" in pbr:
-        if pbr["baseColorTexture"].get("texCoord", 0) != 0:
-            raise NotImplementedError("glTF: base color on TEXCOORD_1")
-        src = doc["textures"][pbr["baseColorTexture"]["index"]].get("source")
-        if src is not None:
-            tex = _image(doc, buffers, base_dir, src)
+
+    def texture(info, what):
+        if info.get("texCoord", 0) != 0:
+            raise NotImplementedError(f"glTF: {what} on TEXCOORD_1")
+        src = doc["textures"][info["index"]].get("source")
+        return None if src is None else _image(doc, buffers, base_dir, src)
+
+    tex = (texture(pbr["baseColorTexture"], "base color")
+           if "baseColorTexture" in pbr else None)
+    ntex = (texture(m["normalTexture"], "normal map")
+            if "normalTexture" in m else None)
     color = pbr.get("baseColorFactor", [1, 1, 1, 1])[:3]
     # glTF factors are linear; Material holds sRGB.
     srgb = [_linear_to_srgb(c) for c in color]
     return Material(m.get("name", f"material{index}"), srgb,
                     metallic=pbr.get("metallicFactor", 1.0),
                     roughness=pbr.get("roughnessFactor", 1.0),
-                    base_color_texture=tex)
+                    base_color_texture=tex, normal_texture=ntex,
+                    normal_scale=m.get("normalTexture", {}).get("scale", 1.0))
 
 
 def _linear_to_srgb(c):

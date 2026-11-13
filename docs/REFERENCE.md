@@ -117,7 +117,14 @@ or floats in 0..1, top row first; replace it every frame for a stream). A
 surface mesh shows it with `set_uvs(uv)`, `texture = name` and
 `color_source = ColorSource.Texture` (`unlit = True` shows it without
 lighting, e.g. a camera frame on a billboard); ImGui shows it with
-`imgui.Image(v.image_texture(name), (w, h))`.
+`imgui.Image(v.image_texture(name), (w, h))`. `normal_map = name` reads an
+image as a tangent-space normal map at the same UVs (glTF's convention:
++x along increasing u, +y toward the image's top, linear bytes; scaled in
+x / y by `normal_scale`), with any color source. The tangent frame comes
+from the screen-space derivatives of position and uv, so no tangents are
+stored and mirrored mappings work; it changes the shading normal only (not
+silhouettes, shadows or ambient occlusion), and the back side sees the
+front's relief mirrored, as glTF viewers do.
 
 Text: `v.overlay.text(text, anchor, ...)` draws a screen-facing SDF label at a
 world point, `size_px` tall, or `world_height` tall in world units (it then
@@ -175,7 +182,9 @@ colors changed after creation are streamed (and recorded) with its poses.
 Camera rendering (`rillfacet.render`, for vision RL and synthetic data): a
 scene also carries what viewers ignore. Rigid meshes take `normals`, `uvs`,
 `materials` (`Material`: glTF's PBR metallic-roughness, optional base color
-texture) and `triangle_material`; each instance (env) has its own copy of
+texture and tangent-space normal map, `normal_texture` / `normal_scale` as
+glTF's `normalTexture`, which `load_gltf` reads; the raster backend and
+Mitsuba render it, the Cycles backend not yet) and `triangle_material`; each instance (env) has its own copy of
 every material's parameters, so domain randomization is an array write
 (`set_materials(base_color=[E, M, 3], roughness=[E, M], metallic=...)`).
 A material with `solid_texture=True` takes its base color and roughness

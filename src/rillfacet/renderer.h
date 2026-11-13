@@ -144,7 +144,8 @@ class Renderer {
   const Font& font() const { return font_; }
   // GPU copy of a scene image (uploaded on first use and whenever it
   // changed); a 1x1 white texture when the scene has no such image.
-  wgpu::TextureView image_view(const Scene& scene, const std::string& name);
+  // `linear`: the bytes are data (normal maps), not sRGB colors.
+  wgpu::TextureView image_view(const Scene& scene, const std::string& name, bool linear = false);
   const std::string& shader_error() const { return shader_error_; }
   glm::vec3 environment_sun() const { return env_.sun_dir; }
 
@@ -211,6 +212,7 @@ class Renderer {
   MatcapPreset matcap_built_ = MatcapPreset::Count;
   Font font_;
   wgpu::TextureView white_view_;
+  wgpu::TextureView flat_normal_view_;  // (0.5, 0.5, 1): the normal map of a flat surface
   std::unordered_map<std::string, ImageGpu> images_;
   // Replaced image textures, kept until the frame that may still draw them
   // (an ImGui image taken before the replacement) has been submitted.

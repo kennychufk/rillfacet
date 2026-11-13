@@ -73,6 +73,9 @@ class CameraRaster {
   // Base color textures (sRGB RGBA8), all size x size, `layers` of them;
   // mips[k] holds level k of every layer (layer-major).
   bool set_textures(uint32_t size, uint32_t layers, const std::vector<const uint8_t*>& mips);
+  // Tangent-space normal maps (LINEAR RGBA8, glTF's convention), laid out as
+  // set_textures.
+  bool set_normal_textures(uint32_t size, uint32_t layers, const std::vector<const uint8_t*>& mips);
   // Equirectangular environment, linear RGBA16F (raw half bits), w x h at
   // level 0, halved per level.
   bool set_envmap(uint32_t w, uint32_t h, const std::vector<const uint16_t*>& mips);
@@ -84,8 +87,10 @@ class CameraRaster {
   // Directional albedo of the BRDF, n x n (n_dot_v along x, roughness along
   // y), RGBA16F half bits: GGX scale and bias (F0 * x + y), Burley diffuse.
   bool set_brdf_lut(uint32_t n, const uint16_t* data);
-  // [envs, slots, 8]: linear base color, roughness, metallic, texture layer
-  // (-1 = none), solid texture row (-1 = none), its bump (0 / 1).
+  // [envs, slots, kMaterialFloats]: linear base color, roughness, metallic,
+  // texture layer (-1 = none), solid texture row (-1 = none), its bump
+  // (0 / 1), normal map layer (-1 = none), its scale, 2 spare.
+  static constexpr uint32_t kMaterialFloats = 12;
   bool set_materials(const float* m, uint32_t envs, uint32_t slots);
   // [n, 32]: solid (3D) texture parameter rows (rillfacet.solid_texture's
   // layout, linear colors; the last float 1 = filter by the footprint).
@@ -122,6 +127,9 @@ class CameraRaster {
   void wait_idle();
 
  private:
+  // (Re)creates `tex` as a size x size x layers array with mips[k] at level k.
+  bool upload_layers(wgpu::Texture& tex, wgpu::TextureFormat format, const char* label, uint32_t size,
+                     uint32_t layers, const std::vector<const uint8_t*>& mips);
   struct Image {   // a shared image or, without zero-copy, a plain texture
     std::unique_ptr<SharedImage> shared;
     wgpu::Texture tex;
@@ -163,7 +171,7 @@ class CameraRaster {
   uint64_t mats_size_ = 0, lens_size_ = 0, solid_size_ = 128;
   std::vector<uint32_t> first_index_, index_count_;
   uint32_t bodies_ = 0;
-  wgpu::Texture base_tex_, env_tex_, bg_tex_, brdf_lut_;
+  wgpu::Texture base_tex_, normal_tex_, env_tex_, bg_tex_, brdf_lut_;
   wgpu::Sampler cmp_, repeat_, clamp_;
   wgpu::Texture dummy_out_[4], dummy_rad_, dummy_depth_, dummy_seg_, dummy_shadow_;
   bool groups_dirty_ = true, shadows_ = false;

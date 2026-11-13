@@ -32,6 +32,21 @@ Arr<T> checked(nb::handle h, int ndim, const char* what) {
   }
 }
 
+// Texture mips (each [layers, size, size, 4] uint8) passed to `set` as
+// (size, layers, pointers); the arrays stay alive for the call.
+template <typename F>
+bool with_mips(nb::list mips, F&& set) {
+  std::vector<Arr<uint8_t>> keep;
+  std::vector<const uint8_t*> ptrs;
+  keep.reserve(mips.size());
+  for (nb::handle h : mips) {
+    keep.push_back(checked<uint8_t>(h, 4, "texture mip"));
+    ptrs.push_back(keep.back().data());
+  }
+  if (keep.empty()) return false;
+  return set(uint32_t(keep[0].shape(1)), uint32_t(keep[0].shape(0)), ptrs);
+}
+
 }  // namespace
 
 void bind_camera_raster(nb::module_& m) {
@@ -51,15 +66,14 @@ void bind_camera_raster(nb::module_& m) {
                               uint32_t(g.shape(0)));
       })
       .def("set_textures", [](CameraRaster& r, nb::list mips) {
-        std::vector<Arr<uint8_t>> keep;
-        std::vector<const uint8_t*> ptrs;
-        keep.reserve(mips.size());
-        for (nb::handle h : mips) {
-          keep.push_back(checked<uint8_t>(h, 4, "texture mip"));
-          ptrs.push_back(keep.back().data());
-        }
-        if (keep.empty()) return false;
-        return r.set_textures(uint32_t(keep[0].shape(1)), uint32_t(keep[0].shape(0)), ptrs);
+        return with_mips(mips, [&](uint32_t size, uint32_t layers, const std::vector<const uint8_t*>& p) {
+          return r.set_textures(size, layers, p);
+        });
+      })
+      .def("set_normal_textures", [](CameraRaster& r, nb::list mips) {
+        return with_mips(mips, [&](uint32_t size, uint32_t layers, const std::vector<const uint8_t*>& p) {
+          return r.set_normal_textures(size, layers, p);
+        });
       })
       .def("set_envmap", [](CameraRaster& r, nb::list mips) {
         std::vector<Arr<uint16_t>> keep;   // float16 bits (pass arr.view(np.uint16))
@@ -97,6 +111,8 @@ void bind_camera_raster(nb::module_& m) {
       })
       .def("set_materials", [](CameraRaster& r, nb::handle m) {
         auto a = checked<float>(m, 3, "materials");
+        if (size_t(a.shape(2)) != CameraRaster::kMaterialFloats)
+          throw std::invalid_argument("CameraRaster.set_materials: [envs, slots, 12]");
         return r.set_materials(a.data(), uint32_t(a.shape(0)), uint32_t(a.shape(1)));
       })
       .def("set_lens", [](CameraRaster& r, nb::handle l) {
