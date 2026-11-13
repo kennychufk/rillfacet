@@ -98,5 +98,5 @@ assert (p/'shaders').is_dir() and (p/'assets'/'fonts').is_dir(); \
 assert (p/'web'/'static'/'index.html').is_file(); \
 import importlib.metadata as md; d = md.distribution('rillfacet'); \
 lic = sorted(f.name for f in d.files if 'licenses' in f.parts); print(d.metadata['License-Expression'], lic); \
-assert lic == ['LICENSE', 'THIRD_PARTY_LICENSES.txt'] and d.metadata['License-Expression'] == 'MIT'"
+assert lic == ['LICENSE', 'THIRD_PARTY_LICENSES.txt'] and d.metadata['License-Expression'] == 'GPL-3.0-or-later'"
 RUN python -m pytest tests -q

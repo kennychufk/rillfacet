@@ -28,8 +28,8 @@ and ``"rgb"``.
 Backends: :mod:`rillfacet.render.mitsuba` (Mitsuba 3 path tracing on CUDA,
 thin-lens depth of field, exact OpenCV distortion);
 :mod:`rillfacet.render.raster` (batched GPU rasterization with Dawn, for
-thousands of envs; zero-copy to torch on Linux + NVIDIA); Blender Cycles in
-the separate GPL-3.0 package ``rillfacet-cycles`` (``rillfacet_cycles``).
+thousands of envs; zero-copy to torch on Linux + NVIDIA); Blender Cycles
+(:mod:`rillfacet.render.cycles`, ``pip install rillfacet[cycles]``).
 """
 from __future__ import annotations
 

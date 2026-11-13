@@ -106,4 +106,4 @@ You need GCC 13 or newer (or Clang), CMake 3.24 or newer, Ninja and git; `pip in
 
 ## License
 
-MIT. Wheels also bundle Dawn, GLFW, Dear ImGui, ImPlot, nanobind and fonts under their own licenses; see `THIRD_PARTY_LICENSES.txt`.
+GPL-3.0-or-later (`LICENSE`). The Blender Cycles backend (`rillfacet.render.cycles`, `pip install rillfacet[cycles]`) imports Blender's `bpy`, which is GPL-3.0-or-later, and is why rillfacet is copyleft. Releases up to 0.1.4 were MIT. Wheels also bundle Dawn, GLFW, Dear ImGui, ImPlot, nanobind and fonts under their own licenses; see `THIRD_PARTY_LICENSES.txt`.

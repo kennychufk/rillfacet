@@ -206,7 +206,7 @@ against); the raster backend runs a line-by-line WGSL port
 (`shaders/common/noise.wgsl`, `shaders/common/solid_texture.wgsl`), which
 fades detail finer than a pixel to its mean (`solid_texture_filter`; it
 shades one point per pixel, where Mitsuba averages over its samples); the
-Cycles backend (`rillfacet-cycles`) runs an OSL port, unfiltered as
+Cycles backend (`rillfacet.render.cycles`) runs an OSL port, unfiltered as
 Mitsuba (OptiX and CPU only; Cycles has no OSL on CUDA).
 A material with `uv_texture=True` can instead take them from a procedural
 UV (2D) texture (`rillfacet.uv_texture`), evaluated at the mesh's METRIC
@@ -312,14 +312,68 @@ slot solid, 224x224 at 4 spp, they take ~1.35x the time of plain
 materials (64 envs `direct` 35 vs 25 ms, 256 envs `path` 204 vs 152 ms),
 ~2.6x with bump; the first compile of their kernels takes a few seconds.
 
-Blender Cycles is a second backend with the same interface, in the separate
-GPL-3.0 package `rillfacet-cycles` (`from rillfacet_cycles import
-CyclesRenderer`; it imports `bpy`, so it cannot live in this MIT package).
-It renders one Blender render per env and camera (a pinhole proxy, with
-Cycles' own depth of field and denoiser, resampled through the exact OpenCV
-distortion in torch) and is several times slower than Mitsuba at RL batch
-sizes, with less noise per sample; per-env tints also apply to textured
-materials there.
+Blender Cycles is a second backend with the same interface
+(`rillfacet.render.cycles.CyclesRenderer`; `pip install rillfacet[cycles]`
+pulls in `bpy`, Blender as a Python module, which is GPL-3.0-or-later, as is
+rillfacet). `bpy` wheels on PyPI track one Python version per Blender release
+(bpy 5.x: Python 3.13). The tests are `tests/test_render_cycles.py` (skipped
+without `bpy`).
+
+```python
+from rillfacet.scene_api import Scene, Material
+from rillfacet.render.cycles import CyclesRenderer
+
+r = CyclesRenderer(spp=16)                 # OptiX on NVIDIA GPUs
+scene = Scene(r)
+mesh = scene.rigid_mesh("robot", ..., instances=E, materials=[...])
+scene.light("sun", "directional", direction=(0.4, 0.3, -1.0), intensity=2.5)
+scene.camera_sensor("wrist", 320, 180, K, dist=dist, mount=mesh, body=7,
+                    local_pose=cam_in_body, aperture_radius=6e-4,
+                    focus_distance=focus)            # per env
+out = r.render("wrist", outputs=("rgb", "depth", "segmentation"))
+# same outputs as Mitsuba: rgb [E, H, W, 3], depth [E, H, W], segmentation [E, H, W]
+```
+
+Per-env domain randomization is a write to the scene, never a rebuild:
+`mesh.set_materials(base_color=..., roughness=..., metallic=...)` (textured
+materials multiply their texture by the per-env color) and
+`CameraSensor.set_lens` (aperture, focus distance, gain = exposure and white
+balance). Solid (3D) and UV (2D) procedural textures render as in the other
+backends, through an OSL port of `rillfacet.solid_texture` and
+`rillfacet.uv_texture` (`render/cycles/solid_texture.h`, `uv_texture.h`,
+checked against the torch references). Both kinds go through one shader,
+`texture.osl`, which reads each env's row (`uv_texture.render_rows`), the
+metric UVs (a UV map `rf_muv`) and, for a UV bump, the faces' surface
+gradients of u and v (face attributes `rf_gu` / `rf_gv`). Cycles runs OSL on
+the CPU and on OptiX only (on CUDA these slots show their first color); the
+first OptiX render with OSL compiles Cycles' OSL kernels once (~90 s, then
+cached on disk). A scene with solid or UV textures shades everything through
+OSL: ~1.25x the time of SVM (a cube on a floor, 16 envs, 320 x 180, 16 spp,
+RGB + depth + segmentation: 12.3 vs 9.7 ms per env); the patterns and their
+bump add little on top.
+
+How it works (the module docstring has more):
+
+- One Blender mesh per body, one object per (env, body); envs on a grid
+  `env_spacing` apart. Per-env appearance is in object custom properties
+  that shared materials read through Attribute nodes (solid texture
+  parameter rows too).
+- Cycles renders one camera per call, so a frame is one render per env.
+  Persistent data keeps the scene on the GPU between renders.
+- OpenCV lenses (the 14-coefficient rational + thin-prism model included):
+  each env renders a pinhole proxy covering the field of view, with Cycles'
+  thin-lens depth of field and denoiser; torch resamples it through the exact
+  distortion.
+- Depth and segmentation come from a second, one-sample render of the same
+  scene: Cycles' Depth and Object Index passes, combined by the compositor.
+  Only film settings change between the two renders, so Cycles' session
+  stays warm.
+
+Measured on an RTX 5070 Ti (a UR5e visual-mesh scene, 320 x 180 Pi Camera
+Module 3 Wide, 16 spp path tracing, RGB + depth + segmentation): ~15 ms per
+env per frame at 16 envs. Mitsuba renders all envs in one launch and is ~6x
+faster at this size; Cycles has the better noise (light tree, MIS) and
+denoiser. Not modelled yet: motion blur.
 
 `RasterRenderer` (`rillfacet.render.raster`, part of the extension, no extra
 dependency) rasterizes with Dawn for vision RL at thousands of envs:
@@ -591,6 +645,6 @@ directly; simulator data is copied through the CPU each frame.
 
 ## License
 
-MIT (`LICENSE`). Wheels also contain Dawn (BSD-3-Clause), GLFW (zlib), Dear ImGui and
+GPL-3.0-or-later (`LICENSE`; versions up to 0.1.4 were MIT). Wheels also contain Dawn (BSD-3-Clause), GLFW (zlib), Dear ImGui and
 ImPlot (MIT), nanobind, and the Inter and JetBrains Mono fonts (OFL-1.1); their
 licenses are in `THIRD_PARTY_LICENSES.txt` and `assets/fonts/`.
